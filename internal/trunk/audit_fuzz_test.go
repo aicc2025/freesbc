@@ -7,7 +7,6 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 	"github.com/freesbc/freesbc/internal/media"
-	"github.com/pion/sdp/v3"
 )
 
 // Fuzz targets for trunk-local parsers that consume peer-controlled bytes.
@@ -83,7 +82,8 @@ func FuzzAuditParseCryptoAttrs(f *testing.F) {
 // audit: P2-TRK-006, P2-TRK-022
 // Every SDP helper on the trunk's peer-body path. Property: when the rewrite
 // succeeds, its output must itself be a relayable SDP pointing at our
-// address (the other leg will parse it with the same rules).
+// address (the other leg will parse it with the same rules), and a plaintext
+// rewrite, re-parsed with the trunk's own parser, must carry no a=crypto.
 func FuzzAuditTrunkSDP(f *testing.F) {
 	key := base64.StdEncoding.EncodeToString(make([]byte, media.SDESKeyLen))
 	f.Add(testSDPBody(4000), false)
@@ -91,6 +91,11 @@ func FuzzAuditTrunkSDP(f *testing.F) {
 		"m=video 5000 RTP/AVP 96\r\nm=audio 4000 RTP/SAVP 0\r\na=rtcp:4001 IN IP4 192.0.2.1\r\n"+
 		"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"+key+"|2^20|1:4\r\n"), true)
 	f.Add([]byte("v=0\r\no=- 1 1 IN IP6 ::1\r\ns=-\r\nc=IN IP6 ::1\r\nt=0 0\r\nm=audio 0 RTP/AVP 0\r\nm=audio 7 RTP/AVP 0\r\n"), false)
+	// Declined non-audio sections keep the peer's media type, which pion/sdp
+	// rejects; the output must still re-parse with the trunk's own parser.
+	f.Add([]byte("v=0\r\nc=IN IP4 192.0.2.1\r\nm=0 0 0 0\r\nm=audio 4000 RTP/AVP 0\r\n"), false)
+	f.Add([]byte("v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n"+
+		"m=audio 4000 RTP/AVP 0\r\nm=image 4002 udptl t38\r\na=T38FaxVersion:0\r\n"), false)
 	ourIP := netip.MustParseAddr("192.0.2.10")
 	suite, _ := media.ParseCryptoSuite("AES_CM_128_HMAC_SHA1_80")
 	f.Fuzz(func(t *testing.T, body []byte, secure bool) {
@@ -116,19 +121,19 @@ func FuzzAuditTrunkSDP(f *testing.F) {
 			t.Fatalf("rewrite output points media at %v, want %v\nin:\n%q\nout:\n%q", ip, ourIP, body, out)
 		}
 		if !secure {
-			var sd sdp.SessionDescription
-			if err := sd.Unmarshal(out); err != nil {
+			sd, err := parseSDP(out)
+			if err != nil {
 				t.Fatalf("rewrite output does not re-parse: %v\nout:\n%q", err, out)
 			}
 			keys := 0
-			for _, a := range sd.Attributes {
-				if a.Key == "crypto" {
+			for _, a := range sd.attrs {
+				if a.key == "crypto" {
 					keys++
 				}
 			}
-			for _, md := range sd.MediaDescriptions {
-				for _, a := range md.Attributes {
-					if a.Key == "crypto" {
+			for _, sec := range sd.sections {
+				for _, a := range sec.attrs {
+					if a.key == "crypto" {
 						keys++
 					}
 				}
