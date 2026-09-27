@@ -42,6 +42,7 @@ func (c *Config) validateProxy(fail failFunc) {
 	c.validatePlane("network.public", c.Network.Public, fail)
 	c.validatePlane("network.private", c.Network.Private, fail)
 	c.validatePublicListeners(fail)
+	c.validateCarrierSources(fail)
 	c.validatePrivateSIP(fail)
 	c.validateMediaPlanes(fail)
 	c.validatePoolOverlap(fail)
@@ -53,7 +54,8 @@ func (c *Config) proxyPartlyConfigured() bool {
 	ups := c.SIP.Upstreams
 	upsSet := len(ups.Nodes) > 0 || ups.Algorithm != "" || ups.Cooldown != 0
 	return len(c.PublicSIPListeners()) > 0 || c.RTP.Public.configured() || c.RTP.Private.configured() ||
-		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero() || c.SIP.Pstn.configured() || upsSet
+		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero() || c.SIP.Pstn.configured() || upsSet ||
+		len(c.SIP.Public.CarrierSources) > 0
 }
 
 // validateUpstreams checks the upstream in either shape.
@@ -230,6 +232,22 @@ func (c *Config) validatePublicListeners(fail failFunc) {
 	}
 	if !c.PrivateAdvertisedIP().IsValid() {
 		fail("network.private.advertised_ip: required — the private bind address is unspecified/unset, so FreeSWITCH would have no routable address to reach the SBC on")
+	}
+}
+
+// validateCarrierSources checks and compiles sip.public.carrier_sources with
+// the rules of a trunk peer's allowed_ips (allowedPrefix): a bare IP is its
+// full-length prefix, a CIDR is normalised, an IPv4-mapped entry becomes the
+// IPv4 prefix it maps, and anything wider than /8 (IPv4) or /32 (IPv6) —
+// 0.0.0.0/0 and ::/0 included — is refused. The list is a trust boundary for
+// unauthenticated INVITEs into FreeSWITCH, so a catch-all would switch the
+// admission check off. An empty or absent list is valid.
+func (c *Config) validateCarrierSources(fail failFunc) {
+	c.SIP.Public.carrierNets = nil
+	for _, s := range c.SIP.Public.CarrierSources {
+		if pfx, ok := allowedPrefix(fail, "sip.public.carrier_sources", s); ok {
+			c.SIP.Public.carrierNets = append(c.SIP.Public.carrierNets, pfx)
+		}
 	}
 }
 

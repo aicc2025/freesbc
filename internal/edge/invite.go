@@ -89,10 +89,28 @@ type attemptResult struct {
 //	forward → on each fork's answer, negotiate codecs and build the
 //	near-side answer → on the 2xx, confirm the dialog → relay.
 func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort) {
+	inDialog := isInDialog(req)
+	if !inDialog && !s.isPSTNBridgeInvite(req, src) && !s.arrivedOnPrivate(req) &&
+		!s.admitPublicInvite(req, src) {
+		// Admission (issue #86; admission.go): a public out-of-dialog
+		// INVITE from a source that is neither an upstream, a carrier
+		// source nor a registered transport address is dropped before
+		// anything answers it — ahead of the 100rel check below, whose 420
+		// would otherwise tell a scanner something. Returning without a
+		// response is the whole mechanism: sipgo's Server.handleRequest
+		// calls TerminateGracefully when the handler returns, which, for a
+		// transaction with no final response, is Terminate — it stops the
+		// Timer_1xx that would otherwise send "100 Trying" at 200 ms,
+		// removes the transaction and sends nothing. A retransmission of
+		// the INVITE opens a fresh transaction and is dropped the same way.
+		s.dropSilently(dropInviteNotAdmitted, req, src,
+			"to", req.Recipient.User)
+		return
+	}
 	if s.rejectRequired100rel(req, tx) {
 		return // PRACK cannot pass the proxy (extensions.go)
 	}
-	if isInDialog(req) {
+	if inDialog {
 		s.onReInvite(req, tx)
 		return
 	}

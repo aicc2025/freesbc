@@ -81,7 +81,24 @@ type ProxySIPConfig struct {
 	UDP ProxyListen `yaml:"udp"`
 	WS  ProxyListen `yaml:"ws"`
 	WSS ProxyListen `yaml:"wss"`
+
+	// CarrierSources lists the public source IPs (literal IP or CIDR) a
+	// carrier sends inbound calls from. An out-of-dialog INVITE on a public
+	// listener is admitted only from an upstream, from a carrier source or
+	// from a transport address holding a live registration; everything else
+	// is dropped silently. The IPs of sip.pstn's gateways are carrier
+	// sources automatically, so this list is only needed for a carrier's
+	// OTHER inbound IPs, or for inbound carriers with no sip.pstn at all.
+	// Validated like a trunk peer's allowed_ips (same width caps).
+	CarrierSources []string `yaml:"carrier_sources"`
+
+	carrierNets []netip.Prefix // compiled by Validate
 }
+
+// CarrierNets returns the compiled sip.public.carrier_sources prefixes,
+// canonical (Masked) and IPv4-mapped entries unmapped. Only valid after
+// Validate has run.
+func (p ProxySIPConfig) CarrierNets() []netip.Prefix { return p.carrierNets }
 
 // ProxyListen is one public-facing SIP listener.
 type ProxyListen struct {

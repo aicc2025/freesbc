@@ -38,6 +38,7 @@ type collector struct {
 	proxyICEFail    *prometheus.Desc
 	proxyDTLSFail   *prometheus.Desc
 	proxyPanics     *prometheus.Desc
+	proxyAdmission  *prometheus.Desc
 }
 
 func newCollector(deps Deps) *collector {
@@ -68,6 +69,7 @@ func newCollector(deps Deps) *collector {
 		proxyICEFail:   prometheus.NewDesc("freesbc_webrtc_ice_failure_total", "WebRTC legs that never completed ICE.", nil, nil),
 		proxyDTLSFail:  prometheus.NewDesc("freesbc_webrtc_dtls_failure_total", "WebRTC legs that failed the DTLS handshake or fingerprint check.", nil, nil),
 		proxyPanics:    prometheus.NewDesc("freesbc_sip_handler_panics_total", "Edge SIP handler panics recovered (each one lost a request).", nil, nil),
+		proxyAdmission: prometheus.NewDesc("freesbc_edge_admission_drops_total", "Public requests the edge proxy dropped silently by admission, by reason.", []string{"reason"}, nil),
 	}
 }
 
@@ -83,6 +85,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
+		c.proxyAdmission,
 	} {
 		ch <- d
 	}
@@ -140,6 +143,9 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.proxyICEFail, float64(p.ICEFailures))
 	counter(c.proxyDTLSFail, float64(p.DTLSFailures))
 	counter(c.proxyPanics, float64(p.HandlerPanics))
+	for reason, v := range p.AdmissionDrops {
+		counter(c.proxyAdmission, float64(v), reason)
+	}
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

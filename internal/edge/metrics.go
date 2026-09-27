@@ -40,6 +40,10 @@ type Metrics struct {
 	dtlsFailures  atomic.Uint64
 	handlerPanics atomic.Uint64
 
+	// admissionDrops counts public requests dropped silently by the
+	// admission policy, one counter per (fixed) reason (admission.go).
+	admissionDrops [numDropReasons]atomic.Uint64
+
 	// Media byte/packet totals, accumulated at call teardown from each
 	// session's own counters. Sampling live sessions instead would need a
 	// registry walk on every scrape.
@@ -113,6 +117,9 @@ func (m *Metrics) RegistrationFailed()    { m.registrationFailure.Add(1) }
 func (m *Metrics) SetRegistrations(n int) { m.registrations.Store(int64(n)) }
 func (m *Metrics) PortAllocationFailed()  { m.portFailures.Add(1) }
 
+// AdmissionDropped counts one public request dropped by admission.
+func (m *Metrics) AdmissionDropped(r dropReason) { m.admissionDrops[r].Add(1) }
+
 // HandlerPanicked counts a SIP handler panic the guard recovered.
 func (m *Metrics) HandlerPanicked() { m.handlerPanics.Add(1) }
 
@@ -181,6 +188,10 @@ type Snapshot struct {
 	WebRTCICEFailures           uint64
 	WebRTCDTLSFailures          uint64
 	HandlerPanics               uint64
+
+	// AdmissionDrops is keyed by drop reason (dropReasonLabels); every
+	// reason is present, zero or not.
+	AdmissionDrops map[string]uint64
 }
 
 func (m *Metrics) Snapshot() Snapshot {
@@ -202,6 +213,10 @@ func (m *Metrics) Snapshot() Snapshot {
 		HandlerPanics:               m.handlerPanics.Load(),
 		WebRTCICEFailures:           m.iceFailures.Load(),
 		WebRTCDTLSFailures:          m.dtlsFailures.Load(),
+		AdmissionDrops:              map[string]uint64{},
+	}
+	for r := range m.admissionDrops {
+		s.AdmissionDrops[dropReasonLabels[r]] = m.admissionDrops[r].Load()
 	}
 	for i := range m.requestsIn {
 		method := metricOther
