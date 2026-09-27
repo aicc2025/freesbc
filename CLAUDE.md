@@ -39,7 +39,10 @@ One process and one YAML file run two independent SIP planes, either or both. `i
   1. A To-tag makes it a re-INVITE.
   2. An upstream source with a Request-URI equal to `sip.pstn.match` goes to a PSTN gateway.
   3. Arrival on the private socket goes to a registered client. The client is found by the `fsbc=` token that FreeSWITCH copies from the stored Contact into the Request-URI.
-  4. Anything else goes to an upstream chosen by an FNV-1a hash of the user.
+  4. Anything else is a public out-of-dialog INVITE and must pass admission (`admitPublicInvite`, `admission.go`): its source must be FreeSWITCH's own transport address, a carrier source (the `sip.pstn` gateway IPs plus `sip.public.carrier_sources`), or the exact transport + IP:port of a live registration (`Location.HasSource`). Otherwise it is dropped with no response: the handler returns unanswered and sipgo's `TerminateGracefully` terminates the transaction before its 200 ms automatic 100 Trying. This check runs before the 100rel 420.
+  5. An admitted INVITE goes to an upstream chosen by an FNV-1a hash of the user.
+- REGISTER is always forwarded, except that a public source (IPv4 address, IPv6 /64) with 10 distinct AoRs rejected 403/404 by FreeSWITCH in 10 minutes has further REGISTERs dropped silently until the window ends (`enumLimiter`, `admission.go`). Drops of both kinds count in `freesbc_edge_admission_drops_total{reason}`.
+- Edge tests share 127.0.0.1, so the shared harness lists it in `sip.public.carrier_sources`; admission tests use `startHarnessStrict`, which does not.
 - Edge handlers return after the final response. From then on `dialogTable` owns the dialog and its media; a dialog is matched on Call-ID plus both tags, and it is confirmed before its 2xx is relayed.
 - SDP: the edge builds every body from scratch with `internal/sip/sdp` (`Build`) and never copies the other leg's body. That is what guarantees topology hiding. The trunk builds every body from scratch too (`internal/trunk/sdp.go`), from an allow-list, with its own tolerant line parser (not `pion/sdp`, which rejects `m=image`) and its own `o=` per leg.
 

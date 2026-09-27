@@ -236,18 +236,20 @@ func validatePeer(fail failFunc, name string, p *Peer) {
 		fail("peers.%s: allowed_ips: at least one prefix required", name)
 	}
 	for _, s := range p.AllowedIPs {
-		if pfx, ok := allowedPrefix(fail, name, s); ok {
+		if pfx, ok := allowedPrefix(fail, "peers."+name+": allowed_ips", s); ok {
 			p.allowedNets = append(p.allowedNets, pfx)
 		}
 	}
 }
 
-// allowedPrefix parses and checks one allowed_ips entry, returning the
-// canonical prefix to match sources against.
-func allowedPrefix(fail failFunc, peer, s string) (netip.Prefix, bool) {
+// allowedPrefix parses and checks one source-prefix entry — a trunk peer's
+// allowed_ips or the edge's sip.public.carrier_sources — returning the
+// canonical prefix to match sources against. label names the list in the
+// error messages (e.g. "peers.carrier-a: allowed_ips").
+func allowedPrefix(fail failFunc, label, s string) (netip.Prefix, bool) {
 	pfx, err := parsePrefixOrAddr(s)
 	if err != nil {
-		fail("peers.%s: allowed_ips: %v", peer, err)
+		fail("%s: %v", label, err)
 		return netip.Prefix{}, false
 	}
 	// Transport sources are Unmap()ed before matching (sip/addr.go), and an
@@ -256,7 +258,7 @@ func allowedPrefix(fail failFunc, peer, s string) (netip.Prefix, bool) {
 	// the operator meant: the IPv4 prefix it maps.
 	if pfx.Addr().Is4In6() {
 		if pfx.Bits() < 96 {
-			fail("peers.%s: allowed_ips: %q mixes IPv4-mapped and native IPv6 addresses; write the IPv4 prefix instead", peer, s)
+			fail("%s: %q mixes IPv4-mapped and native IPv6 addresses; write the IPv4 prefix instead", label, s)
 			return netip.Prefix{}, false
 		}
 		pfx = netip.PrefixFrom(pfx.Addr().Unmap(), pfx.Bits()-96)
@@ -274,7 +276,7 @@ func allowedPrefix(fail failFunc, peer, s string) (netip.Prefix, bool) {
 		minBits = 32
 	}
 	if pfx.Bits() < minBits {
-		fail("peers.%s: allowed_ips: %q is wider than /%d (T-11 width cap)", peer, s, minBits)
+		fail("%s: %q is wider than /%d (T-11 width cap)", label, s, minBits)
 		return netip.Prefix{}, false
 	}
 	// Store the canonical (Masked) form: a non-canonical input like

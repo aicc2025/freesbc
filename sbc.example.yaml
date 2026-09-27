@@ -139,6 +139,11 @@ shield:                            # sensible defaults; the whole section is opt
 #       bind: 0.0.0.0:18443
 #       cert_file: /etc/freesbc/wss-cert.pem   # a browser REFUSES an untrusted
 #       key_file:  /etc/freesbc/wss-key.pem    #   certificate on a WSS socket
+#     # New calls on a public listener are relayed only from a registered
+#     # client's own transport address or from a carrier source (the
+#     # sip.pstn gateway IPs, plus this list: literal IPs or CIDRs a carrier
+#     # sends INBOUND calls from); anything else is dropped silently.
+#     # carrier_sources: [198.51.100.20, 203.0.113.0/28]
 #   private:
 #     bind: 10.77.0.2:5060           # FreeSBC's own FreeSWITCH-facing socket:
 #                                    #   the source of everything it sends
@@ -152,7 +157,9 @@ shield:                            # sensible defaults; the whole section is opt
 #   # Optional peer-to-peer PSTN trunk: outbound calls from FreeSWITCH's
 #   # dialplan, bridged to sip:<number>@10.77.0.2:16060 (the MATCH address),
 #   # are forwarded to carrier gateways that never register — FreeSBC never
-#   # pings them, and inbound carrier calls need no special handling. The
+#   # pings them. Each gateway's IP is also a carrier source, so inbound
+#   # calls from it are admitted; list a carrier's OTHER inbound IPs in
+#   # sip.public.carrier_sources. The
 #   # bridge is recognised by its SOURCE (FreeSWITCH's own IP) plus its
 #   # Request-URI naming the match, so a public phone dialling the same
 #   # address is not hijacked. The match must be a host:port FreeSWITCH
@@ -208,6 +215,8 @@ shield:                            # sensible defaults; the whole section is opt
 #
 # The bridge reaches FreeSBC on its public UDP socket; FreeSBC anchors the
 # media and forwards the call to the carrier gateway, exactly like a call
-# to a registered phone. Inbound carrier→FreeSWITCH calls need no extra
-# configuration: they arrive on the public side like any other unregistered
-# caller and are proxied upstream unchanged.
+# to a registered phone. Inbound carrier→FreeSWITCH calls arrive on the
+# public side as unregistered callers and are proxied upstream unchanged,
+# but only from a carrier source: a sip.pstn gateway IP or an entry of
+# sip.public.carrier_sources. From any other unregistered source a new call
+# is dropped silently.

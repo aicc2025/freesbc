@@ -206,6 +206,13 @@ type topology struct {
 	// topology).
 	pstn pstnTopo
 
+	// carrierSources are the public source prefixes an out-of-dialog
+	// INVITE is admitted from without a registration (admission.go): every
+	// sip.pstn gateway's IP plus sip.public.carrier_sources. A startup
+	// snapshot like the rest of the topology (sip.public and sip.pstn are
+	// restart-only).
+	carrierSources []netip.Prefix
+
 	// media advertised addresses.
 	publicMediaIP  netip.Addr
 	privateMediaIP netip.Addr
@@ -318,6 +325,8 @@ func buildTopology(cfg *config.Config) (*topology, error) {
 		upstreams:     upstreams,
 		upstreamNames: upstreamNames,
 		pstn:          pstn,
+		// validate compiled sip.public.carrier_sources (CarrierNets).
+		carrierSources: carrierSourcesFrom(pstn.gateways, cfg.SIP.Public.CarrierNets()),
 		private: side{
 			plane:     planePrivate,
 			transport: "udp",

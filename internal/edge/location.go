@@ -51,11 +51,20 @@ func (b *Binding) Expired(now time.Time) bool { return !now.Before(b.ExpiresAt) 
 //
 // Bounded on purpose (spec §16): an unauthenticated flood of REGISTERs
 // that FreeSWITCH happens to accept must not be able to grow this map
-// without limit. Entries are keyed by token and indexed by AoR.
+// without limit. Entries are keyed by token and indexed by AoR and by
+// transport source. The three maps always hold the same set of bindings:
+// every insertion goes through Put and every removal through
+// deleteLocked.
 type Location struct {
-	mu       sync.RWMutex
-	byToken  map[string]*Binding
-	byAOR    map[string][]*Binding
+	mu      sync.RWMutex
+	byToken map[string]*Binding
+	byAOR   map[string][]*Binding
+	// bySource indexes bindings by the transport source address the
+	// REGISTER came from (Binding.Source). It is what the INVITE admission
+	// check (HasSource) and the WebSocket close hook (RemoveBySource) look
+	// up, so neither scans the table. One source may hold several bindings
+	// (a phone registering several lines over one socket).
+	bySource map[netip.AddrPort][]*Binding
 	maxTotal int
 	// maxPerAOR caps how many devices one user may have registered at
 	// once, so a single compromised account cannot consume the table.
@@ -82,6 +91,7 @@ func NewLocation() *Location {
 	return &Location{
 		byToken:   map[string]*Binding{},
 		byAOR:     map[string][]*Binding{},
+		bySource:  map[netip.AddrPort][]*Binding{},
 		maxTotal:  defaultMaxBindings,
 		maxPerAOR: defaultMaxPerAOR,
 	}
@@ -111,7 +121,11 @@ func (l *Location) Put(b Binding) (*Binding, error) {
 			// Refresh in place: the token must not change, or FreeSWITCH
 			// would be left holding a contact that no longer resolves.
 			b.Token = e.Token
+			// The refresh may come from a new source (the phone's NAT
+			// mapping changed), so re-index under the new address.
+			l.unindexSourceLocked(e)
 			*e = b
+			l.indexSourceLocked(e)
 			return e, nil
 		}
 	}
@@ -127,6 +141,7 @@ func (l *Location) Put(b Binding) (*Binding, error) {
 	nb := &b
 	l.byToken[nb.Token] = nb
 	l.byAOR[nb.AOR] = append(l.byAOR[nb.AOR], nb)
+	l.indexSourceLocked(nb)
 	return nb, nil
 }
 
@@ -153,23 +168,63 @@ func (l *Location) Remove(aor, callID string) *Binding {
 func (l *Location) RemoveBySource(src netip.AddrPort) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	n := 0
-	for aor, list := range l.byAOR {
-		for i := len(list) - 1; i >= 0; i-- {
-			if list[i].Source == src {
-				l.deleteLocked(aor, i)
-				list = l.byAOR[aor]
-				n++
+	// Copy: deleteLocked edits the index slice being walked.
+	victims := append([]*Binding(nil), l.bySource[src]...)
+	for _, b := range victims {
+		for i, e := range l.byAOR[b.AOR] {
+			if e == b {
+				l.deleteLocked(b.AOR, i)
+				break
 			}
 		}
 	}
-	return n
+	return len(victims)
 }
 
-// deleteLocked removes index i of an AoR's list. Caller holds the lock.
+// HasSource reports whether a live (unexpired) binding was registered over
+// transport from exactly src. It is the edge INVITE admission check: a
+// public client may place a call from the transport address its
+// registration came from. transport is compared case-insensitively.
+func (l *Location) HasSource(transport string, src netip.AddrPort) bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	now := time.Now()
+	for _, b := range l.bySource[src] {
+		if strings.EqualFold(b.Transport, transport) && !b.Expired(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// indexSourceLocked adds b to the source index. Caller holds the lock.
+func (l *Location) indexSourceLocked(b *Binding) {
+	l.bySource[b.Source] = append(l.bySource[b.Source], b)
+}
+
+// unindexSourceLocked removes b from the source index. Caller holds the
+// lock.
+func (l *Location) unindexSourceLocked(b *Binding) {
+	list := l.bySource[b.Source]
+	for i, e := range list {
+		if e == b {
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(list) == 0 {
+		delete(l.bySource, b.Source)
+		return
+	}
+	l.bySource[b.Source] = list
+}
+
+// deleteLocked removes index i of an AoR's list, and the binding from every
+// other index. Caller holds the lock.
 func (l *Location) deleteLocked(aor string, i int) {
 	list := l.byAOR[aor]
 	delete(l.byToken, list[i].Token)
+	l.unindexSourceLocked(list[i])
 	list = append(list[:i], list[i+1:]...)
 	if len(list) == 0 {
 		delete(l.byAOR, aor)

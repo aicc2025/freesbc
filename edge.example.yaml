@@ -56,6 +56,15 @@ sip:
       # there is no way to click through the warning. Use a real one.
       cert_file: /etc/freesbc/wss-cert.pem
       key_file: /etc/freesbc/wss-key.pem
+    # A public out-of-dialog INVITE (a new call) is relayed to FreeSWITCH
+    # only from a registered client's own transport address or from a
+    # CARRIER SOURCE; anything else is dropped with no response. The IPs of
+    # the sip.pstn gateways below are carrier sources automatically. List
+    # here the IPs a carrier sends INBOUND calls from when they differ from
+    # the gateway address FreeSBC dials, or when there is no sip.pstn at
+    # all: literal IPs or CIDRs, no wider than /8 (IPv4) or /32 (IPv6).
+    # Restart-only.
+    # carrier_sources: [198.51.100.20, 203.0.113.0/28]
 
   private:
     bind: 10.77.0.2:5060        # FreeSBC's own FreeSWITCH-facing socket

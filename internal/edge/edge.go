@@ -82,6 +82,11 @@ type Server struct {
 	// media for and not yet seen answered (see admitEarly).
 	earlyMu sync.Mutex
 	early   map[netip.Addr]int
+
+	// dropWarned limits admission-drop WARNs to one per source IP and
+	// reason; enumLimit is the REGISTER enumeration limit (admission.go).
+	dropWarned *warnOnce
+	enumLimit  *enumLimiter
 }
 
 // udpMTUOnce raises sipgo's UDP send ceiling, once per process.
@@ -147,6 +152,8 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 		privSources:      newPrivateSources(),
 		ready:            make(chan struct{}),
 		early:            map[netip.Addr]int{},
+		dropWarned:       newWarnOnce(maxWarnedSources),
+		enumLimit:        newEnumLimiter(),
 		webrtcEnabled:    cfg.WebRTC.Enabled,
 	}
 	s.dialogs = newDialogTable(s.metrics, s.log)
@@ -210,10 +217,12 @@ func (s *Server) Run(ctx context.Context) error {
 			sip.WithTransportLayerLogger(sipgoLog),
 			// The edge proxy accepts traffic from anywhere — phones and
 			// browsers have no fixed address — so unlike the trunk plane
-			// there is no source-IP allowlist here. The read filter still
+			// there is no source-IP allowlist in the read filter. It
 			// enforces two things that do not depend on knowing the
 			// sender: a hard size cap before the parser touches anything,
-			// and the private listener's own trust boundary.
+			// and the private listener's own trust boundary. Who may push
+			// an out-of-dialog INVITE or a REGISTER into FreeSWITCH is
+			// decided after parsing, per request type (admission.go).
 			sip.WithTransportLayerReadFilter(s.readFilter()),
 		),
 		sipgo.WithUserAgentTransactionLayerOptions(sip.WithTransactionLayerLogger(sipgoLog)),
@@ -332,6 +341,10 @@ func (s *Server) Run(ctx context.Context) error {
 		// which one it is running to read the line.
 		"upstreams", len(s.topo.upstreamNames),
 		"upstream_nodes", strings.Join(s.topo.upstreamNames, ","),
+		// The INVITE admission posture (admission.go): sip.pstn gateway
+		// IPs plus sip.public.carrier_sources. Empty means only upstreams
+		// and registered clients may place calls on a public listener.
+		"carrier_sources", s.topo.carrierSourcesString(),
 		"webrtc", s.webrtcEnabled)
 
 	close(s.ready)

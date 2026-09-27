@@ -197,7 +197,35 @@ func startHarnessWSS(t *testing.T, webrtc bool) *harness {
 // startHarnessWith builds every harness variant. The fake FreeSWITCH, like
 // every other test endpoint, lives on 127.0.0.1, so the suite needs no
 // loopback alias (macOS configures only 127.0.0.1).
+//
+// Every client shares 127.0.0.1, so the shared fixture lists it in
+// sip.public.carrier_sources (harnessCarrierSources): the INVITE admission
+// check (admission.go) then admits every test client's out-of-dialog
+// INVITE, as it admits a carrier's, and the call-flow tests stay about call
+// flow. The admission tests use startHarnessStrict, which leaves the list
+// out.
 func startHarnessWith(t *testing.T, webrtc bool, pubBindIP string, pstn func(pubUDP int) string, wss bool) *harness {
+	t.Helper()
+	return startHarnessFull(t, webrtc, pubBindIP, pstn, wss, harnessCarrierSources)
+}
+
+// harnessCarrierSources is the sip.public.carrier_sources line of the shared
+// fixtures (see startHarnessWith).
+const harnessCarrierSources = "    carrier_sources: [127.0.0.1]\n"
+
+// startHarnessStrict is startHarness (plus a wss listener when wss is set)
+// WITHOUT sip.public.carrier_sources, so the INVITE admission check is live
+// for 127.0.0.1 clients: only a registered transport address may place a
+// call.
+func startHarnessStrict(t *testing.T, webrtc, wss bool) *harness {
+	t.Helper()
+	return startHarnessFull(t, webrtc, "127.0.0.1", nil, wss, "")
+}
+
+// startHarnessFull is startHarnessWith with the sip.public.carrier_sources
+// YAML line (four-space indent, newline-terminated) chosen
+// by the caller; "" configures none.
+func startHarnessFull(t *testing.T, webrtc bool, pubBindIP string, pstn func(pubUDP int) string, wss bool, carrierLine string) *harness {
 	t.Helper()
 	pubUDP := freePort(t)
 	pubWS := freeTCPPort(t)
@@ -227,7 +255,7 @@ sip:
   public:
     udp: {enabled: true, bind: "%s:%d"}
     ws:  {enabled: true, bind: "127.0.0.1:%d"}
-%s  private:
+%s%s  private:
     bind: "127.0.0.1:%d"
   upstream:
     address: 127.0.0.1:%d
@@ -245,7 +273,7 @@ shield:
   # 20/s per_ip would throttle the harness itself rather than the code
   # under test. The rate limiter has its own tests in package shield.
   rate_limit: "5000/s per_ip"
-`, pubBindIP, pubUDP, pubWS, wssBlock, priv, up, pstnBlock, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
+`, pubBindIP, pubUDP, pubWS, wssBlock, carrierLine, priv, up, pstnBlock, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
 
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
@@ -423,6 +451,7 @@ sip:
   public:
     udp: {enabled: true, bind: "127.0.0.1:%d"}
     ws:  {enabled: true, bind: "127.0.0.1:%d"}
+    carrier_sources: [127.0.0.1] # every client is 127.0.0.1; see startHarnessWith
   private:
     bind: "127.0.0.1:%d"
   upstreams:

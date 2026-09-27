@@ -32,6 +32,14 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, src neti
 		s.reject(req, tx, 403, "Forbidden")
 		return
 	}
+	if s.enumLimit.blocked(src.Addr()) {
+		// REGISTER enumeration limit (issue #86; admission.go): this
+		// source has had enumMaxAORs distinct AoRs rejected 403/404 within
+		// enumWindow. Silent, like the INVITE admission drop: returning
+		// unanswered lets sipgo terminate the transaction with nothing sent.
+		s.dropSilently(dropRegisterEnumeration, req, src)
+		return
+	}
 	from, ok := s.publicSideFor(req)
 	if !ok {
 		s.reject(req, tx, 488, "Not Acceptable Here")
@@ -231,6 +239,11 @@ func (s *Server) pumpRegister(ctx context.Context, req *sip.Request, tx sip.Serv
 			}
 			if final {
 				s.logRegister(res, in.aor, in.transport, in.source, in.unregister)
+				if countsAsEnumeration(res.StatusCode) && s.enumLimit.rejected(in.source.Addr(), in.aor) {
+					s.log.Warn("REGISTER enumeration limit reached; dropping this source's REGISTERs",
+						"public_remote", in.source.String(), "transport", in.transport,
+						"distinct_aors", enumMaxAORs, "window", enumWindow.String())
+				}
 				return res, true
 			}
 		case <-clTx.Done():

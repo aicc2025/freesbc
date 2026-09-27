@@ -95,6 +95,11 @@ type ProxyStats struct {
 	ICEFailures            uint64 `json:"webrtc_ice_failure_total"`
 	DTLSFailures           uint64 `json:"webrtc_dtls_failure_total"`
 	HandlerPanics          uint64 `json:"sip_handler_panics_total"`
+
+	// AdmissionDrops counts public requests the edge admission policy
+	// dropped silently, by reason (a fixed set: invite_not_admitted,
+	// register_enumeration).
+	AdmissionDrops map[string]uint64 `json:"admission_drops_total"`
 }
 
 // Server is the admin HTTP server.

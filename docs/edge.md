@@ -70,7 +70,7 @@ configuration, and the "Edge proxy plane" section of
 | re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role — in answers to the browser and in re-offers FreeSWITCH makes to it — so media is never interrupted. A re-INVITE that moves either side's media address re-points the anchor to it once the 2xx completes the exchange; one whose 2xx cannot be anchored is ACKed and the call is ended on both sides. |
 | Dialogs | Identified by Call-ID and both tags (RFC 3261 §12): only a BYE that names the dialog's tags, and that its far end accepts, ends it. The dialog is on record before its 2xx is relayed, so an immediate ACK always finds it; 2xx retransmissions are relayed until Timer M. |
 | Lifecycle | Media is released deterministically on BYE (from either side), CANCEL, a failed final response, dialog teardown, media silence, and shutdown. A 2xx whose SDP cannot be anchored — or one from a second fork, or one that races a CANCEL — is ACKed and BYEd rather than left as a zombie dialog. When media silence from either end (or a DTLS fingerprint mismatch) ends a call, both endpoints are sent a BYE. A CANCEL is relayed without holding up the caller's 487, and an INVITE that outlives its 5-minute backstop is CANCELled and answered 408; a client that never answers FreeSWITCH is answered 408/480 for it. |
-| Abuse | A source the shield has banned gets no response at all — it is dropped before parsing, so even what the SIP stack would answer on its own stays silent, and its TCP/TLS/WS/WSS connection is closed. A scanner over UDP, whose source address can be forged, has only its source socket banned, for a minute. Trunk peers get no exemption on this plane. One public IP may have at most 64 calls ringing out (media anchored, no answer yet) at once; one more is refused 503 before any port is allocated, since media is anchored before FreeSWITCH has authenticated the caller. A handler panic is contained, counted (`freesbc_sip_handler_panics_total`), and answered 500 only if no final response went out. |
+| Abuse | A public out-of-dialog INVITE is admitted only from a carrier source (the `sip.pstn` gateway IPs plus `sip.public.carrier_sources`), from FreeSWITCH, or from the exact transport address (transport + IP:port) of a live registration; anything else is dropped with no response at all and never reaches FreeSWITCH (see [Inbound calls from carriers](#inbound-calls-from-carriers)). A source whose REGISTERs FreeSWITCH has rejected 403/404 for 10 distinct AoRs within 10 minutes has its further REGISTERs dropped silently until that window ends (per IPv4 address, per IPv6 /64; challenges 401/407 do not count). Both drops are counted in `freesbc_edge_admission_drops_total{reason}` and logged at WARN once per source IP, then at debug. A source the shield has banned gets no response at all — it is dropped before parsing, so even what the SIP stack would answer on its own stays silent, and its TCP/TLS/WS/WSS connection is closed. A scanner over UDP, whose source address can be forged, has only its source socket banned, for a minute. Trunk peers get no exemption on this plane. One public IP may have at most 64 calls ringing out (media anchored, no answer yet) at once; one more is refused 503 before any port is allocated, since media is anchored before FreeSWITCH has authenticated the caller. A handler panic is contained, counted (`freesbc_sip_handler_panics_total`), and answered 500 only if no final response went out. |
 
 ## PSTN trunk
 
@@ -94,7 +94,9 @@ naming the match, then forwarded exactly like a call to a registered
 client: media anchored on both legs, each side offered only the SBC's own
 port, and in-dialog requests routed by Record-Route in both directions.
 A phone dialling the match address from the public side is unaffected —
-the source check fails and the call is proxied upstream as usual.
+the source check fails and the call is proxied upstream as usual (a
+registered phone calling from its registered address is admitted; see
+[Inbound calls from carriers](#inbound-calls-from-carriers)).
 
 ```yaml
 sip:
@@ -135,12 +137,43 @@ peer-to-peer bridge):
         data="sofia/internal/sip:${destination_number}@10.77.0.2:16060"/>
 ```
 
-Inbound carrier→FreeSWITCH calls need no trunk configuration: they arrive
-on the public side like any other unregistered caller and are proxied
-upstream unchanged. Note that they are also subject to the same
-[`shield`](trunk.md#configuration) rate limiting as any unregistered source — a
+### Inbound calls from carriers
+
+An inbound carrier→FreeSWITCH call arrives on the public side as an
+out-of-dialog INVITE from an unregistered source, and the edge plane admits
+such an INVITE only from a **carrier source**:
+
+- the IP of `sip.pstn.address` and of every `sip.pstn.gateways.*.address`,
+  derived automatically; and
+- every entry of `sip.public.carrier_sources`: literal IPs or CIDRs,
+  independent of `sip.pstn` (usable with no PSTN trunk at all), validated
+  like a trunk peer's `allowed_ips` (no prefix wider than /8 for IPv4 or /32
+  for IPv6, so `0.0.0.0/0` and `::/0` are refused).
+
+```yaml
+sip:
+  public:
+    carrier_sources: [198.51.100.20, 203.0.113.0/28]
+```
+
+A carrier's inbound signalling IPs often differ from the gateway address
+FreeSBC dials, so list them here. An INVITE from any other unregistered
+source gets no response and never reaches FreeSWITCH. The resulting set is
+logged at startup as `carrier_sources=` on the `edge proxy listening` line.
+The key is restart-only, like the rest of `sip.public`. Carrier INVITEs are
+admitted and then proxied upstream unchanged; they are still subject to the
+same [`shield`](trunk.md#configuration) rate limiting as any public source — a
 chatty carrier can be throttled like an attacker; raise its budget if
 needed.
+
+**Upgrade note.** Before this admission check, every public out-of-dialog
+INVITE was relayed to FreeSWITCH, so inbound carrier calls needed no
+configuration. They now need their source IPs to be a `sip.pstn` gateway
+address or to be listed in `sip.public.carrier_sources`; otherwise they are
+dropped silently (look for `invite_not_admitted` in
+`freesbc_edge_admission_drops_total` and the WARN line naming the source).
+Registered phones and browsers are unaffected: they call from the transport
+address they registered from.
 
 ## Multiple FreeSWITCHes (`sip.upstreams`)
 
@@ -200,6 +233,16 @@ re-registration, not an outage.
 
 These are structural rather than scheduled.
 
+- **A public call must come from a registered transport address or a
+  carrier source.** An out-of-dialog INVITE on a public listener is relayed
+  only when its transport, source IP and port match a live registration, or
+  its source IP is a carrier source (`sip.pstn` gateway IPs plus
+  `sip.public.carrier_sources`); anything else is dropped with no response.
+  A device that calls without registering through FreeSBC, or that sends its
+  INVITE from a different socket than its REGISTER (a NAT mapping that
+  changed since the last refresh, a new WebSocket connection), is refused
+  until it registers again from that address. Inbound carrier calls from IPs
+  not listed are dropped the same way.
 - **A FreeSWITCH-originated call to a browser needs `webrtc.enabled`.** A
   client registered over ws or wss is offered FreeSBC's own DTLS-SRTP offer
   (`UDP/TLS/RTP/SAVPF`, `a=ice-lite`, one host candidate at the public
