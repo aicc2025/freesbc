@@ -1,0 +1,81 @@
+# Builds prebuilt freesbc binaries for a version tag and attaches them to
+# the GitHub Release: one tar.gz per OS/arch plus SHA256SUMS. Runs on every
+# pushed v* tag; run it by hand with a tag to backfill an existing release.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: build and package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*}
+            arch=${target#*/}
+            name="freesbc_${TAG}_${os}_${arch}"
+            stage="dist/${name}"
+            mkdir -p "$stage"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=${TAG}" \
+              -o "${stage}/freesbc" ./cmd/freesbc
+            chmod 0755 "${stage}/freesbc"
+            cp README.md sbc.example.yaml edge.example.yaml "$stage"/
+            if [ -f LICENSE ]; then cp LICENSE "$stage"/; fi
+            tar -C dist -czf "dist/${name}.tar.gz" "$name"
+            rm -rf "$stage"
+          done
+          cd dist
+          sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: sanity check linux/amd64 binary
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/freesbc_${TAG}_linux_amd64.tar.gz" -C "$RUNNER_TEMP"
+          dir="${RUNNER_TEMP}/freesbc_${TAG}_linux_amd64"
+          # The CLI has no version flag, so confirm the stamped version is in the binary.
+          grep -aqF "$TAG" "${dir}/freesbc"
+          file "${dir}/freesbc"
+          "${dir}/freesbc" check -c "${dir}/edge.example.yaml"
+          CARRIER_A_PASS=x "${dir}/freesbc" check -c "${dir}/sbc.example.yaml"
+
+      - name: publish release assets
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+              --title "$TAG" --generate-notes --verify-tag
+          fi
