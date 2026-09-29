@@ -13,7 +13,18 @@ Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables 
 
 ## Install
 
-Requires Go ≥ 1.27.1.
+**Prebuilt binary** — each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and both example configs:
+
+```sh
+v=v0.1.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
+curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/freesbc_${v}_${os}_${arch}.tar.gz
+curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/SHA256SUMS
+shasum -a 256 -c --ignore-missing SHA256SUMS   # Linux: sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf freesbc_${v}_${os}_${arch}.tar.gz && cd freesbc_${v}_${os}_${arch}
+./freesbc check -c edge.example.yaml
+```
+
+**From source** — requires Go ≥ 1.27.1:
 
 ```sh
 go build -o freesbc ./cmd/freesbc
