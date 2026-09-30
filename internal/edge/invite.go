@@ -88,13 +88,36 @@ type attemptResult struct {
 //	parse the offer → allocate media → build the far-side offer →
 //	forward → on each fork's answer, negotiate codecs and build the
 //	near-side answer → on the 2xx, confirm the dialog → relay.
-func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort) {
+func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound) {
+	src := in.src
 	inDialog := isInDialog(req)
-	if !inDialog && !s.isPSTNBridgeInvite(req, src) && !s.arrivedOnPrivate(req) &&
-		!s.admitPublicInvite(req, src) {
+	if in.arr == arrPSTN {
+		// The dedicated PSTN listener (sip.pstn.match). guard has already
+		// exempted it from the shield, so nothing else may reach a carrier
+		// through it: only a fresh INVITE that names the match is a PSTN
+		// bridge. An in-dialog INVITE belongs on the private socket, and
+		// an INVITE for any other Request-URI is not something this
+		// listener serves — it must never fall through to the client or
+		// upstream paths. Both are FreeSWITCH's own mistakes, so they get
+		// an honest answer.
+		if inDialog {
+			s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
+			return
+		}
+		if !s.isPSTNBridgeInvite(req, in) {
+			s.reject(req, tx, 404, "Not Found")
+			return
+		}
+		if s.rejectRequired100rel(req, tx) {
+			return
+		}
+		s.inviteToPSTN(req, tx)
+		return
+	}
+	if !inDialog && !in.private() && !s.admitPublicInvite(req, src) {
 		// Admission (issue #86; admission.go): a public out-of-dialog
-		// INVITE from a source that is neither an upstream, a carrier
-		// source nor a registered transport address is dropped before
+		// INVITE from a source that is neither a carrier source nor a
+		// registered transport address is dropped before
 		// anything answers it — ahead of the 100rel check below, whose 420
 		// would otherwise tell a scanner something. Returning without a
 		// response is the whole mechanism: sipgo's Server.handleRequest
@@ -111,21 +134,16 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, src netip.
 		return // PRACK cannot pass the proxy (extensions.go)
 	}
 	if inDialog {
-		s.onReInvite(req, tx)
+		s.onReInvite(req, tx, in.private())
 		return
 	}
-	// FreeSWITCH bridging an outbound PSTN call arrives on the PUBLIC
-	// socket (it targets the public listener port over the private link),
-	// so the plane dispatch below would misread it as a public phone's
-	// call. Classify it first: upstream source + the configured match
-	// Request-URI. Ordering against arrivedOnPrivate does not matter for
-	// correctness — such a request can never be in privSources — but this
-	// keeps "most specific first".
-	if s.isPSTNBridgeInvite(req, src) {
-		s.inviteToPSTN(req, tx)
-		return
-	}
-	if s.arrivedOnPrivate(req) {
+	// FreeSWITCH bridging an outbound PSTN call is not handled here: it
+	// arrives on its own listener (in.arr == arrPSTN, above). An INVITE
+	// whose Request-URI merely names sip.pstn.match but reached the private
+	// or a public socket is an ordinary INVITE — from a public source it
+	// went through admission and is proxied upstream like any other, and it
+	// never dials a gateway.
+	if in.private() {
 		s.inviteToClient(req, tx)
 		return
 	}
@@ -133,19 +151,15 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, src netip.
 }
 
 // isPSTNBridgeInvite reports whether an INVITE is FreeSWITCH bridging an
-// outbound call to the PSTN carrier: it arrived from the configured
-// upstream AND its Request-URI names sip.pstn.match — the address the
-// dialplan sends PSTN prefixes to. Both halves are needed. A public phone
-// cannot trip this, because the source check fails for anything that did
-// not come from the upstream host; and a request from the upstream for any
-// other purpose fails the match check, because the match host:port is one
-// FreeSWITCH uses for nothing else (validation enforces it does not name
-// the SBC's private socket or the upstream itself).
-func (s *Server) isPSTNBridgeInvite(req *sip.Request, src netip.AddrPort) bool {
-	if !s.topo.pstnEnabled() {
-		return false
-	}
-	if !s.topo.fromUpstream(src.Addr()) {
+// outbound call to the PSTN carrier: it arrived on the dedicated PSTN
+// listener (sip.pstn.match) — the arrival the read filter stamped, so the
+// SOURCE address alone never suffices — and its Request-URI names that same
+// address, which is what the dialplan sends PSTN prefixes to. The
+// Request-URI half is defence in depth: the listener serves nothing else,
+// and validation keeps the match away from the private socket and the
+// upstream.
+func (s *Server) isPSTNBridgeInvite(req *sip.Request, in inbound) bool {
+	if !s.topo.pstnEnabled() || in.arr != arrPSTN {
 		return false
 	}
 	if req.Recipient.Host != s.topo.pstn.match.Host {

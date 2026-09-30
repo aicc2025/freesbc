@@ -355,6 +355,13 @@ func (c *Config) validateSockets(fail failFunc) {
 		}
 		b := c.SIP.Private.Bind
 		socks = append(socks, boundSocket{"sip.private.bind", "udp", b.Host, b.Port})
+		// sip.pstn.match is a UDP socket the edge binds itself: FreeSWITCH
+		// bridges PSTN calls to it, and it must not share its port with any
+		// other listener (a public wildcard bind on the same port included).
+		if !c.SIP.Pstn.Match.IsZero() {
+			m := c.SIP.Pstn.Match
+			socks = append(socks, boundSocket{"sip.pstn.match", "udp", m.Host, m.Port})
+		}
 	}
 	if c.Admin != nil {
 		if ap, err := netip.ParseAddrPort(c.Admin.Listen); err == nil {
@@ -417,7 +424,13 @@ func sortedKeys[V any](m map[string]V) []string {
 // keys on the match host:port alone (the called number varies per call),
 // so a match that names an address FreeSWITCH legitimately uses for other
 // traffic would shadow it: every such call would be routed to the carrier
-// instead of its real destination. The private SIP socket and the upstream
+// instead of its real destination.
+//
+// The match is also a socket: the edge binds a dedicated, trusted UDP
+// listener there (the "PSTN listener"), and that socket, not the sender's
+// address, is what makes an INVITE a PSTN bridge. It must therefore be a
+// local address of this host on a port no other listener uses; the
+// collision check is validateSockets'. The private SIP socket and the upstream
 // are exactly the two addresses FreeSWITCH talks to for everything else —
 // and in the pool shape "the upstream" is every node, not just the one the
 // operator happened to be thinking of, so the alias and all nodes are
@@ -427,8 +440,13 @@ func (c *Config) validatePSTNMatch(pstn PstnConfig, withKey string, fail failFun
 		fail("sip.pstn.match: required with %s", withKey)
 		return
 	}
-	if _, err := netip.ParseAddr(pstn.Match.Host); err != nil {
+	if ip, err := netip.ParseAddr(pstn.Match.Host); err != nil {
 		fail("sip.pstn.match: %q is not a literal IP — the edge plane does no DNS", pstn.Match.Host)
+	} else if ip.IsUnspecified() {
+		// A wildcard bind would put the trusted PSTN listener on every
+		// interface, the public one included, and no Request-URI could
+		// ever name it.
+		fail("sip.pstn.match: %q is unspecified — it must be the specific private address FreeSWITCH dials", pstn.Match.Host)
 	}
 	if pstn.Match.Host == c.SIP.Private.Bind.Host && pstn.Match.Port == c.SIP.Private.Bind.Port {
 		fail("sip.pstn.match: must not name the SBC's private SIP address")

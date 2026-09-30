@@ -96,14 +96,12 @@ func (t *topology) carrierSourcesString() string {
 }
 
 // admitPublicInvite decides whether an out-of-dialog INVITE that arrived
-// on a public listener, and is not a PSTN bridge from FreeSWITCH, may be
-// relayed upstream. It is admitted when its transport source is:
+// on a public listener may be relayed upstream. FreeSWITCH is not among the
+// admitted sources: it speaks only on the private bind and the PSTN
+// listener, both trusted sockets that never reach this check, so a public
+// read from FreeSWITCH's own address is an ordinary public INVITE. It is
+// admitted when its transport source is:
 //
-//   - FreeSWITCH itself: the exact transport address it uses on the
-//     private socket (privSources), which is how guard and the read filter
-//     already recognise FreeSWITCH on a public listener. Its PSTN bridge
-//     INVITE is classified before this check (isPSTNBridgeInvite, by
-//     upstream IP), so this only covers anything else it sends there;
 //   - inside a carrier-source prefix (sip.pstn gateways and
 //     sip.public.carrier_sources);
 //   - exactly the transport address (transport + IP:port) of a live
@@ -115,9 +113,6 @@ func (t *topology) carrierSourcesString() string {
 // The check keys on the transport source only, never on From or any
 // identity header, so it cannot be talked past by a spoofed header.
 func (s *Server) admitPublicInvite(req *sip.Request, src netip.AddrPort) bool {
-	if s.topo.fromUpstream(src.Addr()) && s.privSources.has(req.Source()) {
-		return true
-	}
 	if s.topo.isCarrierSource(src.Addr()) {
 		return true
 	}

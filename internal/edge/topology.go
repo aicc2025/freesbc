@@ -471,14 +471,18 @@ func (t *topology) isSelfVia(v *sip.ViaHeader) bool {
 	return false
 }
 
-// fromUpstream reports whether a request arrived from a FreeSWITCH in the
-// upstream pool. The transport source address is the only trustworthy
-// signal — never a Via or From host, which the sender controls.
+// fromUpstream reports whether a datagram's transport source address is one
+// of the FreeSWITCHes in the upstream pool. It is NOT a trust decision on
+// its own: an address is forgeable and a public listener can be sent
+// anything. It is only the source-IP gate the read filter applies on the
+// TRUSTED sockets (the private bind and the PSTN listener), where the local
+// socket has already made the datagram FreeSWITCH-facing and this merely
+// keeps every other host out. Never a Via or From host, which the sender
+// controls.
 //
 // Membership is by IP across the WHOLE pool, not by a single address: with
-// several switches, any of them may source a request, and the trust
-// decision (readFilter, arrivedOnPrivate, the PSTN-bridge classification,
-// the shield exemption) must not depend on which one. Only the IP is
+// several switches, any of them may source a request, and the gate must
+// not depend on which one. Only the IP is
 // compared, not the port: FreeSWITCH may source a request from an
 // ephemeral port while still listening on its configured one. Two nodes
 // behind one IP are therefore indistinguishable for trust purposes — fine,

@@ -25,8 +25,8 @@ import (
 // candidates and a DTLS fingerprint. What is NOT re-done is allocation:
 // the session keeps the ports and, for a WebRTC leg, the ICE and DTLS
 // state it already holds, so a renegotiation never interrupts media.
-func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
-	from, to, dest, d, ok := s.directionFor(req)
+func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivate bool) {
+	from, to, dest, d, ok := s.directionFor(req, onPrivate)
 	if !ok || d == nil || d.session() == nil {
 		// No confirmed dialog with these tags, or no anchored session to
 		// renegotiate against. Forwarding the body as-is here would be the
@@ -215,8 +215,8 @@ func (s *Server) applyReInvite(d *dialog, offerer plane, offer *sdp.Session, ans
 // (RFC 3261 §17.1.1.3) and must be sent statelessly, not through a client
 // transaction — sipgo enforces this by refusing an ACK in
 // TransactionRequest.
-func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
-	from, to, dest, d, ok := s.directionFor(req)
+func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
+	from, to, dest, d, ok := s.directionFor(req, in.private())
 	if !ok {
 		return // nothing to forward it to; an ACK gets no response
 	}
@@ -234,7 +234,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrP
 // INVITE server transaction. When it DID match, sipgo answers 200 and
 // terminates the INVITE itself, which fires the OnCancel hook that
 // cancels our upstream leg — so this path only sees an orphan.
-func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
+func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ inbound) {
 	if d, ok := s.dialogs.early(fsip.CallID(req), fsip.FromTag(req)); ok && s.cancelCall(d, cancelOrphan) {
 		s.respond(req, tx, sip.NewResponseFromRequest(req, 200, "OK", nil))
 		return
@@ -274,13 +274,13 @@ func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ netip.Ad
 // answered 481 only when no dialog with a public route carries the
 // Call-ID. BYE, INFO and ACK, and every NOTIFY from the public plane, keep
 // exact tag matching. The no-To-tag rule above is separate and unchanged.
-func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
-	if req.Method == sip.NOTIFY && fsip.ToTag(req) == "" && !s.arrivedOnPrivate(req) {
+func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbound) {
+	if req.Method == sip.NOTIFY && fsip.ToTag(req) == "" && !in.private() {
 		s.reject(req, tx, 481, "Subscription Does Not Exist")
 		return
 	}
-	from, to, dest, d, ok := s.directionFor(req)
-	if !ok && req.Method == sip.NOTIFY && fsip.ToTag(req) != "" && s.arrivedOnPrivate(req) {
+	from, to, dest, d, ok := s.directionFor(req, in.private())
+	if !ok && req.Method == sip.NOTIFY && fsip.ToTag(req) != "" && in.private() {
 		from, to, dest, d, ok = s.relaxedNotifyDirection(req)
 	}
 	if !ok {
@@ -393,7 +393,8 @@ func byeEndsDialog(final *sip.Response) bool {
 	return final.StatusCode/100 == 2 || final.StatusCode == 481 || final.StatusCode == 408
 }
 
-// directionFor decides where an in-dialog request goes, from which side,
+// directionFor decides where an in-dialog request goes, from which side
+// (onPrivate: it arrived on the private bind, see arrival.go),
 // and — when the request names one — which confirmed dialog it belongs
 // to.
 //
@@ -404,8 +405,7 @@ func byeEndsDialog(final *sip.Response) bool {
 // that names no confirmed dialog is still routed — FreeSBC is a proxy, and
 // the endpoint itself answers 481 honestly — but d is nil, so nothing is
 // torn down on its account.
-func (s *Server) directionFor(req *sip.Request) (from, to side, dest string, d *dialog, ok bool) {
-	onPrivate := s.arrivedOnPrivate(req)
+func (s *Server) directionFor(req *sip.Request, onPrivate bool) (from, to side, dest string, d *dialog, ok bool) {
 	if dd, fromCaller, found := s.dialogs.lookup(fsip.CallID(req), fsip.FromTag(req), fsip.ToTag(req)); found {
 		sender := dd.callerPlane
 		if !fromCaller {

@@ -137,6 +137,7 @@ type harness struct {
 	publicWS   string // where a browser connects
 	publicWSS  string // where a browser connects over TLS ("" unless startHarnessWSS)
 	privateSIP string // the proxy's FreeSWITCH-facing socket
+	pstnMatch  string // sip.pstn.match: the dedicated PSTN listener ("" without sip.pstn)
 	upstream   string // the fake FreeSWITCH
 
 	fs *fakeSwitch
@@ -178,10 +179,11 @@ func startHarnessOn(t *testing.T, webrtc bool, pubBindIP string) *harness {
 }
 
 // startHarnessCfg is startHarnessOn with an optional sip.pstn block chosen
-// by the caller. pstn, when non-nil, is called with the public UDP port
-// once it is allocated and must return the YAML for the sip.pstn section
-// ("" disables the trunk).
-func startHarnessCfg(t *testing.T, webrtc bool, pubBindIP string, pstn func(pubUDP int) string) *harness {
+// by the caller. pstn, when non-nil, is called with the port of the
+// dedicated PSTN listener (the port of sip.pstn.match, on 127.0.0.1, a port
+// of its own from the SIP band) and must return the YAML for the sip.pstn
+// section ("" disables the trunk).
+func startHarnessCfg(t *testing.T, webrtc bool, pubBindIP string, pstn func(matchPort int) string) *harness {
 	t.Helper()
 	return startHarnessWith(t, webrtc, pubBindIP, pstn, false)
 }
@@ -204,7 +206,7 @@ func startHarnessWSS(t *testing.T, webrtc bool) *harness {
 // INVITE, as it admits a carrier's, and the call-flow tests stay about call
 // flow. The admission tests use startHarnessStrict, which leaves the list
 // out.
-func startHarnessWith(t *testing.T, webrtc bool, pubBindIP string, pstn func(pubUDP int) string, wss bool) *harness {
+func startHarnessWith(t *testing.T, webrtc bool, pubBindIP string, pstn func(matchPort int) string, wss bool) *harness {
 	t.Helper()
 	return startHarnessFull(t, webrtc, pubBindIP, pstn, wss, harnessCarrierSources)
 }
@@ -225,7 +227,7 @@ func startHarnessStrict(t *testing.T, webrtc, wss bool) *harness {
 // startHarnessFull is startHarnessWith with the sip.public.carrier_sources
 // YAML line (four-space indent, newline-terminated) chosen
 // by the caller; "" configures none.
-func startHarnessFull(t *testing.T, webrtc bool, pubBindIP string, pstn func(pubUDP int) string, wss bool, carrierLine string) *harness {
+func startHarnessFull(t *testing.T, webrtc bool, pubBindIP string, pstn func(matchPort int) string, wss bool, carrierLine string) *harness {
 	t.Helper()
 	pubUDP := freePort(t)
 	pubWS := freeTCPPort(t)
@@ -239,9 +241,13 @@ func startHarnessFull(t *testing.T, webrtc bool, pubBindIP string, pstn func(pub
 	// Media ranges are per-harness so no two tests contend for a port.
 	mediaBase := nextMediaBase(t)
 
-	pstnBlock := ""
+	pstnBlock, pstnMatch := "", ""
 	if pstn != nil {
-		pstnBlock = pstn(pubUDP)
+		matchPort := freePort(t)
+		pstnBlock = pstn(matchPort)
+		if pstnBlock != "" {
+			pstnMatch = fmt.Sprintf("127.0.0.1:%d", matchPort)
+		}
 	}
 	yaml := fmt.Sprintf(`
 network:
@@ -292,6 +298,7 @@ shield:
 		publicWS:   fmt.Sprintf("127.0.0.1:%d", pubWS),
 		publicWSS:  publicWSS,
 		privateSIP: fmt.Sprintf("127.0.0.1:%d", priv),
+		pstnMatch:  pstnMatch,
 		upstream:   fmt.Sprintf("127.0.0.1:%d", up),
 		done:       make(chan struct{}),
 	}
@@ -323,9 +330,10 @@ shield:
 // so a test can install its answer hooks and assert on what it receives.
 //
 // The upstream FreeSWITCH shares 127.0.0.1 with every client, so on this
-// harness any 127.0.0.1 source counts as the upstream: the proxy's
-// "source is the upstream" gate compares the IP only. That gate is checked
-// directly, without sockets, by TestPSTNMatchFromNonUpstreamFallsThrough.
+// harness any 127.0.0.1 source counts as the upstream: the trusted sockets'
+// "source is an upstream IP" gate compares the IP only. That the PSTN
+// listener, not that gate, is what makes a call a bridge is checked by
+// TestAuditPSTNMatchOnPublicListenerNeverDials (P2-EDG-003).
 func startHarnessPSTN(t *testing.T) (*harness, *fakeSwitch) {
 	t.Helper()
 	// The carrier gateway address must be in the config, so its port is
@@ -333,8 +341,8 @@ func startHarnessPSTN(t *testing.T) (*harness, *fakeSwitch) {
 	// is up, since the proxy never pings a peer-to-peer gateway (there is
 	// nothing to ping: no registration, no keepalives).
 	carrierAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h := startHarnessCfg(t, false, "127.0.0.1", func(pubUDP int) string {
-		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", carrierAddr, pubUDP)
+	h := startHarnessCfg(t, false, "127.0.0.1", func(matchPort int) string {
+		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", carrierAddr, matchPort)
 	})
 	carrier := startFakeSwitch(t, carrierAddr)
 	h.carrier = carrier
@@ -356,7 +364,7 @@ func startHarnessPSTN(t *testing.T) (*harness, *fakeSwitch) {
 // use — so the failover ORDER and the match prefixes are the caller's to
 // choose. attemptTimeout, when non-empty, is spliced under `attempt_timeout:`
 // (the tests that need a fast-failing gateway pass "300ms"); the match is
-// always the harness's own public UDP socket, and cooldown rides the
+// always the harness's own dedicated PSTN listener (h.pstnMatch), and cooldown rides the
 // 30-second default unless the caller wants otherwise.
 func startHarnessPSTNGateways(t *testing.T, attemptTimeout, routesYAML string, gwAddrs map[string]string) (*harness, map[string]*fakeSwitch) {
 	t.Helper()
@@ -378,9 +386,9 @@ func startHarnessPSTNGateways(t *testing.T, attemptTimeout, routesYAML string, g
 	if attemptTimeout != "" {
 		budget = "    attempt_timeout: " + attemptTimeout + "\n"
 	}
-	h := startHarnessCfg(t, false, "127.0.0.1", func(pubUDP int) string {
+	h := startHarnessCfg(t, false, "127.0.0.1", func(matchPort int) string {
 		return fmt.Sprintf("  pstn:\n    match: 127.0.0.1:%d\n%s    gateways:\n%s    routes:\n%s",
-			pubUDP, budget, gateways.String(), routesYAML)
+			matchPort, budget, gateways.String(), routesYAML)
 	})
 	switches := make(map[string]*fakeSwitch, len(names))
 	h.pstnGateways = make(map[string]*fakeSwitch, len(names))

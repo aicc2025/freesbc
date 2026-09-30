@@ -62,7 +62,7 @@ func mustParseProxy(t *testing.T, yaml string) *Config {
 // pstnTrunk is a valid sip.pstn section for the proxyYAML shape: a carrier
 // gateway on the public side whose match address nothing else uses (it is
 // not the private socket and not the upstream).
-const pstnTrunk = "  pstn:\n    address: 223.76.90.4:16060\n    match: 203.0.113.7:16060\n"
+const pstnTrunk = "  pstn:\n    address: 223.76.90.4:16060\n    match: 203.0.113.7:16061\n"
 
 // withPSTN tucks a sip.pstn section into a proxyYAML-shaped config, right
 // after the upstream stanza it belongs beside — both are keys of sip:.
@@ -106,8 +106,8 @@ func TestPSTNTrunkParses(t *testing.T) {
 	if got := c.SIP.Pstn.Address; got != "223.76.90.4:16060" {
 		t.Errorf("Pstn.Address = %q", got)
 	}
-	if got := c.SIP.Pstn.Match.Host; got != "203.0.113.7" || c.SIP.Pstn.Match.Port != 16060 {
-		t.Errorf("Pstn.Match = %s, want 203.0.113.7:16060", c.SIP.Pstn.Match)
+	if got := c.SIP.Pstn.Match.Host; got != "203.0.113.7" || c.SIP.Pstn.Match.Port != 16061 {
+		t.Errorf("Pstn.Match = %s, want 203.0.113.7:16061", c.SIP.Pstn.Match)
 	}
 	if got := c.SIP.Pstn.Transport; got != "udp" {
 		t.Errorf("Pstn.Transport = %q, want the udp default", got)
@@ -135,7 +135,7 @@ func TestPSTNTrunkParses(t *testing.T) {
 // regexp is single-quoted YAML on purpose: a double-quoted "\d" is not a
 // YAML escape and would not parse.
 const multiPSTN = `  pstn:
-    match: 203.0.113.7:16060
+    match: 203.0.113.7:16061
     gateways:
       gw-mobile:
         address: 223.76.90.4:16060
@@ -156,7 +156,7 @@ func TestPSTNGatewaysParses(t *testing.T) {
 	if pstn.Address != "" {
 		t.Errorf("alias Address set in the multi shape: %q", pstn.Address)
 	}
-	if got := pstn.Match.String(); got != "203.0.113.7:16060" {
+	if got := pstn.Match.String(); got != "203.0.113.7:16061" {
 		t.Errorf("Match = %s", got)
 	}
 	if got := pstn.AttemptTimeout.Std(); got != 32*time.Second {
@@ -195,7 +195,7 @@ func TestPSTNGatewaysParses(t *testing.T) {
 // is exercised too, as that is the shape the examples document.
 func TestPSTNGatewaysExplicitAndCatchalls(t *testing.T) {
 	explicit := `  pstn:
-    match: 203.0.113.7:16060
+    match: 203.0.113.7:16061
     attempt_timeout: 45s
     cooldown: 90s
     gateways:
@@ -365,7 +365,7 @@ func TestPSTNMatchRejectsPoolNode(t *testing.T) {
 	poolYAML := strings.Replace(withUpstreams(proxyYAML, multiUpstreams),
 		"      fs-b:\n        address: 10.77.0.11:5060\n",
 		"      fs-b:\n        address: 10.77.0.11:5060\n"+pstnTrunk, 1)
-	yaml := strings.Replace(poolYAML, "match: 203.0.113.7:16060", "match: 10.77.0.11:5060", 1)
+	yaml := strings.Replace(poolYAML, "match: 203.0.113.7:16061", "match: 10.77.0.11:5060", 1)
 	if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "sip.pstn.match: must not name the upstream") {
 		t.Fatalf("want the must-not-name-the-upstream error, got %v", err)
 	}
@@ -374,7 +374,7 @@ func TestPSTNMatchRejectsPoolNode(t *testing.T) {
 		t.Fatalf("valid pool + pstn config rejected: %v", err)
 	}
 	// The alias collision keeps the same message (and the same check).
-	aliasYAML := strings.Replace(withPSTN(proxyYAML, pstnTrunk), "match: 203.0.113.7:16060", "match: 10.77.0.10:5060", 1)
+	aliasYAML := strings.Replace(withPSTN(proxyYAML, pstnTrunk), "match: 203.0.113.7:16061", "match: 10.77.0.10:5060", 1)
 	if _, err := Parse([]byte(aliasYAML)); err == nil || !strings.Contains(err.Error(), "sip.pstn.match: must not name the upstream") {
 		t.Fatalf("alias: want the must-not-name-the-upstream error, got %v", err)
 	}
@@ -407,7 +407,7 @@ func TestPSTNMultiValidationErrors(t *testing.T) {
 		},
 		{
 			"gateways without match",
-			func(s string) string { return strings.Replace(s, "    match: 203.0.113.7:16060\n", "", 1) },
+			func(s string) string { return strings.Replace(s, "    match: 203.0.113.7:16061\n", "", 1) },
 			"sip.pstn.match: required with sip.pstn.gateways",
 		},
 		{
@@ -482,14 +482,14 @@ func TestPSTNMultiValidationErrors(t *testing.T) {
 		{
 			"match names the private socket in the multi shape",
 			func(s string) string {
-				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.2:5060", 1)
+				return strings.Replace(s, "match: 203.0.113.7:16061", "match: 10.77.0.2:5060", 1)
 			},
 			"sip.pstn.match: must not name the SBC's private SIP address",
 		},
 		{
 			"match names the upstream in the multi shape",
 			func(s string) string {
-				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.10:5060", 1)
+				return strings.Replace(s, "match: 203.0.113.7:16061", "match: 10.77.0.10:5060", 1)
 			},
 			"sip.pstn.match: must not name the upstream",
 		},
@@ -613,7 +613,7 @@ func TestProxyValidationErrors(t *testing.T) {
 			"pstn match names the private socket",
 			func(s string) string {
 				s = withPSTN(s, pstnTrunk)
-				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.2:5060", 1)
+				return strings.Replace(s, "match: 203.0.113.7:16061", "match: 10.77.0.2:5060", 1)
 			},
 			"sip.pstn.match: must not name the SBC's private SIP address",
 		},
@@ -621,7 +621,7 @@ func TestProxyValidationErrors(t *testing.T) {
 			"pstn match names the upstream",
 			func(s string) string {
 				s = withPSTN(s, pstnTrunk)
-				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.10:5060", 1)
+				return strings.Replace(s, "match: 203.0.113.7:16061", "match: 10.77.0.10:5060", 1)
 			},
 			"sip.pstn.match: must not name the upstream",
 		},
@@ -645,7 +645,7 @@ func TestProxyValidationErrors(t *testing.T) {
 		{
 			"pstn match without address",
 			func(s string) string {
-				return withPSTN(s, "  pstn:\n    match: 203.0.113.7:16060\n")
+				return withPSTN(s, "  pstn:\n    match: 203.0.113.7:16061\n")
 			},
 			"sip.pstn.match: requires sip.pstn.address",
 		},
@@ -872,5 +872,37 @@ func TestHostsCollide(t *testing.T) {
 		if got := hostsCollide(tt.a, tt.b); got != tt.want {
 			t.Errorf("hostsCollide(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
 		}
+	}
+}
+
+// sip.pstn.match is a UDP socket the edge binds itself, so it may not share
+// a port with any listener: on the same port as the public UDP listener
+// (wildcard or not), the private bind, or a trunk listener, it is an
+// "already bound" error, exactly like two listeners on one socket.
+func TestPSTNMatchIsASocketAndMustNotCollide(t *testing.T) {
+	base := withPSTN(proxyYAML, pstnTrunk)
+	if _, err := Parse([]byte(base)); err != nil {
+		t.Fatalf("the match on its own port must validate: %v", err)
+	}
+	for name, tc := range map[string]struct {
+		match string
+		want  string
+	}{
+		"public wildcard udp port": {"10.77.0.2:16060", "sip.pstn.match: udp/10.77.0.2:16060 already bound by sip.public.udp.bind"},
+		"public udp exact":         {"203.0.113.7:16060", "sip.pstn.match: udp/203.0.113.7:16060 already bound by sip.public.udp.bind"},
+		"wildcard ipv4":            {"0.0.0.0:16061", "sip.pstn.match: \"0.0.0.0\" is unspecified"},
+		"wildcard ipv6":            {"'[::]:16061'", "sip.pstn.match: \"::\" is unspecified"},
+	} {
+		yaml := strings.Replace(base, "match: 203.0.113.7:16061", "match: "+tc.match, 1)
+		_, err := Parse([]byte(yaml))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want it to contain %q", name, err, tc.want)
+		}
+	}
+	// The same port as a TCP listener is a different socket: ws/wss listen
+	// on TCP, and the match is UDP.
+	ok := strings.Replace(base, "match: 203.0.113.7:16061", "match: 203.0.113.7:18080", 1)
+	if _, err := Parse([]byte(ok)); err != nil {
+		t.Errorf("a UDP match on a TCP listener's port must validate: %v", err)
 	}
 }
