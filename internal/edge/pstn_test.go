@@ -51,8 +51,8 @@ func placePSTNCall(t *testing.T, h *harness, carrier *fakeSwitch, number string)
 	// The dialplan bridge: an INVITE whose Request-URI is the called number
 	// AT the match address, sent to that same address — the proxy's public
 	// socket — from the upstream's own source.
-	ruri := sip.Uri{User: number, Host: "127.0.0.1", Port: portOf(h.publicUDP)}
-	res := h.fs.call(t, ruri, h.publicUDP, phoneOfferSDP(h.fs.rtpPort))
+	ruri := sip.Uri{User: number, Host: "127.0.0.1", Port: portOf(h.pstnMatch)}
+	res := h.fs.call(t, ruri, h.pstnMatch, phoneOfferSDP(h.fs.rtpPort))
 	if res.StatusCode != 200 {
 		t.Fatalf("bridged INVITE: got %d, want 200", res.StatusCode)
 	}
@@ -223,12 +223,11 @@ func TestPSTNUnconfiguredFallsBackTo404(t *testing.T) {
 }
 
 // TestPSTNMatchFromNonUpstreamFallsThrough guards the classification's
-// source half: a request whose Request-URI names the match must NOT be
-// whisked off to the carrier unless it came from the upstream — a phone
-// dialing that address is an ordinary client call. The gate compares the
-// source IP only, and every harness endpoint shares 127.0.0.1, so the check
-// is made directly on isPSTNBridgeInvite with a source that is not the
-// upstream, rather than over a socket.
+// socket half: an INVITE whose Request-URI names the match is a PSTN bridge
+// only when it arrived on the dedicated PSTN listener. The sender's address
+// never decides it — an INVITE from the upstream's own address and port that
+// reached the private bind or a public listener is an ordinary INVITE
+// (P2-EDG-003) — and the Request-URI half still has to name the match.
 func TestPSTNMatchFromNonUpstreamFallsThrough(t *testing.T) {
 	h, _ := startHarnessPSTN(t)
 
@@ -236,18 +235,19 @@ func TestPSTNMatchFromNonUpstreamFallsThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	match := sip.NewRequest(sip.INVITE, sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.publicUDP)})
-	if !h.srv.isPSTNBridgeInvite(match, upstream) {
-		t.Errorf("a match-addressed INVITE from the upstream %s was not classified as a PSTN bridge", upstream)
+	match := sip.NewRequest(sip.INVITE, sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.pstnMatch)})
+	if !h.srv.isPSTNBridgeInvite(match, inbound{src: upstream, arr: arrPSTN}) {
+		t.Errorf("a match-addressed INVITE that arrived on the PSTN listener was not classified as a PSTN bridge")
 	}
-	phone := netip.MustParseAddrPort("203.0.113.5:5060")
-	if h.srv.isPSTNBridgeInvite(match, phone) {
-		t.Errorf("a match-addressed INVITE from the non-upstream %s was classified as a PSTN bridge", phone)
+	for _, arr := range []arrival{arrPublic, arrPrivate} {
+		if h.srv.isPSTNBridgeInvite(match, inbound{src: upstream, arr: arr}) {
+			t.Errorf("a match-addressed INVITE from the upstream %s that arrived on socket class %d was classified as a PSTN bridge", upstream, arr)
+		}
 	}
-	// The Request-URI half, from the upstream: another port is not the match.
+	// The Request-URI half, on the PSTN listener: another port is not the match.
 	other := sip.NewRequest(sip.INVITE, sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.privateSIP)})
-	if h.srv.isPSTNBridgeInvite(other, upstream) {
-		t.Error("an INVITE from the upstream that does not name the match was classified as a PSTN bridge")
+	if h.srv.isPSTNBridgeInvite(other, inbound{src: upstream, arr: arrPSTN}) {
+		t.Error("an INVITE on the PSTN listener that does not name the match was classified as a PSTN bridge")
 	}
 }
 
@@ -265,8 +265,8 @@ func TestPSTNMatchFromNonUpstreamFallsThrough(t *testing.T) {
 // the caller, who decides what the code proves.
 func bridgePSTNCall(t *testing.T, h *harness, number string) *sip.Response {
 	t.Helper()
-	ruri := sip.Uri{User: number, Host: "127.0.0.1", Port: portOf(h.publicUDP)}
-	res := h.fs.call(t, ruri, h.publicUDP, phoneOfferSDP(h.fs.rtpPort))
+	ruri := sip.Uri{User: number, Host: "127.0.0.1", Port: portOf(h.pstnMatch)}
+	res := h.fs.call(t, ruri, h.pstnMatch, phoneOfferSDP(h.fs.rtpPort))
 	if res.StatusCode == 200 {
 		waitForCommitted(t, h)
 		h.fs.sendAckTo2xx(t, res)
@@ -953,14 +953,14 @@ func TestPSTNCancelACKsGateway487(t *testing.T) {
 	// returns without draining.
 	gw := startRawGateway(t, gwAddr, 100*time.Millisecond)
 	gwB := startRawGateway(t, gwBAddr, 100*time.Millisecond)
-	h := startHarnessCfg(t, false, "127.0.0.1", func(pubUDP int) string {
+	h := startHarnessCfg(t, false, "127.0.0.1", func(matchPort int) string {
 		return fmt.Sprintf("  pstn:\n    match: 127.0.0.1:%d\n    gateways:\n"+
 			"      gw-a:\n        address: %s\n      gw-b:\n        address: %s\n"+
-			"    routes:\n      - to: [gw-a, gw-b]\n", pubUDP, gwAddr, gwBAddr)
+			"    routes:\n      - to: [gw-a, gw-b]\n", matchPort, gwAddr, gwBAddr)
 	})
 
-	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.publicUDP)}
-	invite, final := h.fs.callAsync(t, ruri, h.publicUDP, phoneOfferSDP(h.fs.rtpPort))
+	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.pstnMatch)}
+	invite, final := h.fs.callAsync(t, ruri, h.pstnMatch, phoneOfferSDP(h.fs.rtpPort))
 
 	// The bridged INVITE reached the carrier and the carrier is ringing.
 	invs := gw.waitFor(sip.INVITE, 1, 5*time.Second)
@@ -970,7 +970,7 @@ func TestPSTNCancelACKsGateway487(t *testing.T) {
 	branch, _ := invs[0].Via().Params.Get("branch")
 
 	// FreeSWITCH's dialplan gives up mid-ring.
-	h.fs.cancelCall(t, invite, h.publicUDP)
+	h.fs.cancelCall(t, invite, h.pstnMatch)
 
 	// The SBC relayed the CANCEL and the gateway answered it; the gateway's
 	// 487 for the INVITE follows afterCancel later.

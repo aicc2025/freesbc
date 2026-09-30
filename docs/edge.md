@@ -70,7 +70,7 @@ configuration, and the "Edge proxy plane" section of
 | re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role — in answers to the browser and in re-offers FreeSWITCH makes to it — so media is never interrupted. A re-INVITE that moves either side's media address re-points the anchor to it once the 2xx completes the exchange; one whose 2xx cannot be anchored is ACKed and the call is ended on both sides. |
 | Dialogs | Identified by Call-ID and both tags (RFC 3261 §12): only a BYE that names the dialog's tags, and that its far end accepts, ends it. The dialog is on record before its 2xx is relayed, so an immediate ACK always finds it; 2xx retransmissions are relayed until Timer M. |
 | Lifecycle | Media is released deterministically on BYE (from either side), CANCEL, a failed final response, dialog teardown, media silence, and shutdown. A 2xx whose SDP cannot be anchored — or one from a second fork, or one that races a CANCEL — is ACKed and BYEd rather than left as a zombie dialog. When media silence from either end (or a DTLS fingerprint mismatch) ends a call, both endpoints are sent a BYE. A CANCEL is relayed without holding up the caller's 487, and an INVITE that outlives its 5-minute backstop is CANCELled and answered 408; a client that never answers FreeSWITCH is answered 408/480 for it. |
-| Abuse | A public out-of-dialog INVITE is admitted only from a carrier source (the `sip.pstn` gateway IPs plus `sip.public.carrier_sources`), from FreeSWITCH, or from the exact transport address (transport + IP:port) of a live registration; anything else is dropped with no response at all and never reaches FreeSWITCH (see [Inbound calls from carriers](#inbound-calls-from-carriers)). A source whose REGISTERs FreeSWITCH has rejected 403/404 for 10 distinct AoRs within 10 minutes has its further REGISTERs dropped silently until that window ends (per IPv4 address, per IPv6 /64; challenges 401/407 do not count). Both drops are counted in `freesbc_edge_admission_drops_total{reason}` and logged at WARN once per source IP, then at debug. A source the shield has banned gets no response at all — it is dropped before parsing, so even what the SIP stack would answer on its own stays silent, and its TCP/TLS/WS/WSS connection is closed. A scanner over UDP, whose source address can be forged, has only its source socket banned, for a minute. Trunk peers get no exemption on this plane. One public IP may have at most 64 calls ringing out (media anchored, no answer yet) at once; one more is refused 503 before any port is allocated, since media is anchored before FreeSWITCH has authenticated the caller. A handler panic is contained, counted (`freesbc_sip_handler_panics_total`), and answered 500 only if no final response went out. |
+| Abuse | A public out-of-dialog INVITE is admitted only from a carrier source (the `sip.pstn` gateway IPs plus `sip.public.carrier_sources`) or from the exact transport address (transport + IP:port) of a live registration; anything else is dropped with no response at all and never reaches FreeSWITCH (see [Inbound calls from carriers](#inbound-calls-from-carriers)). FreeSWITCH is trusted by the local socket it reaches (the private bind and the PSTN listener), never by its source address: a datagram from FreeSWITCH's own address that reaches a public listener is an ordinary public datagram, shielded and subject to admission. A source whose REGISTERs FreeSWITCH has rejected 403/404 for 10 distinct AoRs within 10 minutes has its further REGISTERs dropped silently until that window ends (per IPv4 address, per IPv6 /64; challenges 401/407 do not count). Both drops are counted in `freesbc_edge_admission_drops_total{reason}` and logged at WARN once per source IP, then at debug. A source the shield has banned gets no response at all — it is dropped before parsing, so even what the SIP stack would answer on its own stays silent, and its TCP/TLS/WS/WSS connection is closed. A scanner over UDP, whose source address can be forged, has only its source socket banned, for a minute. Trunk peers get no exemption on this plane. One public IP may have at most 64 calls ringing out (media anchored, no answer yet) at once; one more is refused 503 before any port is allocated, since media is anchored before FreeSWITCH has authenticated the caller. A handler panic is contained, counted (`freesbc_sip_handler_panics_total`), and answered 500 only if no final response went out. |
 
 ## PSTN trunk
 
@@ -80,7 +80,7 @@ calls to it through the proxy, so PSTN numbers dial from the same
 FreeSWITCH the phones register to:
 
 ```text
-FreeSWITCH ──bridge──▶ FreeSBC public UDP ──▶ PSTN carrier gateway
+FreeSWITCH ──bridge──▶ FreeSBC PSTN listener (sip.pstn.match) ──▶ PSTN carrier gateway
 ```
 
 Configure `sip.pstn`: either the single-gateway shorthand (`address` =
@@ -88,20 +88,36 @@ the gateway) or the multi-gateway form (`gateways` = named carriers,
 `routes` = called-number patterns selecting which gateways a call fails
 over across, in `to:` order; a number no route matches is refused 503).
 `match` is the address FreeSWITCH's dialplan dials PSTN prefixes to in
-both forms. A bridged call is
-classified by its source (FreeSWITCH itself) **and** its Request-URI
-naming the match, then forwarded exactly like a call to a registered
-client: media anchored on both legs, each side offered only the SBC's own
-port, and in-dialog requests routed by Record-Route in both directions.
-A phone dialling the match address from the public side is unaffected —
-the source check fails and the call is proxied upstream as usual (a
-registered phone calling from its registered address is admitted; see
+both forms, and it is a socket the SBC binds **itself**: a dedicated UDP
+listener (the PSTN listener) that only FreeSWITCH's IP may reach. It must
+be a specific local address of the SBC host (not `0.0.0.0` or `::`), on a UDP port no other listener uses —
+validation rejects a match that shares a port with a public listener, the
+private bind or any other listener, and one that names the SBC's private
+address or the upstream. A call is a PSTN bridge because it **arrived on
+that listener** (and its Request-URI names the match), never because of the
+source address it carries; it is then forwarded exactly like a call to a
+registered client: media anchored on both legs, each side offered only the
+SBC's own port, and in-dialog requests routed by Record-Route (which names
+the private socket) in both directions. The listener answers only that
+INVITE and its CANCEL: any other method there gets 405, an in-dialog INVITE
+481, and an INVITE for another Request-URI 404. A request naming the match
+that reaches a public listener — from anyone, FreeSWITCH's own address
+included — is an ordinary public request: admission and the shield apply
+and it never dials a gateway (a registered phone calling from its
+registered address is admitted; see
 [Inbound calls from carriers](#inbound-calls-from-carriers)).
+
+**Upgrade note.** Earlier releases reached the trunk through the public UDP
+listener: `match` was `<private-ip>:<public-udp-port>`. That is now a
+validation error ("already bound"). Give `match` its own port on a local
+address (for example `10.77.0.2:16061` next to a public listener on
+`0.0.0.0:16060`) and point the FreeSWITCH dialplan's bridge at the new
+address. Restart the SBC: `match` is read once at startup.
 
 ```yaml
 sip:
   pstn:
-    match: 10.77.0.2:16060
+    match: 10.77.0.2:16061   # the PSTN listener; its own port, not a public one
     # attempt_timeout: 32s     # per-gateway attempt budget (default 32s)
     # cooldown: 30s            # passive health penalty window (default 30s)
     gateways:
@@ -134,7 +150,7 @@ peer-to-peer bridge):
 
 ```xml
 <action application="bridge"
-        data="sofia/internal/sip:${destination_number}@10.77.0.2:16060"/>
+        data="sofia/internal/sip:${destination_number}@10.77.0.2:16061"/>
 ```
 
 ### Inbound calls from carriers

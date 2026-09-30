@@ -51,8 +51,8 @@ func TestAuditParseNullEntriesDoNotPanic(t *testing.T) {
 	cases := map[string]string{
 		"null peer":         strings.Replace(minimalYAML, "peers:\n", "peers:\n  a:\n", 1),
 		"null route":        minimalYAML + "  - ~\n",
-		"null pstn gateway": withPSTN(proxyYAML, "  pstn:\n    match: 203.0.113.7:16060\n    gateways:\n      gw1:\n    routes:\n      - to: [gw1]\n"),
-		"null pstn route":   withPSTN(proxyYAML, "  pstn:\n    match: 203.0.113.7:16060\n    gateways:\n      gw1:\n        address: 223.76.90.4:16060\n    routes:\n      - ~\n"),
+		"null pstn gateway": withPSTN(proxyYAML, "  pstn:\n    match: 203.0.113.7:16061\n    gateways:\n      gw1:\n    routes:\n      - to: [gw1]\n"),
+		"null pstn route":   withPSTN(proxyYAML, "  pstn:\n    match: 203.0.113.7:16061\n    gateways:\n      gw1:\n        address: 223.76.90.4:16060\n    routes:\n      - ~\n"),
 	}
 	for name, src := range cases {
 		t.Run(name, func(t *testing.T) {

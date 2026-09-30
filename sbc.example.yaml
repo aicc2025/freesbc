@@ -155,20 +155,21 @@ shield:                            # sensible defaults; the whole section is opt
 #     transport: udp                 # the only supported value today
 #
 #   # Optional peer-to-peer PSTN trunk: outbound calls from FreeSWITCH's
-#   # dialplan, bridged to sip:<number>@10.77.0.2:16060 (the MATCH address),
+#   # dialplan, bridged to sip:<number>@10.77.0.2:16061 (the MATCH address),
 #   # are forwarded to carrier gateways that never register — FreeSBC never
 #   # pings them. Each gateway's IP is also a carrier source, so inbound
 #   # calls from it are admitted; list a carrier's OTHER inbound IPs in
-#   # sip.public.carrier_sources. The
-#   # bridge is recognised by its SOURCE (FreeSWITCH's own IP) plus its
-#   # Request-URI naming the match, so a public phone dialling the same
-#   # address is not hijacked. The match must be a host:port FreeSWITCH
-#   # uses for nothing else: here it is the SBC's public UDP listener
-#   # (bound 0.0.0.0:16060) as FreeSWITCH reaches it from the private LAN.
+#   # sip.public.carrier_sources. The match is a socket FreeSBC binds ITSELF:
+#   # a dedicated UDP listener only FreeSWITCH's IP may reach, and a call is
+#   # a bridge because it arrived there, not because of the address it claims
+#   # to come from — a public phone dialling the same address is not
+#   # hijacked. It must be a local address of this host on a UDP port no
+#   # other listener uses (here the SBC's private address, next to the public
+#   # 0.0.0.0:16060), and an address FreeSWITCH uses for nothing else.
 #   # Two shapes: the multi-gateway form (gateways + routes below) or the
 #   # single-gateway shorthand `address: <host:port>` — mutually exclusive.
 #   # pstn:
-#   #   match: 10.77.0.2:16060        # what the dialplan dials PSTN prefixes to
+#   #   match: 10.77.0.2:16061        # what the dialplan dials PSTN prefixes to
 #   #   # attempt_timeout: 32s        # per-gateway attempt budget (default 32s)
 #   #   # cooldown: 30s               # passive health penalty window (default 30s)
 #   #   gateways:
@@ -211,9 +212,9 @@ shield:                            # sensible defaults; the whole section is opt
 # needed on FreeSWITCH, this trunk is peer-to-peer:
 #
 #   <action application="bridge"
-#           data="sofia/internal/sip:${destination_number}@10.77.0.2:16060"/>
+#           data="sofia/internal/sip:${destination_number}@10.77.0.2:16061"/>
 #
-# The bridge reaches FreeSBC on its public UDP socket; FreeSBC anchors the
+# The bridge reaches FreeSBC on its dedicated PSTN listener; FreeSBC anchors the
 # media and forwards the call to the carrier gateway, exactly like a call
 # to a registered phone. Inbound carrier→FreeSWITCH calls arrive on the
 # public side as unregistered callers and are proxied upstream unchanged,

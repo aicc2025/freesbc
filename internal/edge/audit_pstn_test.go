@@ -86,12 +86,12 @@ func TestAuditPSTNProvisionalInDrainNotFinal(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 	go g.serve()
 
-	h := startHarnessCfg(t, false, "127.0.0.1", func(pubUDP int) string {
+	h := startHarnessCfg(t, false, "127.0.0.1", func(matchPort int) string {
 		return fmt.Sprintf("  pstn:\n    match: 127.0.0.1:%d\n    attempt_timeout: 300ms\n    gateways:\n"+
-			"      gw-a:\n        address: %s\n    routes:\n      - to: [gw-a]\n", pubUDP, gwAddr)
+			"      gw-a:\n        address: %s\n    routes:\n      - to: [gw-a]\n", matchPort, gwAddr)
 	})
-	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.publicUDP)}
-	_, final := h.fs.callAsync(t, ruri, h.publicUDP, phoneOfferSDP(h.fs.rtpPort))
+	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.pstnMatch)}
+	_, final := h.fs.callAsync(t, ruri, h.pstnMatch, phoneOfferSDP(h.fs.rtpPort))
 	select {
 	case res := <-final:
 		if res == nil {

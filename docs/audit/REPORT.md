@@ -11,7 +11,7 @@
 
 # 0. Status (2026-09-26)
 
-Closed out at main `8a87217` plus [#72](https://github.com/rasonyang/freesbc/issues/72). All 133 findings were grouped into 42 fix-unit issues ([#9](https://github.com/rasonyang/freesbc/issues/9)-[#50](https://github.com/rasonyang/freesbc/issues/50); tracking issue [#51](https://github.com/rasonyang/freesbc/issues/51)). 131 findings are resolved. The two findings in [#10](https://github.com/rasonyang/freesbc/issues/10) remain open on purpose: moving edge trust classification from the source address to the local socket must be validated on real dual-NIC hardware before it ships, so until then the private plane still trusts a packet by its source address (design.md §7.1, §14.2).
+Closed out at main `8a87217` plus [#72](https://github.com/rasonyang/freesbc/issues/72). All 133 findings were grouped into 42 fix-unit issues ([#9](https://github.com/rasonyang/freesbc/issues/9)-[#50](https://github.com/rasonyang/freesbc/issues/50); tracking issue [#51](https://github.com/rasonyang/freesbc/issues/51)). All 133 findings are resolved. The last two, in [#10](https://github.com/rasonyang/freesbc/issues/10), moved edge trust classification from the source address to the local socket (design.md §7.1, §14.2): the read filter stamps requests that reach the trusted sockets with a secret arrival marker, and `sip.pstn.match` became a dedicated trusted UDP listener. The bug was reproduced without spoofing (FACT: same socket, different listener, on loopback; see P2-EDG-003 below), but validation on real dual-NIC hardware, where the private and public interfaces are separate, is still recommended and tracked in [#90](https://github.com/rasonyang/freesbc/issues/90).
 
 Tests at close-out (Linux, Go 1.25.7):
 - `go test -race -count=1 -run Audit ./...`: every package ok (116 audit test and fuzz functions).
@@ -24,7 +24,7 @@ One row per issue; the finding IDs (with aliases and severity) are those listed 
 | Issue | Resolved by PR | Status | Findings |
 |---|---|---|---|
 | [#9](https://github.com/rasonyang/freesbc/issues/9) | [#54](https://github.com/rasonyang/freesbc/issues/54) | resolved | P0 P2-EDG-005; P1 P2-EDG-004; P1 P2-EDG-006; P1 P2-EDG-018; P1 P2-SDP-002 |
-| [#10](https://github.com/rasonyang/freesbc/issues/10) | — | **open**, deliberately deferred | P0 P2-EDG-003; P2 P2-EDG-021 |
+| [#10](https://github.com/rasonyang/freesbc/issues/10) | this change (PR pending) | resolved | P0 P2-EDG-003; P2 P2-EDG-021 |
 | [#11](https://github.com/rasonyang/freesbc/issues/11) | [#57](https://github.com/rasonyang/freesbc/issues/57) | resolved | P1 P2-TRK-002 |
 | [#12](https://github.com/rasonyang/freesbc/issues/12) | [#58](https://github.com/rasonyang/freesbc/issues/58) | resolved | P1 P2-TRK-006; P1 P2-TRK-007; P1 P3-TRK-N01; P1 P2-TRK-022; P2 P2-TRK-025 |
 | [#13](https://github.com/rasonyang/freesbc/issues/13) | [#66](https://github.com/rasonyang/freesbc/issues/66) | resolved | P1 P2-TRK-016 |
@@ -111,7 +111,7 @@ Sources: CLAUDE.md, README.md, docs/design.md (all 3013 lines), docs/edge.md, do
 34. Upstream choice is FNV-1a 64 over the lower-cased user part, applied to a sorted name list. Map order must never leak into routing. (D:1040-1042; D:1196-1198)
 35. In-dialog routing on the edge: the dialog record wins over the hash. The public-client fallback never answers 481. (D:1375-1377; edge.md:162-168)
 36. Cooldown is skip-if-alternatives and never a hard block. The edge keys it by name, the trunk by endpoint (`host:port/transport`). (D:683-684; D:717-719; D:1209-1211; D:1217-1221)
-37. `arrivedOnPrivate` requires all three: udp transport, a source IP in the upstream set, and the exact addr:port present in `privateSources`. (D:1026-1028)
+37. (Superseded by issue #10: `arrivedOnPrivate` and `privateSources` are gone; the arrival marker carries the local socket.) `arrivedOnPrivate` requires all three: udp transport, a source IP in the upstream set, and the exact addr:port present in `privateSources`. (D:1026-1028)
 
 ## D. Media anchoring, latching and watchdog
 38. Every stream is anchored on SBC ports. There is no SDP or media pass-through, and a missing body is answered 488. (D:47-49; D:1872-1873; C:29)
@@ -136,8 +136,8 @@ Sources: CLAUDE.md, README.md, docs/design.md (all 3013 lines), docs/edge.md, do
 ## E. Read-filter rules
 56. A read filter must never return an error, because sipgo treats one as fatal to the read loop. A rejection returns `(nil, nil)`. (D:563-565; D:2644-2645; C:52)
 57. The trunk filter has no size cap (0). It admits only sources whose IP matches `IdentifyPeer` against the current snapshot. The port is discarded, and the address is `Unmap`ped. (D:557-575)
-58. The edge filter caps reads at 64 KiB. On the private bind it requires an upstream source IP and records addr:port in `privateSources`. Other local addresses are accepted. (D:1012-1018)
-59. `privateSources` holds at most 256 entries with a 10 min TTL. When full it prunes, and if still full it refuses the insert. (D:1020-1024)
+58. (Changed by issue #10: the filter no longer records sources; it stamps requests on the trusted sockets.) The edge filter caps reads at 64 KiB. On the private bind it requires an upstream source IP and records addr:port in `privateSources`. Other local addresses are accepted. (D:1012-1018)
+59. (Deleted by issue #10.) `privateSources` holds at most 256 entries with a 10 min TTL. When full it prunes, and if still full it refuses the insert. (D:1020-1024)
 60. Peer identity is the transport source IP only. Via and From are never used. Ties go to the lexicographically smallest peer name. (D:567-575)
 
 ## F. Shield behaviour
@@ -215,7 +215,7 @@ One row per deduplicated finding, sorted by severity, then package. Aliases are 
 |---|---|---|---|---|---|
 | P2-EDG-001 (aka P2-MED-006) | P0 | edge, media | media | FACT | fix |
 | P2-EDG-002 | P0 | edge | transport | FACT | fix |
-| P2-EDG-003 | P0 | edge | transport | INFERENCE | rewrite |
+| P2-EDG-003 | P0 | edge | transport | FACT (reproduced in #10 without spoofing) | rewrite |
 | P2-EDG-005 | P0 | edge | dialog | FACT | rewrite |
 | P2-MED-001 | P0 | media | leg/binding | FACT | fix |
 | P2-SHD-001 | P0 | shield | transport | FACT | fix |
@@ -292,7 +292,7 @@ One row per deduplicated finding, sorted by severity, then package. Aliases are 
 | P1-003 | P2 | edge (tests) | media | FACT | fix |
 | P1-009 | P2 | edge | config/lifecycle | FACT | delete |
 | P2-EDG-020 | P2 | edge | transaction | INFERENCE | fix |
-| P2-EDG-021 | P2 | edge | transport | INFERENCE | rewrite |
+| P2-EDG-021 | P2 | edge | transport | FACT (reproduced in #10) | rewrite |
 | P2-EDG-022 | P2 | edge | transport | INFERENCE | fix |
 | P2-EDG-023 | P2 | edge | transaction | INFERENCE | fix |
 | P2-EDG-024 | P2 | edge | media | INFERENCE | fix |
@@ -402,6 +402,7 @@ Format: **Location** · **Evidence** · **Reference** (RFC or invariant; invaria
 - Reference: invariant 37 (`arrivedOnPrivate` needs the private socket); CLAUDE.md "the private plane is trusted"; the trust should be keyed by the local socket.
 - Repro: not reproducible on loopback without raw sockets and root (section 5). A partial test (send the INVITE to the public listener from an ephemeral socket in a harness where the upstream IP is 127.0.0.1) was proposed but not written.
 - Action: rewrite the plane/trust classification to key on the local socket (section 4).
+- Resolution (issue #10): FACT, then fixed. Loopback reproduces it without spoofing: a socket that has talked to the private bind has the exact identity of FreeSWITCH to the old source-keyed classification, and the same socket can then send to a public listener (same source addr:port, different local socket). `TestAuditPSTNMatchOnPublicListenerNeverDialsGateway` (an INVITE naming the match sent to the public listener dialed the carrier) and `TestAuditPrivateSourceOnPublicListenerIsPublic` (a public REGISTER refused 403 as FreeSWITCH's own, and a scanner exempt from the shield) failed on main and pass after the fix (`// audit: P2-EDG-003`). The trust key is now the local socket only: the read filter stamps a request that reaches the private bind or the PSTN listener from an upstream IP with `X-FreeSBC-Arrival` (a per-process 128-bit secret plus the socket), and `guard` reads and strips it first for every request; `privateSources` is deleted, and `sip.pstn.match` is a dedicated trusted UDP listener the edge binds itself (an INVITE naming the match on any other socket is an ordinary public INVITE). Validation on real dual-NIC hardware is still recommended (#90).
 
 ### P2-EDG-005 — BYE with wrong tags, from any source, tears down the call
 - Location: `internal/edge/dialog.go:131-152` (`dialogTable` keyed by Call-ID); `internal/edge/invite.go:1300-1312` (`teardown(callID)` after every BYE, whatever the far-end response); `:1342-1367` (`directionFor` never fails for public sources).
@@ -812,6 +813,7 @@ Compact format for P2: Location · Evidence · Reference · Repro · Action. "Re
 - **P1-009 — `edge.(*Server).Ready` reachable only from tests.** `internal/edge/edge.go:146`. FACT (`raw/04-deadcode.txt`). Repro: `deadcode ./...`. Action: delete (or move behind a test helper).
 - **P2-EDG-020 — OnCancel hook blocks up to 5 s inside sipgo's FSM lock.** `internal/edge/invite.go:1511-1525`; sipgo `transaction_server_tx_fsm.go:296-315`. INFERENCE. Lock held across network I/O. Action: fix (run `cancelPending` asynchronously).
 - **P2-EDG-021 — Shield exemption for FreeSWITCH's PSTN INVITEs depends on a 10-minute cache.** `internal/edge/plane.go:42`, `:65-70`; `edge.go:516`. INFERENCE. Action: rewrite together with P2-EDG-003.
+  - Resolution (issue #10): FACT, then fixed. `TestAuditPSTNInviteIsShieldExemptWithColdCache` (`// audit: P2-EDG-021`) failed on main (with the source cache cold and the shield banning FreeSWITCH's socket, the PSTN INVITE was dropped) and passes after the fix: the PSTN listener is shield-exempt by construction, with no cache and no TTL.
 - **P2-EDG-022 — Shield-banned sources still get responses (sipgo stateless 400, CANCEL 200).** `internal/edge/edge.go:467-489`; sipgo `transaction_layer.go:154-181`. INFERENCE. Ref: invariant 61 (silent drops). Action: fix (consult bans in the read filter).
 - **P2-EDG-023 — Two finals on one transaction (488 then 503); metrics count the second.** `internal/edge/invite.go:1024-1025`, `:271-272`, `:288`; `edge.go:557`. INFERENCE. Action: fix.
 - **P2-EDG-024 — Unsynchronised `mediaSession.codecs`; one stored answer shared by concurrent re-INVITEs.** `internal/edge/media.go:288`, `:389`, `:446`, `:546`; `invite.go:1188-1190`. INFERENCE (codecs race acknowledged in design.md §7.7). Action: fix.
@@ -889,7 +891,7 @@ Rewrite is recommended only where the identity model (keys, state ownership) is 
 1. **Edge dialog/transaction model** (`internal/edge/dialog.go` `dialogTable`, and the client-transaction handling in `internal/edge/invite.go` `pumpInvite` / `pumpPSTNAttempt`). Decisive reason: the dialog is keyed by Call-ID alone, with one media session per Call-ID, and the client transaction is terminated at the first final response. That model cannot represent a tag-scoped dialog, a second fork, or a 2xx retransmission, and FACT tests fail on all three: P2-EDG-005 (BYE with wrong tags tears the call down), P2-EDG-006 (fork B's 200 gets fork A's media), P2-EDG-004 (retransmitted 200 dropped). P2-EDG-018 and P2-SDP-002 (one `o=` counter per dialog, not per leg) come from the same ownership model. Target: dialog key = Call-ID + local tag + remote tag, per-fork early-dialog state, client transaction held until Timer M, per-leg SDP origin.
 2. **Trunk call store** (`internal/trunk/calls.go`). Decisive reason: `calls`/`legs` are keyed by Call-ID and the admin ID is the dialog key, with no collision check, so a second call with the same Call-ID overwrites the first and `endCall` deletes the survivor (FACT: `TestAuditCallStoreSameCallIDOverwrite`, `TestAuditCallStoreFirstCallUnkillable`). Target: key by dialog ID (Call-ID + tags), separate admin ID, 482 for merged requests (RFC 3261 §8.2.2.2).
 3. **Trunk SDP editing** (`internal/trunk/sdp.go` `rewriteSDPCrypto` and the pion-based helpers). Decisive reason: the output is the peer's body edited in place, so the default for every attribute is pass-through; every new attribute is a potential topology leak (FACT: 7 failing subtests of trunk `TestAuditSDPLeakProperty`), the `o=` belongs to the other leg (P2-TRK-007), and the pion parser rejects `m=image` outright (P3-TRK-N01). Target: construct the body from an allow-list, as the edge does with `internal/sip/sdp` `Build`, with the SBC owning `o=` per leg.
-4. **Edge trust classification** (`internal/edge/plane.go` `privateSources`/`arrivedOnPrivate`, `internal/edge/invite.go` `isPSTNBridgeInvite`). Decisive reason: "is this FreeSWITCH" is keyed by source address, not by the local socket the packet arrived on (P2-EDG-003, P2-EDG-021). This one is INFERENCE; it is recommended because the fix changes what the trust key is, not a check.
+4. **Edge trust classification** (formerly `internal/edge/plane.go` `privateSources`/`arrivedOnPrivate`, `internal/edge/invite.go` `isPSTNBridgeInvite`; done in issue #10, now `internal/edge/arrival.go`). Decisive reason: "is this FreeSWITCH" is keyed by source address, not by the local socket the packet arrived on (P2-EDG-003, P2-EDG-021). This one is INFERENCE; it is recommended because the fix changes what the trust key is, not a check.
 5. **Trunk outbound TLS wiring** (`internal/trunk/tlscert.go`, `server.go:167-182`). Decisive reason: trust roots and client certificates are owned by one UA-wide `tls.Config` rather than per peer (P2-TRK-016, INFERENCE). Because sipgo v1.4.3 accepts one client `tls.Config` per UA (invariant 115), per-peer TLS needs either a per-peer UA/transport or a `GetClientCertificate`/`VerifyConnection` keyed by the dialled target. Decision (2026-09-24): the callback approach, option (c); see the P2-TRK-016 detail entry.
 
 Evaluated and **not** recommended for rewrite:
@@ -899,7 +901,7 @@ Evaluated and **not** recommended for rewrite:
 
 # 5. Things that could not be verified, and why
 
-- **P2-EDG-003** (spoofed source trusted as FreeSWITCH): producing a spoofed-source datagram on loopback needs raw sockets and root. Whether the host accepts it also depends on `rp_filter`.
+- **P2-EDG-003** (spoofed source trusted as FreeSWITCH): producing a spoofed-source datagram on loopback needs raw sockets and root, and whether the host accepts it also depends on `rp_filter`. Resolved by issue #10 with a loopback reproduction that needs no spoofing (the same socket sending to the private bind and then to a public listener); a check on real dual-NIC hardware is still recommended (#90).
 - **P2-EDG-009** (5-min backstop): `inviteTimeout` is a const; testing needs a production-code change or a test longer than 5 minutes.
 - **P2-EDG-008** (INVITE sent between ctx check and track): the race window cannot be forced from outside the code.
 - **P2-EDG-018** (ACK races commit): `TestAuditAckRacesCommit` passed 20/20 on loopback; the window was not hit. Not refuted.
@@ -1068,7 +1070,7 @@ The top of b2bua.go has shifted by about -4 to -8 lines. The middle section was 
 | `fsbc` token cap | invite.go:1444 | 64 |
 | Location caps | internal/edge/location.go:69-70 | 20000 / 10 |
 | Prune ticker | internal/edge/edge.go:281 | 30s |
-| `privateSources` | internal/edge/plane.go:42-43 | 10 min / 256 |
+| `privateSources` (deleted in issue #10) | internal/edge/plane.go:42-43 | 10 min / 256 |
 | Watchdog floor | internal/media/relay.go:105-107 | timeout/4, floor 10 ms |
 | Relay buffer | relay.go:47 | 1500 |
 | `maxPacketSize` | internal/media/mux.go:54 | 1508 |

@@ -60,10 +60,11 @@ type Server struct {
 
 	shield *shield.Shield
 
-	// privSources records which transport addresses reached us on the
-	// private listener; see plane.go for why the source IP alone is not
-	// enough to tell the two planes apart.
-	privSources *privateSources
+	// marker stamps requests that reach a trusted socket (the private bind
+	// and the PSTN listener) and recognises the stamp again in guard. It is
+	// the only carrier of "which local socket did this arrive on"; see
+	// arrival.go. Created in New, never replaced.
+	marker *arrivalMarker
 
 	webrtcEnabled bool
 
@@ -136,6 +137,10 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	marker, err := newArrivalMarker()
+	if err != nil {
+		return nil, err
+	}
 	raiseUDPSendLimit()
 	pub, priv := newMediaPools(store, cfg)
 	s := &Server{
@@ -149,7 +154,7 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 		metrics:          NewMetrics(),
 		pstnCooldown:     newCooldownTable(),
 		upstreamCooldown: newCooldownTable(),
-		privSources:      newPrivateSources(),
+		marker:           marker,
 		ready:            make(chan struct{}),
 		early:            map[netip.Addr]int{},
 		dropWarned:       newWarnOnce(maxWarnedSources),
@@ -205,7 +210,11 @@ func (s *Server) Listeners() []string {
 	for _, l := range s.boot.PublicSIPListeners() {
 		out = append(out, l.Transport+"://"+l.Bind.String())
 	}
-	return append(out, "udp://"+s.boot.SIP.Private.Bind.String()+" (private)")
+	out = append(out, "udp://"+s.boot.SIP.Private.Bind.String()+" (private)")
+	if s.topo.pstnEnabled() {
+		out = append(out, "udp://"+s.topo.pstn.match.String()+" (pstn)")
+	}
+	return out
 }
 
 // Run binds every listener and blocks until ctx is cancelled. It returns
@@ -270,6 +279,13 @@ func (s *Server) Run(ctx context.Context) error {
 		listeners = append(listeners, bound{l.Transport, l.Bind.String()})
 	}
 	listeners = append(listeners, bound{"udp-private", s.boot.SIP.Private.Bind.String()})
+	// The PSTN listener: a dedicated, trusted UDP socket at sip.pstn.match.
+	// FreeSWITCH bridges its outbound PSTN calls to that address, and a
+	// datagram is a PSTN bridge because of the socket it reached, not
+	// because of who it claims to be (see arrival.go).
+	if s.topo.pstnEnabled() {
+		listeners = append(listeners, bound{"udp-pstn", s.topo.pstn.match.String()})
+	}
 
 	// Bind every socket SYNCHRONOUSLY before serving any of them. Binding
 	// inside the serving goroutines would make a bind failure racy to
@@ -459,7 +475,7 @@ func (l listener) Close() {
 // closes it exists.
 func (l listener) Serve(tl *sip.TransportLayer) error {
 	switch l.transport {
-	case "udp", "udp-private":
+	case "udp", "udp-private", "udp-pstn":
 		return tl.ServeUDP(l.packet)
 	case "ws":
 		return tl.ServeWS(l.stream)
@@ -473,7 +489,7 @@ func (l listener) Serve(tl *sip.TransportLayer) error {
 func (s *Server) openListener(transport, addr string) (listener, error) {
 	l := listener{transport: transport, addr: addr}
 	switch transport {
-	case "udp", "udp-private":
+	case "udp", "udp-private", "udp-pstn":
 		ua, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
 			return l, err
@@ -584,49 +600,73 @@ const maxMessageSize = fsip.MaxReadSize
 // parser on every read. The size cap and the rule that a filter must never
 // return an error live in fsip.ReadFilter; what is here is the proxy's own
 // trust decision.
+//
+// There are three kinds of socket. The private bind and the PSTN listener
+// (sip.pstn.match) are TRUSTED: they speak to FreeSWITCH only, so a read
+// from any other IP is dropped before it can become a request, and a
+// request from an upstream IP is stamped with the arrival marker (see
+// arrival.go) so guard can tell which of the two sockets it reached. Every
+// other read is PUBLIC and gets no stamp, whoever it claims to be from.
+// Trust is keyed on the local socket alone: there is no table of "known
+// FreeSWITCH source addresses", so a datagram that reaches a public
+// listener from FreeSWITCH's own address and port is a public datagram.
 func (s *Server) readFilter() sip.TransportReadFilter {
 	privateAddr := s.boot.SIP.Private.Bind.String()
-	return fsip.ReadFilter(maxMessageSize, func(info sip.TransportReadProps) bool {
-		// The private listener speaks to exactly one peer: FreeSWITCH.
-		// Anything else reaching it is either misrouted or hostile, and is
-		// dropped before it can become a request — this is what keeps the
-		// upstream-trusted path (see topology.fromUpstream) from being
-		// reachable by a spoofed source on a public listener.
-		// The private listener is UDP only; a stream read on the same port
-		// number is a public client on a different port space.
-		if info.LocalAddr == nil || !fsip.SameListener(info.Transport, info.LocalAddr.String(), "udp", privateAddr) {
-			// A public read. A source the shield has banned gets nothing
-			// back at all: guard would drop its requests silently, but
-			// sipgo answers some messages on its own before any handler
-			// runs — a stateless 400 to a malformed request, a 200 to a
-			// CANCEL that matches a transaction — so the ban is enforced
-			// here, before parsing. FreeSWITCH is exempt exactly as guard
-			// exempts it (arrivedOnPrivate: the transport address it uses on
-			// the private socket), since its PSTN INVITEs arrive here on the
-			// public one.
-			if sh := s.shield; sh != nil && info.RemoteAddr != nil {
-				if ap, err := netip.ParseAddrPort(info.RemoteAddr.String()); err == nil &&
-					sh.BannedFrom(ap, info.Transport) &&
-					!s.privSources.has(info.RemoteAddr.String()) {
-					// A stream from a banned source is closed on its next
-					// read, so a ban also ends connections opened before it.
-					s.closeStream(info.Transport, info.RemoteAddr.String())
-					return false
-				}
+	pstnAddr := ""
+	if s.topo.pstnEnabled() {
+		pstnAddr = s.topo.pstn.match.String()
+	}
+	// trusted names the trusted socket a read arrived on, or arrPublic. The
+	// trusted sockets are UDP only; a stream read on the same port number
+	// is a public client in a different port space.
+	trusted := func(info sip.TransportReadProps) arrival {
+		if info.LocalAddr == nil {
+			return arrPublic
+		}
+		local := info.LocalAddr.String()
+		if fsip.SameListener(info.Transport, local, "udp", privateAddr) {
+			return arrPrivate
+		}
+		if pstnAddr != "" && fsip.SameListener(info.Transport, local, "udp", pstnAddr) {
+			return arrPSTN
+		}
+		return arrPublic
+	}
+	base := fsip.ReadFilter(maxMessageSize, func(info sip.TransportReadProps) bool {
+		if trusted(info) != arrPublic {
+			// Only an upstream IP may speak on a trusted socket. Anything
+			// else is misrouted or hostile.
+			ip, ok := fsip.AddrOf(info.RemoteAddr)
+			return ok && s.topo.fromUpstream(ip)
+		}
+		// A public read. A source the shield has banned gets nothing back
+		// at all: guard would drop its requests silently, but sipgo answers
+		// some messages on its own before any handler runs — a stateless
+		// 400 to a malformed request, a 200 to a CANCEL that matches a
+		// transaction — so the ban is enforced here, before parsing. There
+		// is no FreeSWITCH exemption: FreeSWITCH does not use a public
+		// listener, so a public read from its address is just a public read.
+		if sh := s.shield; sh != nil && info.RemoteAddr != nil {
+			if ap, err := netip.ParseAddrPort(info.RemoteAddr.String()); err == nil &&
+				sh.BannedFrom(ap, info.Transport) {
+				// A stream from a banned source is closed on its next
+				// read, so a ban also ends connections opened before it.
+				s.closeStream(info.Transport, info.RemoteAddr.String())
+				return false
 			}
-			return true
-		}
-		ip, ok := fsip.AddrOf(info.RemoteAddr)
-		if !ok || !s.topo.fromUpstream(ip) {
-			return false
-		}
-		// Record the exact source so handlers can tell this plane apart
-		// from the public one even when both share an IP.
-		if info.RemoteAddr != nil {
-			s.privSources.note(info.RemoteAddr.String())
 		}
 		return true
 	})
+	return func(info sip.TransportReadProps, data []byte) ([]byte, error) {
+		out, err := base(info, data)
+		if len(out) == 0 || err != nil {
+			return out, err
+		}
+		if a := trusted(info); a != arrPublic {
+			return s.marker.stamp(a, out), nil
+		}
+		return out, nil
+	}
 }
 
 // guard wraps every handler with the panic umbrella and the security
@@ -637,11 +677,16 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 // response: a transaction finalises once, and a 500 after, say, a relayed
 // 200 would only be counted, never delivered.
 // The transport source address is parsed ONCE here and handed to the
-// handler: a request whose source cannot be parsed is dropped before
-// anything else looks at it, and the handlers that need the address (the
-// REGISTER binding, the INVITE plane dispatch) do not re-derive it.
+// handler with the request's arrival: a request whose source cannot be
+// parsed is dropped before anything else looks at it, and the handlers that
+// need either (the REGISTER binding, the INVITE plane dispatch) do not
+// re-derive them.
+//
+// The arrival marker is read and stripped FIRST, for every request on every
+// transport, before anything can copy, log or forward the headers.
 func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 	return func(req *sip.Request, stx sip.ServerTransaction) {
+		req, arr := s.marker.take(req)
 		tx := &finalTracker{ServerTransaction: stx}
 		defer func() {
 			if r := recover(); r != nil {
@@ -658,10 +703,23 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		if !ok {
 			return
 		}
+		// The PSTN listener carries FreeSWITCH's outbound PSTN INVITE and
+		// the CANCEL that ends it, and nothing else: everything FreeSWITCH
+		// sends for an established call, and every other method, goes to
+		// the private socket. A stray method there is answered 405 (ACK
+		// gets nothing); the source is an upstream IP, so the answer tells
+		// it nothing it did not know.
+		if arr == arrPSTN && req.Method != sip.INVITE && req.Method != sip.CANCEL {
+			if req.Method != sip.ACK {
+				s.respond(req, tx, methodNotAllowed(req))
+			}
+			return
+		}
 		// FreeSWITCH is not subject to the public abuse plane: it is the
 		// element the proxy exists to serve, and rate-limiting it would
-		// turn a busy switch into a dropped call.
-		if !s.arrivedOnPrivate(req) {
+		// turn a busy switch into a dropped call. That exemption belongs
+		// to the trusted sockets, and only to them.
+		if arr == arrPublic {
 			network := sip.NetworkToLower(req.Transport())
 			if s.shield.CheckFrom(src, fsip.UserAgent(req), network) == shield.Drop {
 				if s.shield.BannedFrom(src, network) {
@@ -673,7 +731,7 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		// Counted after the shield: a dropped flood is the shield's to
 		// account for, not a request the proxy handled.
 		s.metrics.RequestIn(req.Method.String(), req.Transport())
-		next(req, tx, src)
+		next(req, tx, inbound{src: src, arr: arr})
 	}
 }
 
@@ -708,14 +766,27 @@ func (t *finalTracker) Respond(res *sip.Response) error {
 	return t.ServerTransaction.Respond(res)
 }
 
-// handler is a guarded request handler: sipgo's shape plus the parsed
-// transport source guard has already validated.
-type handler func(*sip.Request, sip.ServerTransaction, netip.AddrPort)
+// inbound is what guard hands a handler besides the request: the parsed
+// transport source it has already validated, and the socket class the
+// request arrived on (see arrival.go).
+type inbound struct {
+	src netip.AddrPort
+	arr arrival
+}
+
+// private reports whether the request reached the private bind: it is
+// FreeSWITCH talking to its own edge proxy. This is the direction switch
+// every handler uses.
+func (in inbound) private() bool { return in.arr == arrPrivate }
+
+// handler is a guarded request handler: sipgo's shape plus the inbound
+// facts guard has already established.
+type handler func(*sip.Request, sip.ServerTransaction, inbound)
 
 // onOptions answers a keepalive locally. An OPTIONS ping is a liveness
 // check on FreeSBC itself; forwarding every phone's keepalive upstream
 // would multiply load on FreeSWITCH for no information gain.
-func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
+func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, _ inbound) {
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	res.AppendHeader(sip.NewHeader("Allow", strings.Join(allowedMethods, ", ")))
 	s.respond(req, tx, res)
@@ -727,10 +798,15 @@ var allowedMethods = []string{"INVITE", "ACK", "CANCEL", "BYE", "OPTIONS", "INFO
 // onNoRoute answers any method the proxy does not handle. A 405 naming the
 // methods it does handle is the honest answer; silence would leave a
 // client retransmitting.
-func (s *Server) onNoRoute(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
+func (s *Server) onNoRoute(req *sip.Request, tx sip.ServerTransaction, _ inbound) {
+	s.respond(req, tx, methodNotAllowed(req))
+}
+
+// methodNotAllowed is the 405 naming the methods the proxy does handle.
+func methodNotAllowed(req *sip.Request) *sip.Response {
 	res := sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)
 	res.AppendHeader(sip.NewHeader("Allow", strings.Join(allowedMethods, ", ")))
-	s.respond(req, tx, res)
+	return res
 }
 
 // respond sends a locally generated response back to the requester.

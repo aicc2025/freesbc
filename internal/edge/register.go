@@ -26,8 +26,9 @@ const registerTimeout = 32 * time.Second
 // FreeSWITCH stores has to be an address that routes back through the
 // SBC, and for a browser the client's own Contact is a deliberately
 // unreachable ".invalid" host.
-func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort) {
-	if s.arrivedOnPrivate(req) {
+func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived inbound) {
+	src := arrived.src
+	if arrived.private() {
 		// FreeSWITCH does not register through its own edge proxy.
 		s.reject(req, tx, 403, "Forbidden")
 		return

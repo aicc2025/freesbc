@@ -50,8 +50,8 @@ func TestTeardownLeavesByPrivateListener(t *testing.T) {
 // request.
 func TestTeardownLeavesByPublicListenerOnWildcardBind(t *testing.T) {
 	carrierAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h := startHarnessCfg(t, false, "0.0.0.0", func(pubUDP int) string {
-		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", carrierAddr, pubUDP)
+	h := startHarnessCfg(t, false, "0.0.0.0", func(matchPort int) string {
+		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", carrierAddr, matchPort)
 	})
 	carrier := startFakeSwitch(t, carrierAddr)
 	h.carrier = carrier
@@ -67,8 +67,8 @@ func TestTeardownLeavesByPublicListenerOnWildcardBind(t *testing.T) {
 		return true
 	})
 
-	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.publicUDP)}
-	if res := h.fs.call(t, ruri, h.publicUDP, phoneOfferSDP(h.fs.rtpPort)); res.StatusCode != 488 {
+	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.pstnMatch)}
+	if res := h.fs.call(t, ruri, h.pstnMatch, phoneOfferSDP(h.fs.rtpPort)); res.StatusCode != 488 {
 		t.Fatalf("got %d, want 488", res.StatusCode)
 	}
 	select {

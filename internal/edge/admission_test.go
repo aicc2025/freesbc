@@ -150,8 +150,8 @@ func TestAdmissionCarrierSourceProceeds(t *testing.T) {
 // inbound INVITE proceeds.
 func TestAdmissionPSTNGatewayIPIsCarrierSource(t *testing.T) {
 	gw := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h := startHarnessFull(t, false, "127.0.0.1", func(pubUDP int) string {
-		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", gw, pubUDP)
+	h := startHarnessFull(t, false, "127.0.0.1", func(matchPort int) string {
+		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", gw, matchPort)
 	}, false, "")
 	if got := h.srv.topo.carrierSourcesString(); got != "127.0.0.1/32" {
 		t.Errorf("carrier sources = %q, want the gateway's 127.0.0.1/32", got)
