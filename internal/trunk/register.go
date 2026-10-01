@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,11 +75,12 @@ func registerOnce(ctx context.Context, client *sipgo.Client, p regParams, seq *r
 // registerOnceNoRetry performs a single REGISTER exchange for p, requesting
 // the given expires (0 = un-REGISTER): builds the request, sends it,
 // answers a 401/407 digest challenge if offered, and parses the granted
-// lifetime off a 200. It does not itself retry on 423 — that one bounded
-// retry is registerOnce's job — so callers that want the 423-retry
-// behavior must call registerOnce, not this directly. On a non-200 final
-// response it returns the response alongside the error (registerOnce needs
-// it to inspect StatusCode/Min-Expires); res may be nil if the failure was
+// lifetime off a 200 (from our own binding's Contact, see isOurContact). It
+// does not itself retry on 423 — that one bounded retry is registerOnce's
+// job — so callers that want the 423-retry behavior must call registerOnce,
+// not this directly. On a non-200 final response it returns the response
+// alongside the error (registerOnce needs it to inspect
+// StatusCode/Min-Expires); res may be nil if the failure was
 // transport-level (no response was ever received).
 func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams, seq *regSeq, expires time.Duration) (time.Duration, *sip.Response, error) {
 	registrar := sip.Uri{Scheme: "sip", Host: p.RegistrarHost, Port: p.RegistrarPort}
@@ -136,7 +138,24 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 	if res.StatusCode != sip.StatusOK {
 		return 0, res, fmt.Errorf("register rejected: %d %s", res.StatusCode, res.Reason)
 	}
-	return fsip.GrantedExpires(res, expires), res, nil
+	return fsip.GrantedExpires(res, expires, p.isOurContact), res, nil
+}
+
+// isOurContact reports whether u, a Contact from a REGISTER 200, is the
+// binding this registration sent (buildContact: our IP and port). The 200
+// lists every binding of the AoR (RFC 3261 §10.3 step 8), so only our own
+// Contact's expires tells us when to refresh. User part, scheme and URI
+// params are ignored; a missing port is the transport's default.
+func (p regParams) isOurContact(u sip.Uri) bool {
+	ip, err := netip.ParseAddr(strings.Trim(u.Host, "[]"))
+	if err != nil || ip.Unmap() != p.ContactIP.Unmap() {
+		return false
+	}
+	port := u.Port
+	if port == 0 {
+		port = fsip.DefaultPort(p.Transport)
+	}
+	return port == p.ContactPort
 }
 
 // newTagParams returns header params carrying a fresh From tag (reuses
