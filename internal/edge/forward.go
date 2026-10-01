@@ -34,7 +34,7 @@ var errMaxForwards = errors.New("proxy: max forwards reached")
 //     is what lets the response find its way back through NAT;
 //  3. strip our own Route values (we are the hop they name), and drop
 //     the extensions the proxy cannot carry (sanitizeExtensions);
-//  4. decrement Max-Forwards and refuse a looped request;
+//  4. refuse a request that arrived with Max-Forwards 0, else decrement;
 //  5. add Record-Route so in-dialog traffic keeps traversing us;
 //  6. add our own Via with a fresh branch;
 //  7. pin the outbound socket and destination.
@@ -45,11 +45,21 @@ func (s *Server) prepareForward(req *sip.Request, from, to side, dest string, re
 	s.stripOwnRoutes(out)
 	sanitizeExtensions(out)
 
-	if mf := out.MaxForwards(); mf != nil {
-		mf.Dec()
-		if mf.Val() <= 0 {
+	// RFC 3261 §16.3 step 3 rejects only a request that ARRIVES with zero;
+	// §16.6 step 3 then decrements, so one that arrives with 1 leaves with
+	// 0. Check before decrementing: the header is a uint32, so decrementing
+	// a zero wraps it to 4294967295 instead of stopping the loop.
+	//
+	// sipgo's Clone shares the Max-Forwards header pointer with the
+	// original, so decrementing it in place would also decrement req, and
+	// every failover attempt re-forwarding req would lose one more hop.
+	// Replace it with a fresh header instead.
+	if mf := req.MaxForwards(); mf != nil {
+		if mf.Val() == 0 {
 			return nil, errMaxForwards
 		}
+		h := sip.MaxForwardsHeader(mf.Val() - 1)
+		out.ReplaceHeader(&h)
 	} else {
 		h := sip.MaxForwardsHeader(70)
 		out.AppendHeader(&h)
