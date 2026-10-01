@@ -1827,8 +1827,13 @@ in order:
    loop — after a transport change there are two of them (the
    double Record-Route pair); then `sanitizeExtensions` trims `Allow` and
    `Supported` (§7.3).
-4. Max-Forwards: decrement, and fail with `errMaxForwards` (→ **483 Too Many
-   Hops**) at zero. When the header is absent, append `Max-Forwards: 70`.
+4. Max-Forwards: fail with `errMaxForwards` (→ **483 Too Many Hops**) when
+   the request **arrived** with 0 (RFC 3261 §16.3 step 3); otherwise replace
+   the header with a fresh one holding the value minus one, so a request
+   that arrives with 1 leaves with 0. It is replaced, not decremented in
+   place, because sipgo's `Clone` shares the header pointer with the
+   original and every failover attempt re-forwards that original. When the
+   header is absent, append `Max-Forwards: 70`.
 5. When `recordRoute`: **RFC 5658 double Record-Route** — prepend the
    origin-facing value, then the destination-facing value, so the
    destination-facing one ends up on top. A UAS builds its route set from
