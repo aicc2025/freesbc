@@ -36,9 +36,13 @@ type stubRegistrar struct {
 	grantExpires int
 	// contactExpires, when > 0, makes the 200 OK also carry a Contact
 	// with an expires param of that many seconds — the RFC 3261 §10.3
-	// step 7 form, where the param outranks the Expires header.
+	// step 7 form, where the param outranks the Expires header. The
+	// Contact echoes the REGISTER's own, as a real registrar does.
 	contactExpires int
-	challenge      *digest.Challenge
+	// otherExpires, when > 0, makes the 200 OK list ANOTHER device's
+	// binding (other@127.0.0.1:stubOtherContactPort) with that expires, before ours.
+	otherExpires int
+	challenge    *digest.Challenge
 
 	mu              sync.Mutex
 	authorizedCount int
@@ -56,6 +60,10 @@ type stubRegistrar struct {
 	conn *net.UDPConn
 }
 
+// stubOtherContactPort is the port of the other device's binding the stub
+// registrar lists when otherExpires > 0; no test's own Contact uses it.
+const stubOtherContactPort = 11981
+
 // startStubRegistrar boots the stub UAS on 127.0.0.1:port and returns once
 // it is accepting packets. Follows the same bind-our-own-socket pattern as
 // startStubCarrier in b2bua_test.go (avoids sipgo's known ListenAndServe
@@ -71,13 +79,14 @@ func startStubRegistrar(t *testing.T, port int, user, pass string, grantExpires 
 // never mutated afterward, so -race stays clean.
 func startStubRegistrarRealm(t *testing.T, port int, user, pass string, grantExpires int, realm string) *stubRegistrar {
 	t.Helper()
-	return startStubRegistrarFull(t, port, user, pass, grantExpires, 0, realm)
+	return startStubRegistrarFull(t, port, user, pass, grantExpires, 0, 0, realm)
 }
 
 // startStubRegistrarFull is startStubRegistrarRealm with an extra Contact
 // expires param on the 200 OK (0 = no Contact header at all, the shape
-// every other test uses).
-func startStubRegistrarFull(t *testing.T, port int, user, pass string, grantExpires, contactExpires int, realm string) *stubRegistrar {
+// every other test uses) and, when otherExpires > 0, another binding of
+// the AoR listed ahead of ours.
+func startStubRegistrarFull(t *testing.T, port int, user, pass string, grantExpires, contactExpires, otherExpires int, realm string) *stubRegistrar {
 	t.Helper()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -97,6 +106,7 @@ func startStubRegistrarFull(t *testing.T, port int, user, pass string, grantExpi
 		pass:           pass,
 		grantExpires:   grantExpires,
 		contactExpires: contactExpires,
+		otherExpires:   otherExpires,
 		challenge: &digest.Challenge{
 			Realm:     realm,
 			Nonce:     "test-nonce-fixed",
@@ -130,13 +140,18 @@ func startStubRegistrarFull(t *testing.T, port int, user, pass string, grantExpi
 		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
 		exp := sip.ExpiresHeader(uint32(r.grantExpires))
 		res.AppendHeader(&exp)
-		if r.contactExpires > 0 {
+		if r.otherExpires > 0 {
 			pr := sip.NewParams()
-			pr.Add("expires", strconv.Itoa(r.contactExpires))
+			pr.Add("expires", strconv.Itoa(r.otherExpires))
 			res.AppendHeader(&sip.ContactHeader{
-				Address: sip.Uri{User: user, Host: "127.0.0.1", Port: port},
+				Address: sip.Uri{User: "other", Host: "127.0.0.1", Port: stubOtherContactPort},
 				Params:  pr,
 			})
+		}
+		if c := req.Contact(); r.contactExpires > 0 && c != nil {
+			pr := sip.NewParams()
+			pr.Add("expires", strconv.Itoa(r.contactExpires))
+			res.AppendHeader(&sip.ContactHeader{Address: c.Address, Params: pr})
 		}
 		if err := tx.Respond(res); err != nil {
 			log.Error("registrar respond 200", "err", err)
@@ -436,7 +451,7 @@ func TestRegisterOnceSucceedsWithDigest(t *testing.T) {
 // after 120s.
 func TestRegisterOnceContactExpiresBeatsExpiresHeader(t *testing.T) {
 	// Grants Expires: 3600, but Contact: <...>;expires=120.
-	reg := startStubRegistrarFull(t, 11325, "reguser", "regpass", 3600, 120, "freesbc-test")
+	reg := startStubRegistrarFull(t, 11325, "reguser", "regpass", 3600, 120, 0, "freesbc-test")
 	client := reg.client(t)
 	p := regParams{
 		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 11325,
@@ -451,6 +466,76 @@ func TestRegisterOnceContactExpiresBeatsExpiresHeader(t *testing.T) {
 	}
 	if granted != 120*time.Second {
 		t.Errorf("granted = %v, want 120s (Contact expires param, not the 3600s Expires header)", granted)
+	}
+}
+
+// TestRegisterOnceReadsOwnBindingExpires pins RFC 3261 §10.3 step 8 (issue
+// #69): the 200 lists every binding of the AoR, so the granted lifetime
+// must come from our own Contact, not from another device's binding that
+// happens to be listed first. The Expires header (1800s) differs from both
+// so a fallback to it is distinguishable.
+func TestRegisterOnceReadsOwnBindingExpires(t *testing.T) {
+	tests := []struct {
+		name             string
+		port             int
+		otherExp, ownExp int
+		want             time.Duration
+	}{
+		{"other shorter", 11327, 60, 3600, 3600 * time.Second},
+		{"other longer", 11328, 7200, 120, 120 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := startStubRegistrarFull(t, tt.port, "reguser", "regpass", 1800, tt.ownExp, tt.otherExp, "freesbc-test")
+			client := reg.client(t)
+			p := regParams{
+				Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: tt.port,
+				Transport: "udp", Username: "reguser", Password: "regpass",
+				ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11993,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			granted, err := registerOnce(ctx, client, p, newRegSeq(), time.Hour)
+			if err != nil {
+				t.Fatalf("registerOnce: %v", err)
+			}
+			if granted != tt.want {
+				t.Errorf("granted = %v, want %v (our binding's expires, not the other's)", granted, tt.want)
+			}
+		})
+	}
+}
+
+// TestRegParamsIsOurContact covers the Contact matcher without sockets:
+// host and port must equal what buildContact sent; user part, scheme and
+// params are ignored; a missing port is the transport default.
+func TestRegParamsIsOurContact(t *testing.T) {
+	udp := regParams{Transport: "udp", ContactIP: netip.MustParseAddr("192.0.2.10"), ContactPort: 5060}
+	tls := regParams{Transport: "tls", ContactIP: netip.MustParseAddr("192.0.2.10"), ContactPort: 5061}
+	v6 := regParams{Transport: "udp", ContactIP: netip.MustParseAddr("::1"), ContactPort: 5070}
+	mapped := regParams{Transport: "udp", ContactIP: netip.MustParseAddr("::ffff:192.0.2.10"), ContactPort: 5060}
+	tests := []struct {
+		name string
+		p    regParams
+		uri  sip.Uri
+		want bool
+	}{
+		{"exact", udp, sip.Uri{Host: "192.0.2.10", Port: 5060}, true},
+		{"different port", udp, sip.Uri{Host: "192.0.2.10", Port: 5062}, false},
+		{"different host", udp, sip.Uri{Host: "192.0.2.11", Port: 5060}, false},
+		{"missing port udp", udp, sip.Uri{Host: "192.0.2.10"}, true},
+		{"missing port tls", tls, sip.Uri{Host: "192.0.2.10"}, true},
+		{"ipv6 bracketed", v6, sip.Uri{Host: "[::1]", Port: 5070}, true},
+		{"ipv6 different port", v6, sip.Uri{Host: "[::1]", Port: 5071}, false},
+		{"ipv4-mapped contact", udp, sip.Uri{Host: "[::ffff:192.0.2.10]", Port: 5060}, true},
+		{"ipv4-mapped params", mapped, sip.Uri{Host: "192.0.2.10", Port: 5060}, true},
+		{"non-IP host", udp, sip.Uri{Host: "example.com", Port: 5060}, false},
+		{"user part ignored", udp, sip.Uri{User: "other", Host: "192.0.2.10", Port: 5060}, true},
+	}
+	for _, tt := range tests {
+		if got := tt.p.isOurContact(tt.uri); got != tt.want {
+			t.Errorf("%s: isOurContact(%v) = %v, want %v", tt.name, tt.uri.String(), got, tt.want)
+		}
 	}
 }
 

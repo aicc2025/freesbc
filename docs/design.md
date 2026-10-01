@@ -1120,9 +1120,12 @@ default 1 h).
   (`xrealm=`), a duplicated realm, or a case variant only one parser reads
   all fail closed. Otherwise `DoDigestAuth`.
 - The granted lifetime is read from the 200 by `fsip.GrantedExpires`
-  (`internal/sip/register.go:54-79`): a Contact `expires` param first (the
-  first Contact carrying a valid one — the trunk passes no matcher for its
-  own binding), then the `Expires` header, then the requested value.
+  (`internal/sip/register.go:54-79`): the `expires` param of the Contact
+  that is this registration's own binding (matched by the Contact's IP and
+  port, a missing port being the transport default; `regParams.isOurContact`
+  in `internal/trunk/register.go`), since the 200 lists every binding of
+  the AoR (RFC 3261 §10.3 step 8) and another device's lifetime must not be
+  taken for ours; then the `Expires` header, then the requested value.
   Values are delta-seconds; a malformed one is ignored and one above
   2^32-1 is clamped.
 - On success: mark registered, reset backoff, and refresh at
