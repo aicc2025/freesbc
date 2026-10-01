@@ -3,7 +3,6 @@ package edge
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/emiago/sipgo/sip"
 )
@@ -73,40 +72,6 @@ func TestRejectedRegistrationCountsFailure(t *testing.T) {
 	if snap.RegistrationTotal != 0 || snap.ActiveRegistrations != 0 {
 		t.Errorf("a refused REGISTER must not count as registered: total=%d active=%d",
 			snap.RegistrationTotal, snap.ActiveRegistrations)
-	}
-}
-
-// TestPrivateSourcesPrunesExpiredWhenFull covers pruneLocked: a full table
-// makes room by dropping expired entries, and refuses a new source only
-// when every entry is still live.
-func TestPrivateSourcesPrunesExpiredWhenFull(t *testing.T) {
-	p := newPrivateSources()
-	p.max = 2
-	p.ttl = time.Minute
-
-	p.note("10.0.0.1:5060")
-	p.note("10.0.0.1:5061")
-	p.mu.Lock()
-	p.m["10.0.0.1:5060"] = time.Now().Add(-2 * time.Minute) // expired
-	p.mu.Unlock()
-
-	p.note("10.0.0.1:5062")
-	if p.has("10.0.0.1:5060") {
-		t.Error("the expired entry must be pruned to make room")
-	}
-	if !p.has("10.0.0.1:5061") || !p.has("10.0.0.1:5062") {
-		t.Error("live entries and the new source must be present after pruning")
-	}
-
-	p.note("10.0.0.1:5063") // full of live entries: refused
-	if p.has("10.0.0.1:5063") {
-		t.Error("a full table of live entries must refuse a new source, not grow")
-	}
-	p.mu.RLock()
-	n := len(p.m)
-	p.mu.RUnlock()
-	if n != 2 {
-		t.Errorf("table holds %d entries, want its cap of 2", n)
 	}
 }
 

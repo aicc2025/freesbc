@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"net"
-	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -145,7 +144,7 @@ func TestAuditGuardPanicAfterFinal(t *testing.T) {
 	req.SetSource("127.0.0.1:5999")
 	tx := &auditRecordTx{}
 	before := h.srv.metrics.Snapshot().HandlerPanics
-	h.srv.guard(func(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
+	h.srv.guard(func(req *sip.Request, tx sip.ServerTransaction, _ inbound) {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 		panic("audit: handler bug after the final response")
 	})(req, tx)
