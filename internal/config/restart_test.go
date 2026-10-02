@@ -28,7 +28,6 @@ func TestRestartOnlyChanges(t *testing.T) {
 	}
 	trunk := parse(minimalYAML)
 	edge := parse(proxyYAML)
-	withPstn := parse(withPSTN(proxyYAML, "  pstn:\n    address: 198.51.100.9:5060\n    match: 203.0.113.7:16061\n"))
 
 	cases := []struct {
 		name          string
@@ -37,14 +36,10 @@ func TestRestartOnlyChanges(t *testing.T) {
 	}{
 		{"identical", trunk, parse(minimalYAML), nil},
 		{"hot only: peer address", trunk, parse(strings.Replace(minimalYAML, "10.0.0.10:5060", "10.0.0.99:5060", 1)), nil},
-		{"hot only: pstn budget", withPstn,
-			parse(withPSTN(proxyYAML, "  pstn:\n    address: 198.51.100.9:5060\n    match: 203.0.113.7:16061\n    attempt_timeout: 5s\n")), nil},
 		{"trunk listener", trunk, parse(strings.Replace(minimalYAML, "0.0.0.0:5060", "0.0.0.0:5070", 1)),
 			[]string{"listen.sip / sip.bind_ip / sip.bind_port / sip.transport"}},
 		{"edge rtp range", edge, parse(strings.Replace(proxyYAML, "port_max: 39999", "port_max: 38999", 1)),
 			[]string{"rtp.public / rtp.private"}},
-		{"pstn removed", withPstn, edge,
-			[]string{"sip.pstn (address, transport, match, gateways, routes)"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

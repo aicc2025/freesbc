@@ -45,16 +45,6 @@ var restartOnly = []struct {
 	{"sip.upstream / sip.upstreams.nodes / sip.upstreams.algorithm", func(c *Config) any {
 		return [3]any{c.SIP.Upstream, c.SIP.Upstreams.Nodes, c.SIP.Upstreams.Algorithm}
 	}},
-	{"sip.pstn (address, transport, match, gateways, routes)", func(c *Config) any {
-		p := c.SIP.Pstn
-		routes := make([][2]any, 0, len(p.Routes))
-		for _, r := range p.Routes {
-			if r != nil {
-				routes = append(routes, [2]any{r.Match, r.To})
-			}
-		}
-		return [5]any{p.Address, p.Transport, p.Match, p.Gateways, routes}
-	}},
 	{"rtp.public / rtp.private", func(c *Config) any { return [2]RTPPlaneConfig{c.RTP.Public, c.RTP.Private} }},
 	{"webrtc", func(c *Config) any { return c.WebRTC }},
 

@@ -10,15 +10,13 @@ import (
 // whole attempt (a failDial) is Penalized and then skipped in favour of
 // alternatives until the cooldown window elapses — lazily, with no
 // background sweeper — or a later successful exchange Recovers it. There is
-// deliberately no active probing (no OPTIONS): a carrier gateway or an
-// upstream switch receives only the traffic it is answering, and a
+// deliberately no active probing (no OPTIONS): an upstream
+// switch receives only the traffic it is answering, and a
 // health-check cadence of its own is exactly the sort of unsolicited traffic
 // a carrier's edge will drop or penalize.
 //
-// One type, two instances: the PSTN gateway cooldown and the upstream node
-// cooldown are the same policy over the same shape (a bounded,
-// operator-chosen name set), and duplicating the logic would let the two
-// drift apart. Keyed by NAME, never by address. Safe for concurrent use.
+// Keyed by NAME, never by address (a bounded, operator-chosen name set).
+// Safe for concurrent use.
 type cooldownTable struct {
 	mu    sync.Mutex
 	until map[string]time.Time // name → cooldown-until

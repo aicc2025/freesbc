@@ -100,18 +100,6 @@ func rejectNullEntries(c *Config) error {
 		}
 	}
 	nullKeys("sip.upstreams.nodes", nodes)
-	var gws []string
-	for name, g := range c.SIP.Pstn.Gateways {
-		if g == nil {
-			gws = append(gws, name)
-		}
-	}
-	nullKeys("sip.pstn.gateways", gws)
-	for i, r := range c.SIP.Pstn.Routes {
-		if r == nil {
-			errs = append(errs, fmt.Sprintf("sip.pstn.routes[%d]: empty entry (null)", i))
-		}
-	}
 	if len(errs) > 0 {
 		return fmt.Errorf("invalid config:\n%s", strings.Join(errs, "\n"))
 	}

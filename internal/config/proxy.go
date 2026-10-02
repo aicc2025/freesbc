@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"regexp"
 	"strconv"
 	"time"
 )
@@ -86,9 +85,7 @@ type ProxySIPConfig struct {
 	// carrier sends inbound calls from. An out-of-dialog INVITE on a public
 	// listener is admitted only from an upstream, from a carrier source or
 	// from a transport address holding a live registration; everything else
-	// is dropped silently. The IPs of sip.pstn's gateways are carrier
-	// sources automatically, so this list is only needed for a carrier's
-	// OTHER inbound IPs, or for inbound carriers with no sip.pstn at all.
+	// is dropped silently.
 	// Validated like a trunk peer's allowed_ips (same width caps).
 	CarrierSources []string `yaml:"carrier_sources"`
 
@@ -163,84 +160,6 @@ type UpstreamsConfig struct {
 	Nodes map[string]*UpstreamConfig `yaml:"nodes"`
 }
 
-// PstnConfig routes FreeSWITCH-bridged outbound calls to peer-to-peer PSTN
-// carrier gateways. A gateway never registers and FreeSBC never sends it
-// keepalives; the only traffic it receives is what it is answering. Its
-// zero value disables the trunk.
-//
-// There are two shapes, and they are mutually exclusive (validation
-// rejects writing both):
-//
-//   - the v1 ALIAS: `address` + `transport` + `match`, a single gateway.
-//     The topology builder synthesises it into gateways["default"] plus
-//     one catch-all route, so the runtime treats both shapes identically
-//     (see proxy/topology.go).
-//   - the MULTI shape: `gateways` (named carrier gateways) + `routes`
-//     (prefix selection over them, in order, first hit wins) + `match`.
-//     The `to` list of a route is its failover order.
-//
-// attempt_timeout is the per-gateway attempt budget before FreeSBC cancels
-// and fails over; cooldown is how long a gateway that produced no response
-// at all is skipped in favour of alternatives. Both are re-read from the
-// store on every call, so a reload changes the budget for the NEXT call;
-// gateways/routes/match are a startup snapshot (like the rest of the
-// topology). A reload that removes the section keeps the startup budgets
-// (edge/budgets.go).
-type PstnConfig struct {
-	Address   string   `yaml:"address"`   // v1 alias: host:port; literal IP enforced at topology build
-	Transport string   `yaml:"transport"` // v1 alias transport: udp (default; the only supported value)
-	Match     HostPort `yaml:"match"`     // host:port FreeSWITCH bridges PSTN calls to
-
-	// AttemptTimeout is how long one gateway may take to answer before the
-	// attempt is cancelled and the next gateway in the route is dialed.
-	// Defaults to 32s when the section is configured.
-	AttemptTimeout Duration `yaml:"attempt_timeout"`
-	// Cooldown is how long a gateway that answered nothing is skipped after
-	// a failed attempt (a passive penalty; there is no active health
-	// probing). Defaults to 30s when the section is configured.
-	Cooldown Duration `yaml:"cooldown"`
-
-	// Gateways is the multi-shape gateway set, keyed by the names the
-	// routes reference.
-	Gateways map[string]*PstnGateway `yaml:"gateways"`
-	// Routes selects the failover list per called number, evaluated in
-	// order; the first route whose match hits wins, and a route without a
-	// match is a catch-all (several catch-alls are legal — only the first
-	// ever fires).
-	Routes []*PstnRoute `yaml:"routes"`
-}
-
-// configured reports whether the operator wrote anything in sip.pstn. It is
-// the single predicate defaults and validation share: a section that names
-// only timers is still "configured" (and validation then reports the
-// missing gateway) rather than silently ignored.
-func (p PstnConfig) configured() bool {
-	return p.Address != "" || !p.Match.IsZero() ||
-		len(p.Gateways) > 0 || len(p.Routes) > 0 ||
-		p.AttemptTimeout != 0 || p.Cooldown != 0
-}
-
-// PstnGateway is one named carrier gateway in the multi shape.
-type PstnGateway struct {
-	Address   string `yaml:"address"`   // host:port; literal IP enforced at topology build
-	Transport string `yaml:"transport"` // udp (default; the only supported value)
-}
-
-// PstnRoute is one routing rule of the multi shape: which gateways a
-// called number fails over across, in order.
-type PstnRoute struct {
-	// Match is a Go regexp matched against the called number (the
-	// Request-URI user part). Empty means the route matches every number.
-	Match string   `yaml:"match"`
-	To    []string `yaml:"to"` // gateway names, in failover order
-
-	matchTo *regexp.Regexp // compiled by Validate
-}
-
-// CompiledMatch returns the compiled Match regex, or nil for a catch-all.
-// Only valid after Validate has run.
-func (r *PstnRoute) CompiledMatch() *regexp.Regexp { return r.matchTo }
-
 // RTPPlaneConfig is one media plane's bind/advertised address plus its own
 // port pool. The two planes MUST use disjoint port ranges when they bind
 // the same address family on the same interface, so validation rejects an
@@ -275,11 +194,6 @@ type WebRTCConfig struct {
 	// off is rejected because a browser offer without rtcp-mux would need
 	// a second ICE component FreeSBC does not implement.
 	RTCPMux *bool `yaml:"rtcp_mux"`
-	// DTLSCertFile/DTLSKeyFile pin the DTLS identity. When unset, one
-	// self-signed ECDSA certificate is generated per process and reused by
-	// every session (spec §11).
-	DTLSCertFile string `yaml:"dtls_cert_file"`
-	DTLSKeyFile  string `yaml:"dtls_key_file"`
 }
 
 // ProxyEnabled reports whether the SIP/RTP/WebRTC edge proxy plane is
@@ -370,7 +284,6 @@ func (c *Config) PrivateSIPAdvertisedPort() int {
 // trunk-only config is untouched.
 func proxyWithDefaults(c *Config) {
 	upstreamDefaults(c)
-	pstnDefaults(&c.SIP.Pstn)
 	listenerDefaults(c)
 	// Each media plane binds its own network plane's address unless told
 	// otherwise, so `bind_ip` need only be written once per side.
@@ -410,31 +323,6 @@ func upstreamDefaults(c *Config) {
 	}
 	if len(ups.Nodes) > 0 && ups.Algorithm == "" {
 		ups.Algorithm = "hash-user"
-	}
-}
-
-func pstnDefaults(pstn *PstnConfig) {
-	if pstn.Address != "" && pstn.Transport == "" {
-		pstn.Transport = "udp"
-	}
-	// The pstn failure-budget defaults mirror peer_cooldown's (schema.go):
-	// they only apply when the section was actually written — a config
-	// without sip.pstn keeps a fully zero PstnConfig so "is the trunk
-	// configured" stays decidable — and zero still means "operator did not
-	// say", which is why validation only has to reject negatives.
-	if !pstn.configured() {
-		return
-	}
-	if pstn.AttemptTimeout == 0 {
-		pstn.AttemptTimeout = Duration(32 * time.Second)
-	}
-	if pstn.Cooldown == 0 {
-		pstn.Cooldown = Duration(30 * time.Second)
-	}
-	for _, g := range pstn.Gateways {
-		if g != nil && g.Transport == "" {
-			g.Transport = "udp"
-		}
 	}
 }
 

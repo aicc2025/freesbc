@@ -47,12 +47,8 @@ type Server struct {
 	dialogs *dialogTable
 	metrics *Metrics
 
-	// pstnCooldown and upstreamCooldown are the passive health penalties of
-	// the PSTN carrier gateways and the upstream FreeSWITCHes (see
-	// cooldown.go). Two instances of one policy: the sets and the windows
-	// are configured separately, but the logic must not fork. Both are
-	// always allocated; harmless when the corresponding section is off.
-	pstnCooldown     *cooldownTable
+	// upstreamCooldown is the passive health penalty of the upstream
+	// FreeSWITCHes (see cooldown.go).
 	upstreamCooldown *cooldownTable
 
 	srv    *sipgo.Server
@@ -61,9 +57,8 @@ type Server struct {
 	shield   *shield.Shield
 	shieldMu sync.RWMutex // guards the assignment in Run against ShieldStats
 
-	// marker stamps requests that reach a trusted socket (the private bind
-	// and the PSTN listener) and recognises the stamp again in guard. It is
-	// the only carrier of "which local socket did this arrive on"; see
+	// marker stamps requests that reach the trusted private bind and
+	// recognises the stamp again in guard. It is the only carrier of "which local socket did this arrive on"; see
 	// arrival.go. Created in New, never replaced.
 	marker *arrivalMarker
 
@@ -150,7 +145,6 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 		privPool:         priv,
 		loc:              NewLocation(),
 		metrics:          NewMetrics(),
-		pstnCooldown:     newCooldownTable(),
 		upstreamCooldown: newCooldownTable(),
 		marker:           marker,
 		ready:            make(chan struct{}),
@@ -162,11 +156,7 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 	s.dialogs = newDialogTable(s.metrics, s.log)
 	s.dialogs.onMediaEnd = s.byeBothEnds
 	if s.webrtcEnabled {
-		if cfg.WebRTC.DTLSCertFile != "" {
-			s.identity, err = media.LoadDTLSIdentity(cfg.WebRTC.DTLSCertFile, cfg.WebRTC.DTLSKeyFile)
-		} else {
-			s.identity, err = media.ProcessDTLSIdentity()
-		}
+		s.identity, err = media.ProcessDTLSIdentity()
 		if err != nil {
 			return nil, err
 		}
@@ -221,9 +211,6 @@ func (s *Server) Listeners() []string {
 		out = append(out, l.Transport+"://"+l.Bind.String())
 	}
 	out = append(out, "udp://"+s.boot.SIP.Private.Bind.String()+" (private)")
-	if s.topo.pstnEnabled() {
-		out = append(out, "udp://"+s.topo.pstn.match.String()+" (pstn)")
-	}
 	return out
 }
 
@@ -291,13 +278,6 @@ func (s *Server) Run(ctx context.Context) error {
 		listeners = append(listeners, bound{l.Transport, l.Bind.String()})
 	}
 	listeners = append(listeners, bound{"udp-private", s.boot.SIP.Private.Bind.String()})
-	// The PSTN listener: a dedicated, trusted UDP socket at sip.pstn.match.
-	// FreeSWITCH bridges its outbound PSTN calls to that address, and a
-	// datagram is a PSTN bridge because of the socket it reached, not
-	// because of who it claims to be (see arrival.go).
-	if s.topo.pstnEnabled() {
-		listeners = append(listeners, bound{"udp-pstn", s.topo.pstn.match.String()})
-	}
 
 	// Bind every socket SYNCHRONOUSLY before serving any of them. Binding
 	// inside the serving goroutines would make a bind failure racy to
@@ -369,9 +349,9 @@ func (s *Server) Run(ctx context.Context) error {
 		// which one it is running to read the line.
 		"upstreams", len(s.topo.upstreamNames),
 		"upstream_nodes", strings.Join(s.topo.upstreamNames, ","),
-		// The INVITE admission posture (admission.go): sip.pstn gateway
-		// IPs plus sip.public.carrier_sources. Empty means only upstreams
-		// and registered clients may place calls on a public listener.
+		// The INVITE admission posture (admission.go):
+		// sip.public.carrier_sources. Empty means only registered clients
+		// may place calls on a public listener.
 		"carrier_sources", s.topo.carrierSourcesString(),
 		"webrtc", s.webrtcEnabled)
 
@@ -486,7 +466,7 @@ func (l listener) Close() {
 // closes it exists.
 func (l listener) Serve(tl *sip.TransportLayer) error {
 	switch l.transport {
-	case "udp", "udp-private", "udp-pstn":
+	case "udp", "udp-private":
 		return tl.ServeUDP(l.packet)
 	case "ws":
 		return tl.ServeWS(l.stream)
@@ -500,7 +480,7 @@ func (l listener) Serve(tl *sip.TransportLayer) error {
 func (s *Server) openListener(transport, addr string) (listener, error) {
 	l := listener{transport: transport, addr: addr}
 	switch transport {
-	case "udp", "udp-private", "udp-pstn":
+	case "udp", "udp-private":
 		ua, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
 			return l, err
@@ -612,23 +592,18 @@ const maxMessageSize = fsip.MaxReadSize
 // return an error live in fsip.ReadFilter; what is here is the proxy's own
 // trust decision.
 //
-// There are three kinds of socket. The private bind and the PSTN listener
-// (sip.pstn.match) are TRUSTED: they speak to FreeSWITCH only, so a read
-// from any other IP is dropped before it can become a request, and a
-// request from an upstream IP is stamped with the arrival marker (see
-// arrival.go) so guard can tell which of the two sockets it reached. Every
-// other read is PUBLIC and gets no stamp, whoever it claims to be from.
+// There are two kinds of socket. The private bind is TRUSTED: it speaks
+// to FreeSWITCH only, so a read from any other IP is dropped before it can
+// become a request, and a request from an upstream IP is stamped with the
+// arrival marker (see arrival.go) so guard can tell it reached that socket.
+// Every other read is PUBLIC and gets no stamp, whoever it claims to be from.
 // Trust is keyed on the local socket alone: there is no table of "known
 // FreeSWITCH source addresses", so a datagram that reaches a public
 // listener from FreeSWITCH's own address and port is a public datagram.
 func (s *Server) readFilter() sip.TransportReadFilter {
 	privateAddr := s.boot.SIP.Private.Bind.String()
-	pstnAddr := ""
-	if s.topo.pstnEnabled() {
-		pstnAddr = s.topo.pstn.match.String()
-	}
 	// trusted names the trusted socket a read arrived on, or arrPublic. The
-	// trusted sockets are UDP only; a stream read on the same port number
+	// trusted socket is UDP only; a stream read on the same port number
 	// is a public client in a different port space.
 	trusted := func(info sip.TransportReadProps) arrival {
 		if info.LocalAddr == nil {
@@ -637,9 +612,6 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		local := info.LocalAddr.String()
 		if fsip.SameListener(info.Transport, local, "udp", privateAddr) {
 			return arrPrivate
-		}
-		if pstnAddr != "" && fsip.SameListener(info.Transport, local, "udp", pstnAddr) {
-			return arrPSTN
 		}
 		return arrPublic
 	}
@@ -712,18 +684,6 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		}()
 		src, ok := fsip.SourceAddrPort(req)
 		if !ok {
-			return
-		}
-		// The PSTN listener carries FreeSWITCH's outbound PSTN INVITE and
-		// the CANCEL that ends it, and nothing else: everything FreeSWITCH
-		// sends for an established call, and every other method, goes to
-		// the private socket. A stray method there is answered 405 (ACK
-		// gets nothing); the source is an upstream IP, so the answer tells
-		// it nothing it did not know.
-		if arr == arrPSTN && req.Method != sip.INVITE && req.Method != sip.CANCEL {
-			if req.Method != sip.ACK {
-				s.respond(req, tx, methodNotAllowed(req))
-			}
 			return
 		}
 		// FreeSWITCH is not subject to the public abuse plane: it is the

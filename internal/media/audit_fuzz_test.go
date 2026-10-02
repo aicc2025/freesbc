@@ -155,19 +155,17 @@ func FuzzAuditSRTPUnprotect(f *testing.F) {
 	auditSeedPackets(f)
 	key := bytes.Repeat([]byte{0x5a}, testKeyLen)
 	f.Fuzz(func(t *testing.T, b []byte) {
-		for range 1 {
-			c, err := newTestCtx(key)
-			if err != nil {
-				t.Fatal(err)
-			}
-			in := append([]byte(nil), b...)
-			_, _ = c.unprotectRTP(in)
-			_, _ = c.unprotectRTCP(in)
-			_, _ = c.protectRTP(in)
-			_, _ = c.protectRTCP(in)
-			if !bytes.Equal(in, b) {
-				t.Fatalf("transform mutated its input buffer")
-			}
+		c, err := newTestCtx(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		in := append([]byte(nil), b...)
+		_, _ = c.unprotectRTP(in)
+		_, _ = c.unprotectRTCP(in)
+		_, _ = c.protectRTP(in)
+		_, _ = c.protectRTCP(in)
+		if !bytes.Equal(in, b) {
+			t.Fatalf("transform mutated its input buffer")
 		}
 	})
 }
@@ -179,13 +177,11 @@ func FuzzAuditSRTPRoundTrip(f *testing.F) {
 	auditSeedPackets(f)
 	key := bytes.Repeat([]byte{0x5a}, testKeyLen)
 	f.Fuzz(func(t *testing.T, b []byte) {
-		for range 1 {
-			c, _ := newTestCtx(key)
-			r, _ := newTestCtx(key)
-			if p, ok := c.protectRTP(append([]byte(nil), b...)); ok {
-				if got, ok := r.unprotectRTP(p); !ok || !bytes.Equal(got, b) {
-					t.Fatalf("SRTP round trip failed (P3-MED-001): ok=%v", ok)
-				}
+		c, _ := newTestCtx(key)
+		r, _ := newTestCtx(key)
+		if p, ok := c.protectRTP(append([]byte(nil), b...)); ok {
+			if got, ok := r.unprotectRTP(p); !ok || !bytes.Equal(got, b) {
+				t.Fatalf("SRTP round trip failed (P3-MED-001): ok=%v", ok)
 			}
 		}
 	})

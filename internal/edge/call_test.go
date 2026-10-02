@@ -487,6 +487,33 @@ func TestInboundCallToUnknownContact(t *testing.T) {
 	waitForRelease(t, h)
 }
 
+// A switch-originated INVITE finds its client only by the fsbc token: a
+// Request-URI naming a registered address-of-record with no token (or an
+// unknown one) is 404, never resolved by AoR.
+func TestInboundCallWithoutTokenIsNotFoundByAoR(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+	h.fs.mu.Lock()
+	h.fs.challenge = false
+	h.fs.mu.Unlock()
+	if res := phone.do(t, phone.buildRegister("1001", "example.com", 600, ""), h.publicUDP); res.StatusCode != 200 {
+		t.Fatalf("REGISTER: %d", res.StatusCode)
+	}
+	tokParams := sip.NewParams()
+	tokParams.Add(contactTokenParam, "no-such-token")
+	for name, ruri := range map[string]sip.Uri{
+		"no token":      {User: "1001", Host: "example.com", Port: 0},
+		"private host":  {User: "1001", Host: "127.0.0.1", Port: portOf(h.privateSIP)},
+		"unknown token": {User: "1001", Host: "127.0.0.1", Port: portOf(h.privateSIP), UriParams: tokParams},
+	} {
+		res := h.fs.call(t, ruri, h.privateSIP, phoneOfferSDP(h.fs.rtpPort))
+		if res.StatusCode != 404 {
+			t.Errorf("%s: got %d, want 404", name, res.StatusCode)
+		}
+	}
+	waitForRelease(t, h)
+}
+
 // A call whose codecs do not intersect must be rejected, never transcoded.
 func TestCallWithNoCommonCodecRejected(t *testing.T) {
 	h := startHarness(t, false)

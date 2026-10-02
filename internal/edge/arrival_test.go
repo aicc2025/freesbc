@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/emiago/sipgo/sip"
+
+	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
 const arrOptions = "OPTIONS sip:x@127.0.0.1 SIP/2.0\r\n" +
@@ -63,7 +65,7 @@ func TestArrivalStampInsertsHeaderAfterRequestLine(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			in := []byte(tc.in)
 			orig := append([]byte(nil), in...)
-			for _, arr := range []arrival{arrPrivate, arrPSTN} {
+			for _, arr := range []arrival{arrPrivate} {
 				out := m.stamp(arr, in)
 				if !bytes.Equal(in, orig) {
 					t.Fatal("stamp modified sipgo's read buffer in place")
@@ -122,7 +124,7 @@ func TestArrivalTakeForgedMarkerIsPublicAndStripped(t *testing.T) {
 	m := mustMarker(t)
 	for name, forged := range map[string]string{
 		"wrong secret":      arrivalHeader + ": deadbeefdeadbeefdeadbeefdeadbeef;private\r\n",
-		"lowercase name":    "x-freesbc-arrival: deadbeef;pstn\r\n",
+		"lowercase name":    "x-freesbc-arrival: deadbeef;private\r\n",
 		"empty value":       arrivalHeader + ":\r\n",
 		"secret prefix":     arrivalHeader + ": " + string(m.private)[:10] + "\r\n",
 		"secret wrong kind": arrivalHeader + ": " + strings.SplitN(string(m.private), ";", 2)[0] + ";other\r\n",
@@ -147,7 +149,7 @@ func TestArrivalTakeForgedMarkerIsPublicAndStripped(t *testing.T) {
 
 func TestArrivalTakeDoesNotMutateSharedRequest(t *testing.T) {
 	m := mustMarker(t)
-	req := parseReq(t, m.stamp(arrPSTN, []byte(arrOptions)))
+	req := parseReq(t, m.stamp(arrPrivate, []byte(arrOptions)))
 	clean, _ := m.take(req)
 	if clean == req {
 		t.Fatal("take must return a copy: the original is shared with sipgo's transaction goroutines")
@@ -160,7 +162,7 @@ func TestArrivalTakeDoesNotMutateSharedRequest(t *testing.T) {
 // The read filter stamps only reads on the trusted sockets, only from an
 // upstream IP, and only requests.
 func TestReadFilterStampsOnlyTrustedSockets(t *testing.T) {
-	h, _ := startHarnessPSTN(t)
+	h := startHarness(t, false)
 	f := h.srv.readFilter()
 	udpAddr := func(hostport string) net.Addr {
 		a, err := net.ResolveUDPAddr("udp", hostport)
@@ -186,7 +188,6 @@ func TestReadFilterStampsOnlyTrustedSockets(t *testing.T) {
 		arr   arrival
 	}{
 		"private": {h.privateSIP, arrPrivate},
-		"pstn":    {h.pstnMatch, arrPSTN},
 	} {
 		got := run(props(tc.local, upstream), arrOptions)
 		if want := string(h.srv.marker.stamp(tc.arr, []byte(arrOptions))); got != want {
@@ -228,7 +229,7 @@ func TestForgedArrivalMarkerOnPublicListenerIsPublicAndNeverForwarded(t *testing
 	conn := auditUDP(t)
 	port := auditUDPPort(conn)
 	fake := arrivalHeader + ": " + strings.Repeat("0", 32) + ";private\r\n"
-	fake2 := strings.ToLower(arrivalHeader) + ": " + string(h.srv.marker.pstn[:8]) + "\r\n"
+	fake2 := strings.ToLower(arrivalHeader) + ": " + string(h.srv.marker.private[:8]) + "\r\n"
 	auditRawRequest(t, conn, h.publicUDP, fmt.Sprintf("REGISTER sip:example.com SIP/2.0\r\n%s"+
 		"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=z9hG4bK-forge;rport\r\n%s"+
 		"Max-Forwards: 70\r\nFrom: <sip:1001@example.com>;tag=forge\r\nTo: <sip:1001@example.com>\r\n"+
@@ -257,19 +258,23 @@ func TestForgedArrivalMarkerOnPublicListenerIsPublicAndNeverForwarded(t *testing
 }
 
 // The marker never appears in anything the proxy sends: not the requests it
-// forwards to the carrier and to FreeSWITCH, not the responses it returns.
+// forwards to FreeSWITCH, not the responses it returns.
 func TestArrivalMarkerNeverLeavesTheProxy(t *testing.T) {
-	h, carrier := startHarnessPSTN(t)
-	// A PSTN call: FreeSWITCH -> PSTN listener -> carrier, then teardown.
-	carrierInvite, res, _ := placePSTNCall(t, h, carrier, "12345")
-	if r := h.fs.uacBye(t, res); r.StatusCode != 200 {
+	h := startHarness(t, false)
+	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
+	settle()
+	// A public phone call through to FreeSWITCH, then teardown.
+	phone := newUDPClient(t)
+	invite, res, _ := auditPhoneCall(t, h, phone)
+	waitForDialog(t, h, fsip.CallID(invite))
+	if r := phone.do(t, buildBye(phone, invite, res), h.publicUDP); r.StatusCode != 200 {
 		t.Fatalf("BYE: %d", r.StatusCode)
 	}
 	waitForRelease(t, h)
-	// A private-bind INVITE (404) and raw exchanges on all three sockets.
+	// A private-bind INVITE (404) and raw exchanges on both sockets.
 	warmPrivateSource(t, h)
 	conn := auditUDP(t)
-	for _, dst := range []string{h.privateSIP, h.pstnMatch, h.publicUDP} {
+	for _, dst := range []string{h.privateSIP, h.publicUDP} {
 		auditRawRequest(t, conn, dst, arrOptions)
 		auditRecvUntil(conn, 500*time.Millisecond, func(b []byte) bool {
 			if strings.Contains(strings.ToLower(string(b)), "freesbc-arrival") {
@@ -280,9 +285,7 @@ func TestArrivalMarkerNeverLeavesTheProxy(t *testing.T) {
 	}
 
 	var all []*sip.Request
-	all = append(all, carrierInvite)
 	for _, m := range []sip.RequestMethod{sip.INVITE, sip.ACK, sip.BYE} {
-		all = append(all, carrier.received(m)...)
 		all = append(all, h.fs.received(m)...)
 	}
 	for _, r := range all {
@@ -291,48 +294,6 @@ func TestArrivalMarkerNeverLeavesTheProxy(t *testing.T) {
 		}
 	}
 	if strings.Contains(strings.ToLower(res.String()), "freesbc-arrival") {
-		t.Errorf("the response FreeSWITCH received carries the marker:\n%s", res.String())
-	}
-}
-
-// The PSTN listener serves the outbound bridge only: any other method is
-// 405, an INVITE that does not name the match is 404 and never reaches a
-// client or the upstream, and an in-dialog INVITE is 481.
-func TestPSTNListenerServesOnlyTheBridge(t *testing.T) {
-	h, carrier := startHarnessPSTN(t)
-	conn := auditUDP(t)
-	port := auditUDPPort(conn)
-	auditRawRequest(t, conn, h.pstnMatch, strings.Replace(arrOptions, "5999", fmt.Sprint(port), 1))
-	var status string
-	auditRecvUntil(conn, 2*time.Second, func(b []byte) bool {
-		if bytes.HasPrefix(b, []byte("SIP/2.0 ")) {
-			status = strings.SplitN(string(b), "\r\n", 2)[0]
-			return true
-		}
-		return false
-	})
-	if !strings.HasPrefix(status, "SIP/2.0 405") {
-		t.Errorf("OPTIONS on the PSTN listener = %q, want 405", status)
-	}
-
-	other := sip.Uri{User: "9999", Host: "127.0.0.1", Port: portOf(h.privateSIP)}
-	if res := h.fs.call(t, other, h.pstnMatch, phoneOfferSDP(h.fs.rtpPort)); res.StatusCode != 404 {
-		t.Errorf("INVITE on the PSTN listener for another Request-URI = %d, want 404", res.StatusCode)
-	}
-	if got := carrier.received(sip.INVITE); len(got) != 0 {
-		t.Errorf("the carrier saw %d INVITEs for a non-match Request-URI", len(got))
-	}
-	if got := h.fs.received(sip.INVITE); len(got) != 0 {
-		t.Errorf("the upstream saw %d INVITEs from the PSTN listener", len(got))
-	}
-	listeners := h.srv.Listeners()
-	found := false
-	for _, l := range listeners {
-		if l == "udp://"+h.pstnMatch+" (pstn)" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("Listeners() = %v, want the PSTN listener", listeners)
+		t.Errorf("the response the phone received carries the marker:\n%s", res.String())
 	}
 }

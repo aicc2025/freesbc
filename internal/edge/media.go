@@ -593,8 +593,7 @@ func (s *Server) pointMedia(sess *mediaSession, p plane, remote, rtcp netip.Addr
 // FROM FreeSWITCH: the private body is the offer, and the client sees a
 // constructed public one.
 //
-// toBrowser selects the public leg's shape. A UDP phone (and a PSTN
-// gateway) gets a plain RTP↔RTP relay and an RTP/AVP offer. A client
+// toBrowser selects the public leg's shape. A UDP phone gets a plain RTP↔RTP relay and an RTP/AVP offer. A client
 // registered over ws or wss is a browser, which accepts only DTLS-SRTP: it
 // gets an offerer WebRTC leg on the public pool and an offer with the
 // browser-facing block — UDP/TLS/RTP/SAVPF, a=ice-lite, one host

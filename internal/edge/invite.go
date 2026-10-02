@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
@@ -17,9 +16,7 @@ import (
 // inviteTimeout bounds an INVITE transaction end to end. It is longer than
 // a typical ring cap because the far end, not FreeSBC, decides when to
 // give up; this is a backstop against a transaction that never finalises
-// pinning a media session forever. For a PSTN trunk it is the WHOLE-CALL
-// budget the failover series runs under — each gateway attempt gets its own
-// (much smaller) budget, attempt_timeout, enforced by the pump.
+// pinning a media session forever.
 const inviteTimeout = 5 * time.Minute
 
 // maxEarlyPerSource caps the calls one public source IP may have in
@@ -32,51 +29,6 @@ const inviteTimeout = 5 * time.Minute
 // address, so it also bounds a flood spread over many source ports; it is
 // generous enough for many phones ringing out through one NAT at once.
 const maxEarlyPerSource = 64
-
-// pstnDrain is how long the pump waits after a budget-expiry CANCEL for the
-// final response that CANCEL provokes. Long enough for a local gateway's
-// 487 (a few RTTs), short enough that a dead gateway cannot stall the
-// failover: the attempt is over either way, and the drain only exists to
-// classify HOW it ended (a 2xx that raced the CANCEL must be ACKed and
-// BYEd, or the gateway retransmits its 200 for up to Timer H).
-const pstnDrain = 300 * time.Millisecond
-
-// attemptKind classifies how one gateway attempt ended, for the status the
-// exhausted-budget path synthesises when every gateway has failed. The
-// precedence is deliberate: a media-anchor failure (failAnchor) outranks
-// everything — it means no carrier that answered can use FreeSWITCH's
-// offer, which no further attempt can fix; a real final (failReal) is the
-// last carrier's honest word on the call; a ring timeout (failRing) is the
-// budget the carrier burned in silence; failDial is an attempt that never
-// produced anything at all.
-type attemptKind int
-
-const (
-	failDial   attemptKind = iota // the INVITE never produced an answerable response
-	failReal                      // a real final (>=500 or 408) arrived and was held
-	failRing                      // the attempt budget expired while it was ringing
-	failAnchor                    // an answer arrived but its media could not be anchored
-)
-
-// attemptResult is what one gateway attempt reports back to the failover
-// loop. ok means a 2xx was accepted and the dialog is confirmed; retryable
-// false means the pump already relayed a final response that ends the call
-// (3xx, 401/407, a 4xx other than 408, or a 6xx — the server transaction
-// can finalise only once, so the series must stop); penalize asks the caller
-// to put the gateway into cooldown (it produced no response at all while
-// FreeSWITCH was still waiting); kind/code/reason feed the exhausted-budget
-// synthesis. global is a 6xx that could not be relayed as it arrived (it
-// raced the attempt's expiry CANCEL): the series stops and FreeSWITCH is
-// sent that code.
-type attemptResult struct {
-	ok        bool
-	global    bool
-	retryable bool
-	penalize  bool
-	kind      attemptKind
-	code      int
-	reason    string
-}
 
 // onInvite proxies a call in whichever direction it is going and anchors
 // its media.
@@ -91,29 +43,6 @@ type attemptResult struct {
 func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	src := in.src
 	inDialog := isInDialog(req)
-	if in.arr == arrPSTN {
-		// The dedicated PSTN listener (sip.pstn.match). guard has already
-		// exempted it from the shield, so nothing else may reach a carrier
-		// through it: only a fresh INVITE that names the match is a PSTN
-		// bridge. An in-dialog INVITE belongs on the private socket, and
-		// an INVITE for any other Request-URI is not something this
-		// listener serves — it must never fall through to the client or
-		// upstream paths. Both are FreeSWITCH's own mistakes, so they get
-		// an honest answer.
-		if inDialog {
-			s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
-			return
-		}
-		if !s.isPSTNBridgeInvite(req, in) {
-			s.reject(req, tx, 404, "Not Found")
-			return
-		}
-		if s.rejectRequired100rel(req, tx) {
-			return
-		}
-		s.inviteToPSTN(req, tx)
-		return
-	}
 	if !inDialog && !in.private() && !s.admitPublicInvite(req, src) {
 		// Admission (issue #86; admission.go): a public out-of-dialog
 		// INVITE from a source that is neither a carrier source nor a
@@ -137,41 +66,11 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound
 		s.onReInvite(req, tx, in.private())
 		return
 	}
-	// FreeSWITCH bridging an outbound PSTN call is not handled here: it
-	// arrives on its own listener (in.arr == arrPSTN, above). An INVITE
-	// whose Request-URI merely names sip.pstn.match but reached the private
-	// or a public socket is an ordinary INVITE — from a public source it
-	// went through admission and is proxied upstream like any other, and it
-	// never dials a gateway.
 	if in.private() {
 		s.inviteToClient(req, tx)
 		return
 	}
 	s.inviteToUpstream(req, tx, src)
-}
-
-// isPSTNBridgeInvite reports whether an INVITE is FreeSWITCH bridging an
-// outbound call to the PSTN carrier: it arrived on the dedicated PSTN
-// listener (sip.pstn.match) — the arrival the read filter stamped, so the
-// SOURCE address alone never suffices — and its Request-URI names that same
-// address, which is what the dialplan sends PSTN prefixes to. The
-// Request-URI half is defence in depth: the listener serves nothing else,
-// and validation keeps the match away from the private socket and the
-// upstream.
-func (s *Server) isPSTNBridgeInvite(req *sip.Request, in inbound) bool {
-	if !s.topo.pstnEnabled() || in.arr != arrPSTN {
-		return false
-	}
-	if req.Recipient.Host != s.topo.pstn.match.Host {
-		return false
-	}
-	// A URI without a port means the transport default, as everywhere else
-	// in the proxy (isSelf, Via checks).
-	port := req.Recipient.Port
-	if port == 0 {
-		port = 5060
-	}
-	return port == s.topo.pstn.match.Port
 }
 
 // beginDialog opens the call's record, or answers 482 when the INVITE
@@ -552,305 +451,16 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	}
 }
 
-// inviteToPSTN handles a call FreeSWITCH is bridging to the PSTN trunk: a
-// route picks the gateway list by called number, and the gateways are
-// dialed in order until one connects the call. Each attempt is a fresh
-// forward of FreeSWITCH's ORIGINAL INVITE — same Call-ID, CSeq, From and
-// To, a new Via branch and its own copy of the offer — so every carrier
-// sees an ordinary, complete INVITE while the media session and the record
-// FreeSWITCH's INVITE opened are shared across all of them.
-//
-// A failed attempt's final is never relayed to FreeSWITCH: the server
-// transaction can finalise only once, and a later gateway may still connect
-// the call. Only when the list is exhausted is one status synthesised from
-// what the attempts revealed.
-//
-// The gateway is peer-to-peer: it never registers and FreeSBC never pings
-// it (its health is the passive cooldown the gateway cooldown table
-// tracks). The call
-// shape is exactly FS→client — media anchored on both legs, the private
-// identity advertised back to FreeSWITCH.
-//
-// Precondition (established by onInvite's classification): the request
-// arrived from the configured upstream and its Request-URI names
-// sip.pstn.match.
-func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
-	// The trunk rides the public UDP plane, which validation guarantees is
-	// configured whenever sip.pstn is. Unlike a client (480), an
-	// unreachable carrier is a temporary service failure (503): it is
-	// infrastructure FreeSWITCH expects to fail over around, not an
-	// endpoint that has gone away.
-	to, ok := s.topo.publicSide("udp")
-	if !ok {
-		s.reject(req, tx, 503, "Service Unavailable")
-		return
-	}
-	body := req.Body()
-	if len(body) == 0 {
-		// An offerless INVITE would make FreeSBC the offerer toward the
-		// carrier and then require a second negotiation against the ACK.
-		// Not supported in this phase; refusing is honest. Same answer as
-		// the client path, before any gateway is dialed.
-		s.reject(req, tx, 488, "Not Acceptable Here")
-		return
-	}
-
-	// wholeCtx is the whole-call backstop the entire attempt series runs
-	// under: the 5-minute inviteTimeout, cancellable — a FreeSWITCH CANCEL
-	// cancels the series, never just the attempt in flight.
-	wholeCtx, wholeCancel := context.WithTimeout(context.Background(), s.inviteBudget())
-	defer wholeCancel()
-
-	// One record from here to teardown, as in inviteToUpstream. The whole
-	// failover series shares it: one media session, one CANCEL bridge. The
-	// caller is FreeSWITCH, whose in-dialog requests arrive on the private
-	// socket (the double Record-Route puts it first in its route set).
-	d, ok := s.beginDialog(req, tx, planePrivate)
-	if !ok {
-		return
-	}
-	defer d.endUnlessUp()
-
-	offer, err := s.buildPublicOffer(d, body, false)
-	if err != nil {
-		s.rejectMedia(req, tx, err)
-		return
-	}
-	sess := offer.sess()
-
-	// A number no route matches is not a PSTN call as far as this trunk is
-	// concerned; 503 tells FreeSWITCH's bridge to fail over rather than
-	// treat the number as invalid. No gateway is dialed (the harness and
-	// route tests assert exactly that).
-	gwNames, ok := resolvePSTNRoute(s.topo.pstn.routes, req.Recipient.User)
-	if !ok {
-		s.reject(req, tx, 503, "Service Unavailable")
-		return
-	}
-
-	// The failure budgets are re-read from the store on EVERY call, so a
-	// config reload changes them for the next call without a restart; the
-	// gateway set and routes are a startup snapshot like the rest of the
-	// topology (see budgets.go).
-	budget, cooldown := s.pstnBudget()
-
-	// Cooldown ordering: keep the route's failover order, but SKIP every
-	// cooling gateway while any alternative is available, so a sick gateway
-	// never delays the call to a healthy one (skip-if-alternatives,
-	// mirroring the trunk plane's expandTargets). When EVERY candidate is
-	// cooling, dial the route's order anyway: a cooldown is a suspicion,
-	// not a verdict, and a hard block would turn one dead gateway into a
-	// dead route.
-	targets, _ := orderByAvailability(gwNames, s.pstnCooldown.Available)
-
-	// The CANCEL bridge is registered ONCE, for the whole series: the
-	// server transaction FreeSWITCH's INVITE created is a single
-	// transaction across every attempt, and its OnCancel hook must cancel
-	// whichever attempt is in flight when FreeSWITCH gives up. The pending
-	// entry is re-tracked per attempt below, and the cancel it holds is
-	// ALWAYS wholeCancel — never a per-attempt cancel — so a CANCEL landing
-	// between two attempts still ends the whole series through the stale
-	// entry, and the loop's wholeCtx check stops the next attempt from
-	// starting.
-	if !tx.OnCancel(func(*sip.Request) {
-		if !s.cancelCall(d, cancelByCaller) {
-			// No attempt in flight (between attempts, or before the first):
-			// there is nothing to CANCEL on the wire, but the series must
-			// still stop.
-			wholeCancel()
-		}
-	}) {
-		// The CANCEL beat us here: the server transaction is already
-		// terminated, the hook will never fire, and there is nothing to
-		// forward to. sipgo has already answered FreeSWITCH (200 to the
-		// CANCEL, 487 to the INVITE); ending the series is the whole of the
-		// work left.
-		return
-	}
-	// One untrack at the end of the whole series: the per-attempt entries
-	// deliberately OVERWRITE one another on the record, so a CANCEL in the
-	// window between two attempts finds the previous attempt's entry and
-	// still fires wholeCancel through it.
-	defer d.untrack()
-
-	var (
-		haveAnchor     bool
-		haveReal       bool
-		lastRealCode   int
-		lastRealReason string
-		haveRing       bool
-		attempt        int
-	)
-	for _, name := range targets {
-		if wholeCtx.Err() != nil {
-			break // FreeSWITCH cancelled (or the backstop fired) mid-series
-		}
-		attempt++
-		gw, ok := s.topo.pstn.gateways[name]
-		if !ok {
-			continue
-		}
-
-		// Every attempt re-forwards the ORIGINAL request (prepareForward
-		// clones, so FreeSWITCH's INVITE stays intact): a fresh Via branch
-		// and Record-Route pair per attempt, same Call-ID/CSeq/From/To —
-		// it is one call FreeSWITCH is still waiting on, whatever we had
-		// to try to connect it.
-		out, err := s.prepareForward(req, s.topo.private, to, gw.host, true)
-		if err != nil {
-			s.reject(req, tx, 483, "Too Many Hops")
-			return
-		}
-		// The Request-URI FreeSWITCH used names FreeSBC's own match
-		// address; the carrier must see the called number addressed to
-		// itself.
-		out.Recipient = pstnRequestURI(req.Recipient, gw.addr)
-		fsip.SetContact(out, to.uri())
-		fsip.SetSDPBody(out, offer.sdp)
-
-		s.log.Info("dialing pstn gateway",
-			"sip_call_id", fsip.CallID(req), "direction", "private->public",
-			"number", req.Recipient.User, "gateway", name, "attempt", attempt,
-			"public_remote", gw.host,
-			"rtp_public_port", sess.publicPort,
-			"rtp_private_port", sess.privatePort,
-			"codec", codecNames(sess.negotiated()))
-
-		// Tracked before it is sent, as in inviteToUpstream.
-		a := &inviteAttempt{req: out, cancel: wholeCancel}
-		if !d.track(a) {
-			break // FreeSWITCH cancelled before this attempt started
-		}
-		// Started on wholeCtx, NOT on an attempt context: the client
-		// transaction must survive the attempt budget so the expiry path
-		// can complete a CANCEL against it (decision #4).
-		clTx, err := s.client.TransactionRequest(wholeCtx, out, noBuild)
-		if err != nil {
-			s.log.Warn("forward PSTN INVITE", "err", err, "sip_call_id", fsip.CallID(req), "gateway", name)
-			if wholeCtx.Err() != nil {
-				break // the caller is gone; nothing left to do
-			}
-			// The INVITE never got out: a zero-response failure while
-			// FreeSWITCH is still waiting. Cooldown the gateway and let the
-			// next one try.
-			s.pstnCooldown.Penalize(name, cooldown)
-			continue
-		}
-		if d.markSent(a) {
-			go s.sendCancel(a)
-		}
-
-		// In-dialog traffic rides the WINNING gateway: directionFor sends
-		// FreeSWITCH's ACKs and BYEs to this address, and the winner's
-		// Contact is what their Request-URI names.
-		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
-			near: s.topo.private, far: to, callee: calleePSTN,
-			calleeRemote: gw.host, transport: "udp", fromPrivate: true}
-		res := s.pumpPSTNAttempt(wholeCtx, budget, l, name)
-
-		switch {
-		case res.ok:
-			s.pstnCooldown.Recover(name)
-			return
-		case res.global:
-			s.pstnCooldown.Recover(name)
-			s.reject(req, tx, res.code, res.reason)
-			return
-		case !res.retryable:
-			// The pump relayed a final that ends the call (a 3xx, 401/407,
-			// a 4xx other than 408, or a 6xx): the server transaction is
-			// finalised and nothing more may be sent on it.
-			return
-		case res.penalize:
-			// Zero responses across a whole attempt with FreeSWITCH still
-			// waiting: the gateway is suspect. Cooldown it so the NEXT call
-			// prefers its alternatives.
-			s.log.Warn("pstn gateway unreachable; entering cooldown",
-				"gateway", name, "cooldown", cooldown.String(), "sip_call_id", fsip.CallID(req))
-			s.pstnCooldown.Penalize(name, cooldown)
-		}
-		switch res.kind {
-		case failAnchor:
-			haveAnchor = true
-		case failReal:
-			haveReal, lastRealCode, lastRealReason = true, res.code, res.reason
-		case failRing:
-			haveRing = true
-		}
-		// Between attempts the stale pending entry deliberately stays put:
-		// a FreeSWITCH CANCEL in this window still finds it and fires
-		// wholeCancel (see the OnCancel hook above).
-	}
-
-	if wholeCtx.Err() != nil || d.wasCancelled() {
-		// FreeSWITCH cancelled (sipgo answered it), or the backstop expired.
-		s.giveUp(wholeCtx, d, req, tx, 408, "Request Timeout")
-		return
-	}
-	// Every gateway failed and nothing was relayed: synthesise the ONE
-	// status FreeSWITCH sees. An anchor failure answers 488 (no carrier can
-	// use FreeSWITCH's offer — worth more than any gateway's own failure,
-	// and what the v1 single-gateway shape answered for the same case);
-	// otherwise the last real code, a ring timeout, or the generic 503 in
-	// that order.
-	switch {
-	case haveAnchor:
-		s.reject(req, tx, 488, "Not Acceptable Here")
-	case haveReal:
-		s.reject(req, tx, lastRealCode, lastRealReason)
-	case haveRing:
-		s.reject(req, tx, 408, "Request Timeout")
-	default:
-		s.reject(req, tx, 503, "Service Unavailable")
-	}
-}
-
-// pstnRequestURI re-points a bridged call's Request-URI at the carrier
-// gateway: FreeSWITCH dialed FreeSBC's own match address, and the carrier
-// must be addressed by its own host:port. Everything else about the URI
-// survives — the user part IS the called number, and header-style
-// parameters like user=phone ride along — so only the host, the port and
-// any transport parameter (which would try to steer the carrier to a
-// different transport on a non-default port) change.
-func pstnRequestURI(u sip.Uri, gw netip.AddrPort) sip.Uri {
-	// Clone first: the clone deep-copies the params, and the request's own
-	// URI must not be mutated — it is what the response path matches
-	// against.
-	u = *u.Clone()
-	u.Host = gw.Addr().String()
-	u.Port = int(gw.Port())
-	if u.UriParams != nil {
-		u.UriParams.Remove("transport")
-	}
-	return u
-}
-
 // publicSideFor returns the public side matching a request's transport.
 func (s *Server) publicSideFor(req *sip.Request) (side, bool) {
 	return s.topo.publicSide(sip.NetworkToLower(req.Transport()))
 }
 
-// resolveTarget finds the binding an inbound request is addressed to,
-// preferring the opaque token FreeSBC put in the registered Contact and
-// falling back to the address-of-record.
+// resolveTarget finds the binding an inbound request is addressed to by the
+// opaque token FreeSBC put in the registered Contact. There is no
+// address-of-record fallback: an unknown or expired token is not found.
 func (s *Server) resolveTarget(req *sip.Request) (Binding, bool) {
-	if b, ok := s.bindingForRequest(req); ok {
-		return b, true
-	}
-	// No token: fall back to the AoR in the Request-URI. With several
-	// devices registered this picks the first, which is a real limitation
-	// — FreeSWITCH normally forks per contact, so each INVITE carries its
-	// own token and this path is not taken.
-	u := req.Recipient
-	if u.User == "" || u.Host == "" {
-		return Binding{}, false
-	}
-	for _, host := range []string{u.Host, s.topo.private.advIP.String()} {
-		if bs := s.loc.ByAOR(strings.ToLower(u.User + "@" + host)); len(bs) > 0 {
-			return bs[0], true
-		}
-	}
-	return Binding{}, false
+	return s.bindingForRequest(req)
 }
 
 // bindingForRequest extracts the binding token from a Request-URI (or from

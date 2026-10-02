@@ -104,9 +104,6 @@ type SIPNetConfig struct {
 	Private   ProxyPrivateSIP `yaml:"private"`
 	Upstream  UpstreamConfig  `yaml:"upstream"`
 	Upstreams UpstreamsConfig `yaml:"upstreams"`
-	// Pstn is the optional peer-to-peer PSTN carrier gateway the proxy
-	// forwards FreeSWITCH-bridged outbound calls to (see config/proxy.go).
-	Pstn PstnConfig `yaml:"pstn"`
 }
 
 // RTPNetConfig is the media-plane bind/advertised pair plus the explicit

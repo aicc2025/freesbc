@@ -135,7 +135,7 @@ func TestAdmissionRegisteredUDPClientCallProceeds(t *testing.T) {
 // An INVITE from a sip.public.carrier_sources prefix proceeds without any
 // registration.
 func TestAdmissionCarrierSourceProceeds(t *testing.T) {
-	h := startHarnessFull(t, false, "127.0.0.1", nil, false, "    carrier_sources: [127.0.0.0/8]\n")
+	h := startHarnessFull(t, false, "127.0.0.1", false, "    carrier_sources: [127.0.0.0/8]\n")
 	if got := h.srv.topo.carrierSourcesString(); got != "127.0.0.0/8" {
 		t.Errorf("carrier sources = %q, want 127.0.0.0/8", got)
 	}
@@ -143,23 +143,6 @@ func TestAdmissionCarrierSourceProceeds(t *testing.T) {
 	res := carrier.do(t, carrier.buildInvite("+15551230000", "1001", "example.com", phoneOfferSDP(4000)), h.publicUDP)
 	if res.StatusCode != 200 {
 		t.Fatalf("carrier INVITE: got %d, want 200", res.StatusCode)
-	}
-}
-
-// A sip.pstn gateway's IP is a carrier source with no further config: its
-// inbound INVITE proceeds.
-func TestAdmissionPSTNGatewayIPIsCarrierSource(t *testing.T) {
-	gw := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h := startHarnessFull(t, false, "127.0.0.1", func(matchPort int) string {
-		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", gw, matchPort)
-	}, false, "")
-	if got := h.srv.topo.carrierSourcesString(); got != "127.0.0.1/32" {
-		t.Errorf("carrier sources = %q, want the gateway's 127.0.0.1/32", got)
-	}
-	carrier := newUDPClient(t)
-	res := carrier.do(t, carrier.buildInvite("+15551230000", "1001", "example.com", phoneOfferSDP(4000)), h.publicUDP)
-	if res.StatusCode != 200 {
-		t.Fatalf("gateway INVITE: got %d, want 200", res.StatusCode)
 	}
 }
 
@@ -353,15 +336,12 @@ func TestWarnOnceIsBounded(t *testing.T) {
 	}
 }
 
-// carrierSourcesFrom unions the gateway IPs (as host prefixes, IPv4-mapped
-// unmapped) with the configured prefixes, deduplicated and sorted.
+// carrierSourcesFrom deduplicates and sorts the configured prefixes.
 func TestCarrierSourcesFrom(t *testing.T) {
-	gws := map[string]endpoint{
-		"b": {addr: netip.MustParseAddrPort("203.0.113.9:5060")},
-		"a": {addr: netip.MustParseAddrPort("[::ffff:198.51.100.1]:5060")},
-		"c": {addr: netip.MustParseAddrPort("203.0.113.9:5080")},
-	}
-	got := carrierSourcesFrom(gws, []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("203.0.113.9/32")})
+	got := carrierSourcesFrom([]netip.Prefix{
+		netip.MustParsePrefix("203.0.113.9/32"), netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("198.51.100.1/32"), netip.MustParsePrefix("203.0.113.9/32"),
+	})
 	topo := &topology{carrierSources: got}
 	if s := topo.carrierSourcesString(); s != "198.51.100.1/32,203.0.113.0/24,203.0.113.9/32" {
 		t.Fatalf("carrier sources = %q", s)

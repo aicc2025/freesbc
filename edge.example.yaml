@@ -26,9 +26,7 @@
 #
 # There are no `peers:` or `routes:` here: those configure the separate
 # trunk B2BUA plane, which this deployment does not use. Add them alongside
-# these sections to run both planes in one process. (Outbound PSTN calls
-# are a different feature — the commented `sip.pstn` section below — and
-# ride THIS plane, not the trunk plane.)
+# these sections to run both planes in one process.
 #
 #   freesbc check -c edge.example.yaml
 #   freesbc run   -c edge.example.yaml
@@ -58,12 +56,9 @@ sip:
       key_file: /etc/freesbc/wss-key.pem
     # A public out-of-dialog INVITE (a new call) is relayed to FreeSWITCH
     # only from a registered client's own transport address or from a
-    # CARRIER SOURCE; anything else is dropped with no response. The IPs of
-    # the sip.pstn gateways below are carrier sources automatically. List
-    # here the IPs a carrier sends INBOUND calls from when they differ from
-    # the gateway address FreeSBC dials, or when there is no sip.pstn at
-    # all: literal IPs or CIDRs, no wider than /8 (IPv4) or /32 (IPv6).
-    # Restart-only.
+    # CARRIER SOURCE; anything else is dropped with no response. List here
+    # the IPs a carrier sends INBOUND calls from: literal IPs or CIDRs, no
+    # wider than /8 (IPv4) or /32 (IPv6). Restart-only.
     # carrier_sources: [198.51.100.20, 203.0.113.0/28]
 
   private:
@@ -87,35 +82,6 @@ sip:
   #   nodes:
   #     fs-1: { address: 10.77.0.10:5060 }   # literal IP:port; udp implied
   #     fs-2: { address: 10.77.0.11:5060 }
-
-  # Optional: a peer-to-peer PSTN trunk. Uncomment to let FreeSWITCH bridge
-  # outbound PSTN calls through the SBC to carrier gateways that never
-  # register (FreeSBC never pings them). The match is a socket the SBC binds
-  # ITSELF: a dedicated UDP listener that only FreeSWITCH's IP may reach, and
-  # a call is a PSTN bridge because it arrived there, never because of the
-  # address it claims to come from. The FreeSWITCH dialplan dials PSTN
-  # prefixes to sip:<number>@<match>; the SBC forwards them to a gateway with
-  # media anchored on both legs, exactly like a call to a registered client.
-  # The match must therefore be a local address of THIS host on a UDP port no
-  # other listener uses (validation refuses one that collides with a public
-  # or private listener, and refuses the SBC's own private address and the
-  # upstream). Restart-only. Here FreeSWITCH reaches it at the SBC's private
-  # address, on its own port 16061 next to the public 16060.
-  #
-  # Two shapes: the multi-gateway form below (named carriers, routes by
-  # called-number prefix, failover in to: order), or the single-gateway
-  # shorthand `address: <host:port>` — the two are mutually exclusive.
-  # pstn:
-  #   match: 10.77.0.2:16061      # FreeSWITCH dials sip:<number>@THIS address
-  #   # attempt_timeout: 32s      # per-gateway attempt budget (default 32s)
-  #   # cooldown: 30s             # passive health penalty window (default 30s)
-  #   gateways:
-  #     gw-mobile: { address: 223.76.90.4:16060 }  # literal IP:port; transport: udp implied
-  #     gw-fixed:   { address: 223.76.90.5:16060 }
-  #   routes:                     # first match wins; multiple catch-alls legal
-  #     - match: "^1[3-9]\\d{9}$" # Go regexp on the called number
-  #       to: [gw-mobile]
-  #     - to: [gw-fixed, gw-mobile]  # no match = catch-all; to: order = failover order
 
 rtp:
   public:

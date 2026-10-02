@@ -4,15 +4,14 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"regexp"
 	"sort"
 	"strconv"
 )
 
 // validateProxy checks the edge-proxy plane (network/sip.public/
-// sip.private/sip.upstream/sip.pstn/rtp.public/rtp.private/webrtc). It is
+// sip.private/sip.upstream/rtp.public/rtp.private/webrtc). It is
 // a no-op for a trunk-only config apart from rejecting half-written
-// sections: a public listener, a media plane or a PSTN trunk configured
+// sections: a public listener, or a media plane configured
 // WITHOUT an upstream is a mistake worth naming, not a silent no-op.
 //
 // fail is validate's error collector, so every problem in the file is
@@ -20,7 +19,7 @@ import (
 func (c *Config) validateProxy(fail failFunc) {
 	if !c.ProxyEnabled() {
 		if c.proxyPartlyConfigured() {
-			fail("sip.upstream: required to enable the edge proxy — set sip.upstream.address or sip.upstreams.nodes; sip.public/sip.private/sip.pstn/rtp.public/rtp.private/webrtc are configured but there is no upstream to proxy to")
+			fail("sip.upstream: required to enable the edge proxy — set sip.upstream.address or sip.upstreams.nodes; sip.public/sip.private/rtp.public/rtp.private/webrtc are configured but there is no upstream to proxy to")
 		}
 		return
 	}
@@ -36,9 +35,6 @@ func (c *Config) validateProxy(fail failFunc) {
 	}
 
 	c.validateUpstreams(fail)
-	if c.SIP.Pstn.configured() {
-		c.validatePSTN(fail)
-	}
 	c.validatePlane("network.public", c.Network.Public, fail)
 	c.validatePlane("network.private", c.Network.Private, fail)
 	c.validatePublicListeners(fail)
@@ -54,13 +50,13 @@ func (c *Config) proxyPartlyConfigured() bool {
 	ups := c.SIP.Upstreams
 	upsSet := len(ups.Nodes) > 0 || ups.Algorithm != "" || ups.Cooldown != 0
 	return len(c.PublicSIPListeners()) > 0 || c.RTP.Public.configured() || c.RTP.Private.configured() ||
-		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero() || c.SIP.Pstn.configured() || upsSet ||
+		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero() || upsSet ||
 		len(c.SIP.Public.CarrierSources) > 0
 }
 
 // validateUpstreams checks the upstream in either shape.
 func (c *Config) validateUpstreams(fail failFunc) {
-	// Two mutually exclusive shapes, exactly like sip.pstn: the v1 alias
+	// Two mutually exclusive shapes: the v1 alias
 	// (sip.upstream.address) and the multi-switch pool (sip.upstreams.nodes).
 	// The alias converges on the pool at topology build time as node
 	// "default", so the runtime never knows which shape produced it — but
@@ -81,7 +77,7 @@ func (c *Config) validateUpstreams(fail failFunc) {
 		// The algorithm field is a forward-compatibility seam: exactly one
 		// value is implemented, so anything else is a config error rather
 		// than a silent fallback to hashing. Each node is checked like the
-		// alias and like a pstn gateway — literal IP:port, UDP only.
+		// alias — literal IP:port, UDP only.
 		if ups.Algorithm != "hash-user" {
 			fail("sip.upstreams.algorithm: only \"hash-user\" is supported, got %q", ups.Algorithm)
 		}
@@ -100,112 +96,10 @@ func (c *Config) validateUpstreams(fail failFunc) {
 		}
 	}
 	if ups.Cooldown < 0 {
-		// Like the pstn budgets: zero means "use the default", so a
+		// Zero means "use the default", so a
 		// negative value is an operator mistake to name, not to default
 		// away.
 		fail("sip.upstreams.cooldown: must not be negative, got %v", ups.Cooldown.Std())
-	}
-}
-
-// validatePSTN checks sip.pstn, which is optional: an outbound PSTN trunk
-// riding the public UDP plane, in one of two mutually exclusive shapes — the
-// v1 single-gateway alias (address + match) or the multi form (gateways +
-// routes + match). Either way its match must not collide with an address
-// FreeSWITCH already uses for other traffic, or the classification in the
-// proxy's onInvite would misroute calls that are not PSTN bridges at all.
-func (c *Config) validatePSTN(fail failFunc) {
-	pstn := c.SIP.Pstn
-	// Both budgets are optional but signed: zero means "use the
-	// default", so a negative value is an operator mistake to name
-	// here, not a value to default away.
-	if pstn.AttemptTimeout < 0 {
-		fail("sip.pstn.attempt_timeout: must not be negative, got %v", pstn.AttemptTimeout.Std())
-	}
-	if pstn.Cooldown < 0 {
-		fail("sip.pstn.cooldown: must not be negative, got %v", pstn.Cooldown.Std())
-	}
-
-	alias := pstn.Address != ""
-	gws := len(pstn.Gateways) > 0
-	routes := len(pstn.Routes) > 0
-	switch {
-	case alias && (gws || routes):
-		fail("sip.pstn: address and gateways are mutually exclusive — use the single-gateway alias (address) or the multi-gateway form (gateways + routes), not both")
-	case alias:
-		// ---- v1 alias: a strict address AND match pair, byte-for-byte
-		// the checks the deployed shape has always had.
-		checkIPPort(fail, "sip.pstn.address", pstn.Address)
-		c.validatePSTNMatch(pstn, "sip.pstn.address", fail)
-	case gws:
-		c.validatePSTNMulti(pstn, fail)
-		c.validatePSTNMatch(pstn, "sip.pstn.gateways", fail)
-	default:
-		// The section exists but names no gateway in either form:
-		// match/routes/timers alone are configuration with nothing to
-		// route to.
-		if !pstn.Match.IsZero() {
-			fail("sip.pstn.match: requires sip.pstn.address")
-		} else if routes {
-			fail("sip.pstn.routes: require sip.pstn.gateways — a route can only name configured gateways")
-		} else {
-			fail("sip.pstn: address or gateways required — match/attempt_timeout/cooldown alone configure nothing")
-		}
-	}
-
-	if pstn.Transport != "" {
-		// The carrier leg rides the public UDP plane, which is the only
-		// public transport the forwarding path can send a peer-to-peer
-		// call over without a registration to bind it to.
-		checkUDPOnly(fail, "sip.pstn.transport", pstn.Transport)
-	}
-	if !c.SIP.Public.UDP.Enabled {
-		fail("sip.pstn: requires sip.public.udp.enabled — the carrier leg rides the public UDP side")
-	}
-}
-
-// validatePSTNMulti checks the multi shape: named gateways plus the routes
-// that select and order them. Both halves are required — a gateway that no
-// route names is dead config, and a route with nothing to name cannot
-// exist.
-func (c *Config) validatePSTNMulti(pstn PstnConfig, fail failFunc) {
-	if len(pstn.Routes) == 0 {
-		fail("sip.pstn.routes: at least one route required when gateways are configured — the route is what selects which gateways a called number fails over across")
-	}
-	for _, name := range sortedKeys(pstn.Gateways) {
-		g := pstn.Gateways[name]
-		label := "sip.pstn.gateways." + name
-		if g == nil || g.Address == "" {
-			fail("%s.address: required", label)
-			continue
-		}
-		checkIPPort(fail, label+".address", g.Address)
-		// Same reasoning as the alias transport: the carrier leg rides
-		// the public UDP plane, the only public transport the
-		// forwarding path can use without a registration.
-		checkUDPOnly(fail, label+".transport", g.Transport)
-	}
-	for i, r := range pstn.Routes {
-		label := fmt.Sprintf("sip.pstn.routes[%d]", i)
-		if len(r.To) == 0 {
-			fail("%s: to: at least one gateway required", label)
-		}
-		for _, t := range r.To {
-			if _, ok := pstn.Gateways[t]; !ok {
-				fail("%s: to: unknown gateway %q", label, t)
-			}
-		}
-		r.matchTo = nil
-		if r.Match != "" {
-			// Compiled once at validate time, exactly like the trunk
-			// routes (validate.go): a bad pattern is a config error,
-			// not a discovery on the first matching call.
-			re, err := regexp.Compile(r.Match)
-			if err != nil {
-				fail("%s: match: %v", label, c.envRedact.detail(r.Match, err))
-			} else {
-				r.matchTo = re
-			}
-		}
 	}
 }
 
@@ -323,7 +217,6 @@ func (c *Config) validateWebRTC(fail failFunc) {
 	if c.WebRTC.RTCPMux != nil && !*c.WebRTC.RTCPMux {
 		fail("webrtc.rtcp_mux: must be true — FreeSBC allocates one ICE component per session and cannot serve a non-muxed browser leg")
 	}
-	checkFilePair(fail, "webrtc", "dtls_cert_file", c.WebRTC.DTLSCertFile, "dtls_key_file", c.WebRTC.DTLSKeyFile)
 	if !c.SIP.Public.WS.Enabled && !c.SIP.Public.WSS.Enabled {
 		fail("webrtc.enabled: requires sip.public.ws or sip.public.wss — a browser has no other way to signal")
 	}
@@ -355,13 +248,6 @@ func (c *Config) validateSockets(fail failFunc) {
 		}
 		b := c.SIP.Private.Bind
 		socks = append(socks, boundSocket{"sip.private.bind", "udp", b.Host, b.Port})
-		// sip.pstn.match is a UDP socket the edge binds itself: FreeSWITCH
-		// bridges PSTN calls to it, and it must not share its port with any
-		// other listener (a public wildcard bind on the same port included).
-		if !c.SIP.Pstn.Match.IsZero() {
-			m := c.SIP.Pstn.Match
-			socks = append(socks, boundSocket{"sip.pstn.match", "udp", m.Host, m.Port})
-		}
 	}
 	if c.Admin != nil {
 		if ap, err := netip.ParseAddrPort(c.Admin.Listen); err == nil {
@@ -416,60 +302,6 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-// validatePSTNMatch checks sip.pstn.match, required by both pstn shapes
-// (withKey names the key that requires it). Like every edge address it must
-// be a literal IP, since the edge plane does no DNS. The classification
-// keys on the match host:port alone (the called number varies per call),
-// so a match that names an address FreeSWITCH legitimately uses for other
-// traffic would shadow it: every such call would be routed to the carrier
-// instead of its real destination.
-//
-// The match is also a socket: the edge binds a dedicated, trusted UDP
-// listener there (the "PSTN listener"), and that socket, not the sender's
-// address, is what makes an INVITE a PSTN bridge. It must therefore be a
-// local address of this host on a port no other listener uses; the
-// collision check is validateSockets'. The private SIP socket and the upstream
-// are exactly the two addresses FreeSWITCH talks to for everything else —
-// and in the pool shape "the upstream" is every node, not just the one the
-// operator happened to be thinking of, so the alias and all nodes are
-// checked alike.
-func (c *Config) validatePSTNMatch(pstn PstnConfig, withKey string, fail failFunc) {
-	if pstn.Match.IsZero() {
-		fail("sip.pstn.match: required with %s", withKey)
-		return
-	}
-	if ip, err := netip.ParseAddr(pstn.Match.Host); err != nil {
-		fail("sip.pstn.match: %q is not a literal IP — the edge plane does no DNS", pstn.Match.Host)
-	} else if ip.IsUnspecified() {
-		// A wildcard bind would put the trusted PSTN listener on every
-		// interface, the public one included, and no Request-URI could
-		// ever name it.
-		fail("sip.pstn.match: %q is unspecified — it must be the specific private address FreeSWITCH dials", pstn.Match.Host)
-	}
-	if pstn.Match.Host == c.SIP.Private.Bind.Host && pstn.Match.Port == c.SIP.Private.Bind.Port {
-		fail("sip.pstn.match: must not name the SBC's private SIP address")
-	}
-	if pstn.Match.Host == c.PrivateAdvertisedIP().String() && pstn.Match.Port == c.PrivateSIPAdvertisedPort() {
-		fail("sip.pstn.match: must not name the SBC's private SIP address")
-	}
-	collidesUpstream := func(address string) bool {
-		uh, up, err := net.SplitHostPort(address)
-		if err != nil {
-			return false
-		}
-		p, err := strconv.Atoi(up)
-		return err == nil && pstn.Match.Host == uh && pstn.Match.Port == p
-	}
-	if c.SIP.Upstream.Address != "" && collidesUpstream(c.SIP.Upstream.Address) {
-		fail("sip.pstn.match: must not name the upstream")
-	}
-	for _, n := range c.SIP.Upstreams.Nodes {
-		if n != nil && n.Address != "" && collidesUpstream(n.Address) {
-			fail("sip.pstn.match: must not name the upstream")
-		}
-	}
 }
 
 func (c *Config) validatePlane(label string, p NetworkPlane, fail failFunc) {

@@ -49,10 +49,8 @@ func auditParseNoPanic(src string) (cfg *Config, err error, panicked any) {
 // an error, never a crash. Null map/list entries must be errors.
 func TestAuditParseNullEntriesDoNotPanic(t *testing.T) {
 	cases := map[string]string{
-		"null peer":         strings.Replace(minimalYAML, "peers:\n", "peers:\n  a:\n", 1),
-		"null route":        minimalYAML + "  - ~\n",
-		"null pstn gateway": withPSTN(proxyYAML, "  pstn:\n    match: 203.0.113.7:16061\n    gateways:\n      gw1:\n    routes:\n      - to: [gw1]\n"),
-		"null pstn route":   withPSTN(proxyYAML, "  pstn:\n    match: 203.0.113.7:16061\n    gateways:\n      gw1:\n        address: 223.76.90.4:16060\n    routes:\n      - ~\n"),
+		"null peer":  strings.Replace(minimalYAML, "peers:\n", "peers:\n  a:\n", 1),
+		"null route": minimalYAML + "  - ~\n",
 	}
 	for name, src := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -140,9 +138,7 @@ func TestAuditValidationErrorDoesNotEchoEnv(t *testing.T) {
 // `check` (Parse) must reject what `run` rejects.
 func TestAuditCheckRejectsWhatRunRejects(t *testing.T) {
 	cases := map[string]string{
-		"upstream hostname": strings.Replace(proxyYAML, "address: 10.77.0.10:5060", "address: fs.example.com:5060", 1),
-		"pstn.match hostname": withPSTN(proxyYAML,
-			"  pstn:\n    address: 223.76.90.4:16060\n    match: fs.example.invalid:16060\n"),
+		"upstream hostname":                 strings.Replace(proxyYAML, "address: 10.77.0.10:5060", "address: fs.example.com:5060", 1),
 		"duplicate listen.sip":              auditTrunkYAML("listen:\n  sip: [udp://127.0.0.1:5070, udp://127.0.0.1:5070]\n"),
 		"trunk and edge share a UDP socket": proxyYAML + auditTrunkYAML("listen:\n  sip: [udp://0.0.0.0:16060]\n  media:\n    port_range: 50000-50099\n"),
 	}
@@ -221,7 +217,6 @@ func FuzzAuditConfigParse(f *testing.F) {
 	skipKnown := os.Getenv("AUDIT_FUZZ_SKIP_KNOWN") == "1"
 	f.Add([]byte(minimalYAML))
 	f.Add([]byte(proxyYAML))
-	f.Add([]byte(withPSTN(proxyYAML, multiPSTN)))
 	f.Add([]byte("listen:\n  sip: [udp://0.0.0.0:5060]\npeers: {}\n"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if skipKnown {

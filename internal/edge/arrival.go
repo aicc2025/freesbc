@@ -23,11 +23,6 @@ const (
 	// arrPrivate is a datagram that reached the private bind from an
 	// upstream IP: FreeSWITCH talking to its own edge proxy.
 	arrPrivate
-	// arrPSTN is a datagram that reached the dedicated PSTN listener
-	// (sip.pstn.match) from an upstream IP: FreeSWITCH bridging an outbound
-	// call. The listener is trusted and shield-exempt, but it is not the
-	// private plane: only an INVITE (and its CANCEL) is expected on it.
-	arrPSTN
 )
 
 // arrivalHeader is the internal header the read filter stamps on a request
@@ -43,7 +38,6 @@ const arrivalHeader = "X-FreeSBC-Arrival"
 // secret, and a wrong or absent value simply means arrPublic.
 type arrivalMarker struct {
 	private []byte // full header value for the private bind
-	pstn    []byte // full header value for the PSTN listener
 }
 
 func newArrivalMarker() (*arrivalMarker, error) {
@@ -54,7 +48,6 @@ func newArrivalMarker() (*arrivalMarker, error) {
 	secret := hex.EncodeToString(b[:])
 	return &arrivalMarker{
 		private: []byte(secret + ";private"),
-		pstn:    []byte(secret + ";pstn"),
 	}, nil
 }
 
@@ -63,8 +56,6 @@ func (m *arrivalMarker) value(a arrival) []byte {
 	switch a {
 	case arrPrivate:
 		return m.private
-	case arrPSTN:
-		return m.pstn
 	}
 	return nil
 }
@@ -140,15 +131,8 @@ func (m *arrivalMarker) take(req *sip.Request) (*sip.Request, arrival) {
 	}
 	got := []byte(hs[0].Value())
 	result := arrPublic
-	// Both comparisons always run, so the time taken does not depend on
-	// which socket the value names.
-	priv := subtle.ConstantTimeCompare(got, m.private)
-	pstn := subtle.ConstantTimeCompare(got, m.pstn)
-	switch {
-	case priv == 1:
+	if subtle.ConstantTimeCompare(got, m.private) == 1 {
 		result = arrPrivate
-	case pstn == 1:
-		result = arrPSTN
 	}
 	clean := req.Clone()
 	for _, h := range clean.GetHeaders(arrivalHeader) {

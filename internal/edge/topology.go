@@ -9,18 +9,12 @@
 // is what makes FreeSWITCH the authoritative registrar — REGISTER and its
 // digest challenge are forwarded verbatim, and FreeSBC never holds a
 // credential.
-//
-// It runs alongside, and entirely independently of, the trunk B2BUA in
-// package trunk: a separate sipgo user agent, separate listeners, separate
-// media pools. Neither plane can disturb the other, and a deployment may
-// enable either or both.
 package edge
 
 import (
 	"hash/fnv"
 	"net"
 	"net/netip"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -110,7 +104,7 @@ func (s side) via(branch string) *sip.ViaHeader {
 }
 
 // endpoint is one resolved SIP peer FreeSBC dials — an upstream
-// FreeSWITCH or a PSTN carrier gateway. addr is the parsed signaling
+// FreeSWITCH. addr is the parsed signaling
 // address; host is the host:port exactly as configured, which is what the
 // forwarder puts in Destination and what the call table records as a
 // remote.
@@ -139,45 +133,6 @@ func parseEndpoint(label, address string) (endpoint, error) {
 	return endpoint{addr: netip.AddrPortFrom(ip, uint16(port)), host: address}, nil
 }
 
-// pstnRoute is one resolved routing rule: which gateways a called number
-// fails over across, in order. A nil re matches every number — that is the
-// catch-all a number with no more specific prefix rule falls back to.
-type pstnRoute struct {
-	re      *regexp.Regexp
-	targets []string // gateway names, in failover order
-}
-
-// pstnTopo is the resolved PSTN gateway model. match is the host:port
-// FreeSWITCH bridges PSTN calls to — the trigger of the classification in
-// onInvite; gateways is keyed by the names routes reference; routes is the
-// per-number failover plan, in evaluation order. The v1 alias shape
-// (config address + match) converges on this same model at build time as
-// gateway "default" with one catch-all route, so the request path never
-// knows which config shape produced it.
-type pstnTopo struct {
-	match    config.HostPort
-	gateways map[string]endpoint
-	routes   []pstnRoute
-}
-
-// pstnEnabled reports whether a PSTN trunk is configured. A config without
-// sip.pstn leaves the gateways map nil; validation guarantees a configured
-// trunk always has at least one gateway.
-func (t *topology) pstnEnabled() bool { return len(t.pstn.gateways) > 0 }
-
-// resolvePSTNRoute picks the failover list for a called number: the first
-// route whose regexp matches the number wins, a nil regexp matches every
-// number, and no match means the call is not a PSTN call at all. Pure and
-// stateless, mirroring the trunk plane's route resolution.
-func resolvePSTNRoute(routes []pstnRoute, user string) ([]string, bool) {
-	for _, r := range routes {
-		if r.re == nil || r.re.MatchString(user) {
-			return r.targets, true
-		}
-	}
-	return nil, false
-}
-
 // topology is the resolved network model the proxy runs with: an
 // IMMUTABLE snapshot, built once at startup from the config and never
 // written again. Listener addresses cannot be changed under a running
@@ -199,18 +154,10 @@ type topology struct {
 	upstreams     map[string]endpoint
 	upstreamNames []string
 
-	// pstn is the PSTN trunk, when sip.pstn is configured; a nil gateways
-	// map leaves the trunk off. Resolved at startup like upstream — the
-	// topology is a snapshot, not something re-read per request (the
-	// failure budgets ARE re-read per call from the store, but they are not
-	// topology).
-	pstn pstnTopo
-
 	// carrierSources are the public source prefixes an out-of-dialog
-	// INVITE is admitted from without a registration (admission.go): every
-	// sip.pstn gateway's IP plus sip.public.carrier_sources. A startup
-	// snapshot like the rest of the topology (sip.public and sip.pstn are
-	// restart-only).
+	// INVITE is admitted from without a registration (admission.go):
+	// sip.public.carrier_sources. A startup snapshot like the rest of the
+	// topology (sip.public is restart-only).
 	carrierSources []netip.Prefix
 
 	// media advertised addresses.
@@ -223,8 +170,7 @@ type topology struct {
 // resolver can never redirect the private leg and failover never waits on
 // a lookup.
 func buildTopology(cfg *config.Config) (*topology, error) {
-	// The upstream pool converges the two config shapes here, exactly like
-	// sip.pstn below: the v1 alias is synthesised — in buildTopology, NOT in
+	// The upstream pool converges the two config shapes here, the v1 alias is synthesised — in buildTopology, NOT in
 	// the config defaults — into the multi model as the single node
 	// "default", so a v1 config and an equivalent one-node pool behave
 	// identically by construction (and the hash degenerates trivially: one
@@ -264,69 +210,13 @@ func buildTopology(cfg *config.Config) (*topology, error) {
 	}
 	sort.Strings(upstreamNames)
 
-	// sip.pstn is optional; the resolution mirrors the upstream's: no DNS,
-	// literal address only, validated host:port. The match must already be
-	// a literal too — it is compared byte-for-byte against Request-URIs,
-	// and a name would silently never match (or, worse, match the wrong
-	// thing once a resolver changed).
-	//
-	// The two config shapes converge here. The v1 alias (a single
-	// `address`) is synthesised — in buildTopology, NOT in the config
-	// defaults — into the multi model: one gateway named "default" plus a
-	// catch-all route naming it. The store keeps what the operator wrote;
-	// this function is the one place both shapes become one runtime model,
-	// so a v1 config and an equivalent multi config behave identically by
-	// construction.
-	pstn := pstnTopo{gateways: map[string]endpoint{}}
-	if cfg.SIP.Pstn.Address != "" || len(cfg.SIP.Pstn.Gateways) > 0 {
-		if _, err := netip.ParseAddr(cfg.SIP.Pstn.Match.Host); err != nil {
-			return nil, &configError{"sip.pstn.match must be a literal IP, got " + cfg.SIP.Pstn.Match.Host}
-		}
-		pstn.match = cfg.SIP.Pstn.Match
-
-		resolve := func(name, label, address string) error {
-			e, err := parseEndpoint(label, address)
-			if err != nil {
-				return err
-			}
-			pstn.gateways[name] = e
-			return nil
-		}
-
-		if cfg.SIP.Pstn.Address != "" {
-			// v1 alias: the single gateway the config has always meant.
-			if err := resolve("default", "sip.pstn.address", cfg.SIP.Pstn.Address); err != nil {
-				return nil, err
-			}
-			pstn.routes = []pstnRoute{{targets: []string{"default"}}}
-		} else {
-			for name, g := range cfg.SIP.Pstn.Gateways {
-				// A gateway entry missing its address cannot survive
-				// validation, but a nil map entry (an empty `gw:` block)
-				// would panic below — treat it as the address error it is.
-				if g == nil || g.Address == "" {
-					return nil, &configError{"sip.pstn.gateways." + name + ".address must be a literal IP:port, got \"\""}
-				}
-				if err := resolve(name, "sip.pstn.gateways."+name, g.Address); err != nil {
-					return nil, err
-				}
-			}
-			for _, r := range cfg.SIP.Pstn.Routes {
-				// The match was compiled by validation (PstnRoute.matchTo);
-				// CompiledMatch() is nil for a catch-all.
-				pstn.routes = append(pstn.routes, pstnRoute{re: r.CompiledMatch(), targets: r.To})
-			}
-		}
-	}
-
 	privIP := cfg.PrivateAdvertisedIP()
 	t := &topology{
 		public:        map[string]side{},
 		upstreams:     upstreams,
 		upstreamNames: upstreamNames,
-		pstn:          pstn,
 		// validate compiled sip.public.carrier_sources (CarrierNets).
-		carrierSources: carrierSourcesFrom(pstn.gateways, cfg.SIP.Public.CarrierNets()),
+		carrierSources: carrierSourcesFrom(cfg.SIP.Public.CarrierNets()),
 		private: side{
 			plane:     planePrivate,
 			transport: "udp",
@@ -475,7 +365,7 @@ func (t *topology) isSelfVia(v *sip.ViaHeader) bool {
 // of the FreeSWITCHes in the upstream pool. It is NOT a trust decision on
 // its own: an address is forgeable and a public listener can be sent
 // anything. It is only the source-IP gate the read filter applies on the
-// TRUSTED sockets (the private bind and the PSTN listener), where the local
+// TRUSTED private bind, where the local
 // socket has already made the datagram FreeSWITCH-facing and this merely
 // keeps every other host out. Never a Via or From host, which the sender
 // controls.
@@ -559,8 +449,7 @@ func (t *topology) selectUpstream(user string, available func(string) bool) (str
 //
 // When EVERY name is cooling it returns the whole set as available: a
 // cooldown is a suspicion, not a verdict, and a hard block would turn one
-// sick target into a dead route. Both failover planes — the upstream pool
-// and the PSTN route — partition their candidates exactly this way.
+// sick target into a dead route. The upstream pool partitions its candidates this way.
 func orderByAvailability(names []string, available func(string) bool) (pool, cooled []string) {
 	for _, name := range names {
 		if available(name) {

@@ -3,32 +3,10 @@ package edge
 import (
 	"net"
 	"testing"
-	"time"
-
-	"github.com/emiago/sipgo/sip"
 
 	"github.com/freesbc/freesbc/internal/config"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 )
-
-// audit: P2-CFG-002
-// The PSTN gateways are topology, built once at startup. A reload that
-// removes sip.pstn leaves them in place, and must not zero the attempt
-// budget they run under: a bridged call still reaches the gateway and is
-// answered, instead of being cancelled the instant it is dialed.
-func TestReloadRemovingPSTNKeepsAttemptBudget(t *testing.T) {
-	h, carrier := startHarnessPSTN(t)
-	carrier.setInviteHook(carrier.answerHook(200, true))
-
-	auditReplaceConfig(h, func(c *config.Config) { c.SIP.Pstn = config.PstnConfig{} })
-
-	res := bridgePSTNCall(t, h, "12345")
-	if got := len(carrier.waitFor(sip.INVITE, 1, 2*time.Second)); got != 1 || res.StatusCode != 200 {
-		t.Fatalf("after a reload removing sip.pstn: FreeSWITCH got %d and the gateway saw %d INVITE(s); want 200 and 1",
-			res.StatusCode, got)
-	}
-	hangupPSTN(t, h, res)
-}
 
 // audit: P2-EDG-025
 // The public media plane's advertised address is topology, fixed at

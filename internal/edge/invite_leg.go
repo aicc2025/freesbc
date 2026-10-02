@@ -27,8 +27,6 @@ const (
 	calleeUpstream calleeKind = iota
 	// calleeClient: a registered client answers FreeSWITCH's call.
 	calleeClient
-	// calleePSTN: a carrier gateway answers FreeSWITCH's bridged call.
-	calleePSTN
 )
 
 // calleePlane is the plane the callee's answers come from, and so the
@@ -265,219 +263,12 @@ func (s *Server) pumpInvite(ctx context.Context, l *inviteLeg) pumpResult {
 	}
 }
 
-// pumpPSTNAttempt drives one gateway attempt to its end and classifies the
-// outcome for the failover loop. It is deliberately NOT pumpInvite with
-// options: the two differ in exactly the ways failover forces — an
-// attempt can end in a retry (its 408/>=500 finals are HELD, never
-// relayed), its budget is a timer rather than the transaction's context,
-// and an answer it can no longer serve must be torn down rather than left
-// to retransmit.
-//
-// wholeCtx is the whole-call context the client transaction was started on
-// (it survives the attempt budget — the CANCEL the budget expiry sends is
-// what ends the attempt). budget bounds the attempt.
-func (s *Server) pumpPSTNAttempt(wholeCtx context.Context, budget time.Duration,
-	l *inviteLeg, gateway string) attemptResult {
-
-	s.watch2xx(l)
-	// The budget is enforced by a timer, NOT a derived context: the client
-	// transaction must outlive the budget so the expiry path can complete a
-	// CANCEL against a live transaction.
-	timer := time.NewTimer(budget)
-	defer timer.Stop()
-
-	responded := false // any response was received (liveness evidence)
-	responses := l.clTx.Responses()
-	for {
-		select {
-		case res, ok := <-responses:
-			if !ok {
-				// sipgo never closes this channel — it ends a transaction
-				// through Done() — so this arm is unreachable. A closed
-				// channel is permanently ready, so stop selecting on it and
-				// let the loop end the way it ends for any transaction
-				// that produced no further response.
-				responses = nil
-				continue
-			}
-			if !fsip.Forwardable(res) {
-				continue // a 100 Trying is hop-by-hop; ours already went out
-			}
-			if wholeCtx.Err() != nil || l.dialog().wasCancelled() {
-				// FreeSWITCH cancelled while this response was in flight:
-				// nothing may be relayed (its transaction is already
-				// terminated). A 2xx that raced the CANCEL still believes
-				// it has a live dialog — complete and tear it down. A
-				// provisional leaves the gateway's 487 still to come, so
-				// drain for it.
-				if res.StatusCode/100 == 2 {
-					s.refuse2xx(l, res)
-				}
-				if res.StatusCode < 200 {
-					s.abandonAttempt(l)
-				}
-				return attemptResult{retryable: true, kind: failDial, code: 503,
-					reason: "Service Unavailable"}
-			}
-			// A final of 408 or 5xx is HELD, never relayed: the server
-			// transaction toward FreeSWITCH can finalise only once, and a
-			// later gateway may still connect the call. The failover loop
-			// synthesises this code only when every attempt has failed. A
-			// 6xx is NOT held: it is a global failure — the callee's
-			// definitive answer, which no other location may be tried
-			// against (RFC 3261 §16.7 step 5, §21.6) — so it falls through
-			// and is relayed like any other final that ends the series.
-			if (res.StatusCode >= 500 && res.StatusCode < 600) || res.StatusCode == 408 {
-				return attemptResult{retryable: true, kind: failReal,
-					code: res.StatusCode, reason: res.Reason}
-			}
-			responded = true
-			err := s.relayInviteResponse(l, res)
-			switch {
-			case errors.Is(err, errResponseDropped):
-				s.log.Debug("dropping unroutable pstn response", "code", res.StatusCode,
-					"sip_call_id", fsip.CallID(l.req), "gateway", gateway)
-				continue
-			case err != nil && l.dialog().wasCancelled():
-				// FreeSWITCH's CANCEL won the race with this 2xx; it has been
-				// ACKed and BYEd.
-				return attemptResult{retryable: true, kind: failDial, code: 503,
-					reason: "Service Unavailable"}
-			case err != nil:
-				s.log.Warn("pstn media negotiation failed", "err", err,
-					"sip_call_id", fsip.CallID(l.req), "gateway", gateway)
-				// Nothing of this response reaches FreeSWITCH — not even a
-				// media-bearing provisional that could not be anchored (a
-				// 2xx has been ACKed and BYEd, out the PUBLIC side: the
-				// gateway can only route to the public identity). 488
-				// outranks every other failure at exhaustion.
-				return attemptResult{retryable: true, kind: failAnchor,
-					code: 488, reason: "Not Acceptable Here"}
-			}
-			switch {
-			case res.StatusCode < 200:
-				// A provisional; keep pumping.
-			case res.StatusCode < 300:
-				// The call is up: the dialog was confirmed from this 2xx.
-				return attemptResult{ok: true}
-			default:
-				// Relayed and final: a 3xx, 401/407, a 4xx other than the
-				// held 408, or a 6xx. These are the far end's verdict on
-				// THIS call — a wrong number will be wrong on every gateway
-				// (404/486), a 6xx is by definition final everywhere, and a
-				// redirect is a response to this dialog — so the series
-				// stops here.
-				return attemptResult{retryable: false}
-			}
-		case <-l.clTx.Done():
-			// The transaction died without a final: the INVITE never got
-			// out, or the remote vanished mid-ring. Zero responses while
-			// FreeSWITCH is still waiting is the cooldown case.
-			return attemptResult{retryable: true, kind: failDial, code: 503,
-				reason: "Service Unavailable", penalize: !responded && wholeCtx.Err() == nil}
-		case <-wholeCtx.Done():
-			// FreeSWITCH cancelled (or the 5-minute backstop fired): the
-			// attempt ends, and the series with it. No penalize: the caller
-			// gave up; the gateway was not given its chance to fail. A
-			// caller's CANCEL is already on the wire; the backstop's is sent
-			// here. Its 487 is not necessarily here yet — drain for it.
-			s.abandonAttempt(l)
-			return attemptResult{retryable: true, kind: failDial, code: 503,
-				reason: "Service Unavailable"}
-		case <-timer.C:
-			return s.expirePSTNAttempt(wholeCtx, l, responded, gateway)
-		}
-	}
-}
-
-// expirePSTNAttempt ends an attempt whose budget ran out. It sends the
-// CANCEL (built from the attempt's own forwarded request, so it carries the
-// Via branch and destination the gateway will match), then drains the
-// transaction briefly for the final that CANCEL provokes — the drain is
-// what tells a gateway that answered (a 2xx that raced the CANCEL, which
-// must be ACKed and BYEd or it retransmits its 200) from one that was
-// simply silent (nothing within pstnDrain: the cooldown case).
-func (s *Server) expirePSTNAttempt(wholeCtx context.Context, l *inviteLeg, responded bool,
-	gateway string) attemptResult {
-	s.log.Warn("pstn attempt budget expired; cancelling",
-		"gateway", gateway, "sip_call_id", fsip.CallID(l.req))
-
-	// A short-lived transaction of its own: per RFC 3261 §9.1 the CANCEL
-	// echoes the INVITE's branch, which fsip.BuildCancel(out) provides.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := s.client.TransactionRequest(ctx, fsip.BuildCancel(l.out), noBuild); err != nil {
-		s.log.Debug("cancel pstn attempt", "err", err, "sip_call_id", fsip.CallID(l.req))
-		l.clTx.Terminate()
-		return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
-			penalize: !responded && wholeCtx.Err() == nil}
-	}
-
-	// Drain briefly. Nothing read here is relayed — the attempt is over —
-	// but what arrives classifies how it ended.
-	drain := time.NewTimer(pstnDrain)
-	defer drain.Stop()
-	responses := l.clTx.Responses()
-	for {
-		select {
-		case res, ok := <-responses:
-			if !ok {
-				// sipgo never closes this channel — it ends a transaction
-				// through Done() — so this arm is unreachable. A closed
-				// channel is permanently ready, so stop selecting on it and
-				// let the loop end the way it ends for any transaction
-				// that produced no further response.
-				responses = nil
-				continue
-			}
-			if !fsip.Forwardable(res) {
-				continue
-			}
-			switch {
-			case res.StatusCode < 200:
-				// A provisional still in flight when the CANCEL went out (a
-				// gateway that starts ringing only now): it says nothing
-				// about how the attempt ended, and is never a final. Keep
-				// draining for the final the CANCEL provokes.
-				continue
-			case res.StatusCode/100 == 2:
-				// A 2xx raced the CANCEL: the gateway accepted a call the
-				// budget had already given up on. It responded, so no
-				// cooldown; complete and tear down the dialog it believes
-				// exists.
-				s.log.Warn("pstn gateway answered as its attempt expired",
-					"gateway", gateway, "sip_call_id", fsip.CallID(l.req))
-				s.refuse2xx(l, res)
-				return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout"}
-			case res.StatusCode == 487:
-				// The CANCEL's own product: the attempt failed by expiry.
-				return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
-					penalize: !responded && wholeCtx.Err() == nil}
-			case res.StatusCode >= 600:
-				// A global failure racing the CANCEL: the call is refused
-				// everywhere, so the series stops and FreeSWITCH gets it.
-				return attemptResult{global: true, code: res.StatusCode, reason: res.Reason}
-			default:
-				// Any other final racing the CANCEL is the gateway's real
-				// word on the call; surface its code like any held final.
-				return attemptResult{retryable: true, kind: failReal,
-					code: res.StatusCode, reason: res.Reason}
-			}
-		case <-drain.C:
-			// Nothing within the drain: a silent gateway. Ring timeout;
-			// cooldown when FreeSWITCH was still waiting for it.
-			l.clTx.Terminate()
-			return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
-				penalize: !responded && wholeCtx.Err() == nil}
-		case <-wholeCtx.Done():
-			// The call ended while we were draining the attempt; nothing
-			// more may be relayed either way.
-			l.clTx.Terminate()
-			return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
-				penalize: !responded && wholeCtx.Err() == nil}
-		}
-	}
-}
+// cancelDrain is how long drainCancelledInvite waits for the final response
+// a CANCEL provokes. Long enough for a local far end's 487 (a few RTTs),
+// short enough that a dead one cannot stall teardown: a 2xx that raced the
+// CANCEL must be ACKed and BYEd, or the far end retransmits its 200 for up
+// to Timer H.
+const cancelDrain = 300 * time.Millisecond
 
 // drainCancelledInvite reads whatever the far end still has to say after the
 // call has been cancelled, briefly and without relaying any of it.
@@ -495,7 +286,7 @@ func (s *Server) expirePSTNAttempt(wholeCtx context.Context, l *inviteLeg, respo
 // far end believes it has a live dialog, so it is completed and torn down.
 // When nothing final arrives in time the transaction is terminated here.
 func (s *Server) drainCancelledInvite(l *inviteLeg) {
-	drain := time.NewTimer(pstnDrain)
+	drain := time.NewTimer(cancelDrain)
 	defer drain.Stop()
 	responses := l.clTx.Responses()
 	for {

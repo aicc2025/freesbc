@@ -284,7 +284,7 @@ func TestCancelPropagatesUpstream(t *testing.T) {
 	waitForRelease(t, h)
 }
 
-// TestCancelACKsUpstream487 is the upstream leg's half of the PSTN cancel
+// TestCancelACKsUpstream487 is the upstream leg's half of the cancel
 // bug: the caller gives up mid-ring, FreeSBC relays the CANCEL, and
 // FreeSWITCH's 487 — sent after the CANCEL already ended the call — must
 // still be ACKed (RFC 3261 §17.1.1.3), or FreeSWITCH retransmits it until

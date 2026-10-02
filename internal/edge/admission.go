@@ -46,11 +46,10 @@ var dropReasonLabels = [numDropReasons]string{
 
 func (r dropReason) String() string { return dropReasonLabels[r] }
 
-// carrierSourcesFrom builds the carrier-source prefix set: every sip.pstn
-// gateway's IP as a host prefix, plus sip.public.carrier_sources (already
-// canonical from validation). The result is deduplicated and sorted, so the
-// startup log line is stable.
-func carrierSourcesFrom(gateways map[string]endpoint, configured []netip.Prefix) []netip.Prefix {
+// carrierSourcesFrom builds the carrier-source prefix set:
+// sip.public.carrier_sources (already canonical from validation). The
+// result is deduplicated and sorted, so the startup log line is stable.
+func carrierSourcesFrom(configured []netip.Prefix) []netip.Prefix {
 	seen := map[netip.Prefix]bool{}
 	var out []netip.Prefix
 	add := func(p netip.Prefix) {
@@ -58,10 +57,6 @@ func carrierSourcesFrom(gateways map[string]endpoint, configured []netip.Prefix)
 			seen[p] = true
 			out = append(out, p)
 		}
-	}
-	for _, g := range gateways {
-		ip := g.addr.Addr().Unmap()
-		add(netip.PrefixFrom(ip, ip.BitLen()))
 	}
 	for _, p := range configured {
 		add(p)
@@ -97,13 +92,12 @@ func (t *topology) carrierSourcesString() string {
 
 // admitPublicInvite decides whether an out-of-dialog INVITE that arrived
 // on a public listener may be relayed upstream. FreeSWITCH is not among the
-// admitted sources: it speaks only on the private bind and the PSTN
-// listener, both trusted sockets that never reach this check, so a public
+// admitted sources: it speaks only on the private bind, a trusted
+// socket that never reaches this check, so a public
 // read from FreeSWITCH's own address is an ordinary public INVITE. It is
 // admitted when its transport source is:
 //
-//   - inside a carrier-source prefix (sip.pstn gateways and
-//     sip.public.carrier_sources);
+//   - inside a carrier-source prefix (sip.public.carrier_sources);
 //   - exactly the transport address (transport + IP:port) of a live
 //     registration binding: a registered phone or browser calling out over
 //     the socket it registered from. A WebSocket client's INVITE arrives on
