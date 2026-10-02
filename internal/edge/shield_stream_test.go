@@ -14,7 +14,7 @@ import (
 // instead of keeping a socket every later message is read and parsed on.
 // The control request with a benign User-Agent leaves the connection up.
 func TestBannedStreamIsClosed(t *testing.T) {
-	h := startHarness(t, false)
+	h := startHarnessStrict(t, true, false)
 	browser := newWSClient(t)
 	send := func(ua string) {
 		t.Helper()

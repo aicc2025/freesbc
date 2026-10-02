@@ -127,14 +127,6 @@
     margin-top: 0.5rem;
   }
   .note.hidden { display: none; }
-  .badge {
-    display: inline-block;
-    padding: 0.05rem 0.4rem;
-    border-radius: 4px;
-    font-size: 0.75rem;
-  }
-  .badge.yes { background: rgba(63, 191, 111, 0.15); color: var(--ok); }
-  .badge.no { background: rgba(138, 144, 160, 0.15); color: var(--muted); }
   textarea {
     width: 100%;
     min-height: 420px;
@@ -243,20 +235,6 @@
         </tbody>
       </table>
     </div>
-
-    <div class="panel">
-      <h2>Peers</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th><th>Address</th><th>Transport</th><th>SRTP</th><th>Register</th><th>Registered</th>
-          </tr>
-        </thead>
-        <tbody id="peers-body">
-          <tr class="empty-row"><td colspan="6">no peers configured</td></tr>
-        </tbody>
-      </table>
-    </div>
   </section>
 
   <section id="view-config" class="view">
@@ -280,7 +258,6 @@
 
   var STATUS_URL = "/api/status";
   var CALLS_URL = "/api/calls";
-  var PEERS_URL = "/api/peers";
   var CONFIG_RAW_URL = "/api/config/raw";
   var CONFIG_URL = "/api/config";
 
@@ -377,46 +354,13 @@
     });
   }
 
-  function badge(v) {
-    var span = document.createElement("span");
-    span.className = "badge " + (v ? "yes" : "no");
-    span.textContent = v ? "yes" : "no";
-    return span;
-  }
-
-  function renderPeers(peers) {
-    var body = document.getElementById("peers-body");
-    body.innerHTML = "";
-    if (!peers || peers.length === 0) {
-      body.innerHTML = '<tr class="empty-row"><td colspan="6">no peers configured</td></tr>';
-      return;
-    }
-    peers.forEach(function (p) {
-      var tr = document.createElement("tr");
-      [p.Name, p.Address, p.Transport, p.SRTP].forEach(function (v) {
-        var td = document.createElement("td");
-        td.textContent = v == null ? "" : v;
-        tr.appendChild(td);
-      });
-      var tdReg = document.createElement("td");
-      tdReg.appendChild(badge(p.Register));
-      tr.appendChild(tdReg);
-      var tdRegistered = document.createElement("td");
-      tdRegistered.appendChild(badge(p.Registered));
-      tr.appendChild(tdRegistered);
-      body.appendChild(tr);
-    });
-  }
-
   function pollDashboard() {
     Promise.all([
       fetchJSON(STATUS_URL),
-      fetchJSON(CALLS_URL),
-      fetchJSON(PEERS_URL)
+      fetchJSON(CALLS_URL)
     ]).then(function (results) {
       renderStatus(results[0]);
       renderCalls(results[1]);
-      renderPeers(results[2]);
       dashboardError.classList.add("hidden");
     }).catch(function () {
       // keep last-known-good data on screen; just flag the problem.

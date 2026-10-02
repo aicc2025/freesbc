@@ -32,12 +32,26 @@ type Server struct {
 
 	// boot is the snapshot the plane was built from (store.Current() in
 	// New). Restart-only settings are read from it and never from the
-	// store: the listener set, the WSS certificate, the private bind the
-	// read filter trusts, the media planes and the fallbacks of the
-	// failure budgets (see budgets.go). Written once in New.
+	// store: the listener set, the WSS certificate, the media planes. Only
+	// shield is hot, and the shield reads it itself. Written once in New.
 	boot *config.Config
 
+	// privAddr is the private SIP socket: private.ip:5060, unless a test
+	// overrode it with WithPrivateAddr. Written once in New.
+	privAddr netip.AddrPort
+
 	topo *topology
+
+	// carriers is the carrier directory: what edge.carriers resolves to and
+	// the carrier source set (carrierdns.go). carrierURIs maps the
+	// "host:port" a carrier is addressed by in a Request-URI to its name.
+	// Both are written once in New.
+	carriers    *carrierDirectory
+	carrierURIs map[string]string
+
+	// carrierRegs holds the switch's live registrations at carriers
+	// (carrierreg.go), by token. Separate from loc, the client table.
+	carrierRegs *carrierRegTable
 
 	pubPool  *media.PlanePool
 	privPool *media.PlanePool
@@ -47,26 +61,27 @@ type Server struct {
 	dialogs *dialogTable
 	metrics *Metrics
 
-	// pstnCooldown and upstreamCooldown are the passive health penalties of
-	// the PSTN carrier gateways and the upstream FreeSWITCHes (see
-	// cooldown.go). Two instances of one policy: the sets and the windows
-	// are configured separately, but the logic must not fork. Both are
-	// always allocated; harmless when the corresponding section is off.
-	pstnCooldown     *cooldownTable
+	// upstreamCooldown is the passive health penalty of the switch nodes
+	// (see cooldown.go).
 	upstreamCooldown *cooldownTable
 
 	srv    *sipgo.Server
 	client *sipgo.Client
 
-	shield *shield.Shield
+	shield   *shield.Shield
+	shieldMu sync.RWMutex // guards the assignment in Run against ShieldStats
 
-	// marker stamps requests that reach a trusted socket (the private bind
-	// and the PSTN listener) and recognises the stamp again in guard. It is
-	// the only carrier of "which local socket did this arrive on"; see
+	// marker stamps requests that reach the trusted private bind and
+	// recognises the stamp again in guard. It is the only carrier of "which local socket did this arrive on"; see
 	// arrival.go. Created in New, never replaced.
 	marker *arrivalMarker
 
 	webrtcEnabled bool
+
+	// rtpTimeout is the media silence timeout in nanoseconds: the
+	// rtpSilenceTimeout constant unless a test shortened it with
+	// setRTPTimeout. Pools read it for every new session.
+	rtpTimeout atomic.Int64
 
 	// inviteBackstop, when non-zero, replaces inviteTimeout as the INVITE
 	// backstop (nanoseconds). Only tests set it: the 5-minute default is
@@ -88,6 +103,33 @@ type Server struct {
 	// reason; enumLimit is the REGISTER enumeration limit (admission.go).
 	dropWarned *warnOnce
 	enumLimit  *enumLimiter
+}
+
+const (
+	// rtpSilenceTimeout tears a call down after this much RTP silence. It
+	// is the only automatic reclaim for a confirmed call whose BYE was lost.
+	rtpSilenceTimeout = 5 * time.Minute
+
+	// switchCooldown is how long a switch node that answered nothing is
+	// skipped in favour of its alternatives (passive; see cooldown.go).
+	switchCooldown = 30 * time.Second
+)
+
+// Option customises New.
+type Option func(*options)
+
+type options struct {
+	privateAddr netip.AddrPort
+}
+
+// WithPrivateAddr overrides the private SIP socket, which is otherwise the
+// fixed private.ip:5060. It is a TEST SEAM: the private socket's port is
+// not configurable in production, but tests run the whole topology on one
+// host and need to separate the private socket from the switch and the
+// public side by port. The address is used for both the bind and the
+// advertised side, and its IP replaces private.ip for media.
+func WithPrivateAddr(a netip.AddrPort) Option {
+	return func(o *options) { o.privateAddr = a }
 }
 
 // udpMTUOnce raises sipgo's UDP send ceiling, once per process.
@@ -114,10 +156,7 @@ var udpMTUOnce sync.Once
 // any legitimate SIP message and far below anything that could be used to
 // amplify traffic.
 //
-// This is a process-wide setting in sipgo with no per-user-agent override,
-// so it also applies to the trunk plane. That plane has the same limit and
-// the same failure mode, so raising it fixes both rather than trading one
-// for the other.
+// This is a process-wide setting in sipgo with no per-user-agent override.
 func raiseUDPSendLimit() {
 	udpMTUOnce.Do(func() {
 		if sip.UDPMTUSize < 8192 {
@@ -128,53 +167,60 @@ func raiseUDPSendLimit() {
 
 // New builds the proxy from the current config. It binds nothing; Run
 // does that.
-func New(store *config.Store, log *slog.Logger) (*Server, error) {
+func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error) {
 	cfg := store.Current()
-	if !cfg.ProxyEnabled() {
-		return nil, errors.New("proxy: sip.upstream.address (or sip.upstreams.nodes) is not configured")
+	var o options
+	for _, opt := range opts {
+		opt(&o)
 	}
-	topo, err := buildTopology(cfg)
-	if err != nil {
-		return nil, err
+	priv := cfg.PrivateAddr()
+	if o.privateAddr.IsValid() {
+		priv = o.privateAddr
 	}
+	topo := buildTopology(cfg, priv)
 	marker, err := newArrivalMarker()
 	if err != nil {
 		return nil, err
 	}
 	raiseUDPSendLimit()
-	pub, priv := newMediaPools(store, cfg)
 	s := &Server{
 		store:            store,
 		boot:             cfg,
+		privAddr:         priv,
 		log:              log.With("component", "proxy"),
 		topo:             topo,
-		pubPool:          pub,
-		privPool:         priv,
+		carriers:         newCarrierDirectory(cfg, log.With("component", "carriers")),
+		carrierURIs:      carrierURIsOf(cfg),
+		carrierRegs:      newCarrierRegTable(),
 		loc:              NewLocation(),
 		metrics:          NewMetrics(),
-		pstnCooldown:     newCooldownTable(),
 		upstreamCooldown: newCooldownTable(),
 		marker:           marker,
 		ready:            make(chan struct{}),
 		early:            map[netip.Addr]int{},
 		dropWarned:       newWarnOnce(maxWarnedSources),
 		enumLimit:        newEnumLimiter(),
-		webrtcEnabled:    cfg.WebRTC.Enabled,
+		webrtcEnabled:    cfg.WebRTC(),
 	}
+	s.rtpTimeout.Store(int64(rtpSilenceTimeout))
+	s.pubPool, s.privPool = newMediaPools(cfg, topo, s.mediaTimeout)
 	s.dialogs = newDialogTable(s.metrics, s.log)
 	s.dialogs.onMediaEnd = s.byeBothEnds
 	if s.webrtcEnabled {
-		if cfg.WebRTC.DTLSCertFile != "" {
-			s.identity, err = media.LoadDTLSIdentity(cfg.WebRTC.DTLSCertFile, cfg.WebRTC.DTLSKeyFile)
-		} else {
-			s.identity, err = media.ProcessDTLSIdentity()
-		}
+		s.identity, err = media.ProcessDTLSIdentity()
 		if err != nil {
 			return nil, err
 		}
 	}
 	return s, nil
 }
+
+// mediaTimeout is the RTP silence timeout for a new media session.
+func (s *Server) mediaTimeout() time.Duration { return time.Duration(s.rtpTimeout.Load()) }
+
+// setRTPTimeout shortens the RTP silence timeout. Tests only: the
+// production value is the rtpSilenceTimeout constant.
+func (s *Server) setRTPTimeout(d time.Duration) { s.rtpTimeout.Store(int64(d)) }
 
 // inviteBudget is the INVITE backstop: inviteTimeout unless a test
 // shortened it.
@@ -203,35 +249,89 @@ func (s *Server) PortStats() (inUse, total int) {
 	return pu + qu, pt + qt
 }
 
+// ShieldStats is the shield's drop counters for the admin API. It is the
+// zero value until Run has created the shield.
+func (s *Server) ShieldStats() shield.Stats {
+	s.shieldMu.RLock()
+	sh := s.shield
+	s.shieldMu.RUnlock()
+	if sh == nil {
+		return shield.Stats{DropsByReason: map[string]int64{}}
+	}
+	return sh.Stats()
+}
+
 // Listeners is the listener set Run binds, as transport://host:port, from
 // the startup snapshot (the set is restart-only).
 func (s *Server) Listeners() []string {
 	var out []string
-	for _, l := range s.boot.PublicSIPListeners() {
-		out = append(out, l.Transport+"://"+l.Bind.String())
+	for _, l := range s.publicListeners() {
+		out = append(out, l.transport+"://"+l.addr)
 	}
-	out = append(out, "udp://"+s.boot.SIP.Private.Bind.String()+" (private)")
-	if s.topo.pstnEnabled() {
-		out = append(out, "udp://"+s.topo.pstn.match.String()+" (pstn)")
+	out = append(out, "udp://"+s.privAddr.String()+" (private)")
+	return out
+}
+
+type bound struct {
+	transport string
+	addr      string
+}
+
+// publicListeners is the public socket set, udp then ws then wss, on
+// public.bind.
+func (s *Server) publicListeners() []bound {
+	bind := s.boot.PublicBind()
+	var out []bound
+	for _, l := range []struct {
+		transport string
+		port      int
+	}{{"udp", s.boot.Edge.Listen.UDP}, {"ws", s.boot.Edge.Listen.WS}, {"wss", s.boot.Edge.Listen.WSS}} {
+		if l.port != 0 {
+			out = append(out, bound{l.transport, netip.AddrPortFrom(bind, uint16(l.port)).String()})
+		}
 	}
 	return out
+}
+
+// checkLocalAddr fails unless ip is assigned to a local interface: a bind
+// to anything else fails late and obscurely, and an address that is not
+// ours would be advertised to peers that can never reach it.
+func checkLocalAddr(key string, ip netip.Addr) error {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("proxy: list local addresses: %w", err)
+	}
+	for _, a := range addrs {
+		if p, ok := a.(*net.IPNet); ok {
+			if got, ok := netip.AddrFromSlice(p.IP); ok && got.Unmap() == ip.Unmap() {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("proxy: %s %s is not assigned to any local interface", key, ip)
 }
 
 // Run binds every listener and blocks until ctx is cancelled. It returns
 // the first fatal bind error, or nil on clean shutdown.
 func (s *Server) Run(ctx context.Context) error {
+	if err := checkLocalAddr("public.bind", s.boot.PublicBind()); err != nil {
+		return err
+	}
+	if err := checkLocalAddr("private.ip", s.privAddr.Addr()); err != nil {
+		return err
+	}
 	sipgoLog := s.log.With("caller", "sipgo")
 	ua, err := sipgo.NewUA(
 		sipgo.WithUserAgentTransportLayerOptions(
 			sip.WithTransportLayerLogger(sipgoLog),
 			// The edge proxy accepts traffic from anywhere — phones and
-			// browsers have no fixed address — so unlike the trunk plane
-			// there is no source-IP allowlist in the read filter. It
-			// enforces two things that do not depend on knowing the
-			// sender: a hard size cap before the parser touches anything,
-			// and the private listener's own trust boundary. Who may push
-			// an out-of-dialog INVITE or a REGISTER into FreeSWITCH is
-			// decided after parsing, per request type (admission.go).
+			// browsers have no fixed address — so there is no source-IP
+			// allowlist on the public sockets. The filter enforces two
+			// things that do not depend on knowing the sender: a hard size
+			// cap before the parser touches anything, and the private
+			// socket's own trust boundary. Who may push an out-of-dialog
+			// INVITE or a REGISTER into the switch is decided after
+			// parsing, per request type (admission.go).
 			sip.WithTransportLayerReadFilter(s.readFilter()),
 		),
 		sipgo.WithUserAgentTransactionLayerOptions(sip.WithTransactionLayerLogger(sipgoLog)),
@@ -253,9 +353,11 @@ func (s *Server) Run(ctx context.Context) error {
 	defer client.Close()
 	s.client = client
 
-	sh := shield.NewNoKernel(s.store, s.log)
+	sh := shield.New(s.store, s.log, func(ip netip.Addr) bool { return s.carriers.snapshot().isSource(ip) })
 	defer sh.Close()
+	s.shieldMu.Lock()
 	s.shield = sh
+	s.shieldMu.Unlock()
 
 	srv.OnRegister(s.guard(s.onRegister))
 	srv.OnInvite(s.guard(s.onInvite))
@@ -270,22 +372,7 @@ func (s *Server) Run(ctx context.Context) error {
 	listenCtx, listenCancel := context.WithCancel(context.Background())
 	defer listenCancel()
 
-	type bound struct {
-		transport string
-		addr      string
-	}
-	var listeners []bound
-	for _, l := range s.boot.PublicSIPListeners() {
-		listeners = append(listeners, bound{l.Transport, l.Bind.String()})
-	}
-	listeners = append(listeners, bound{"udp-private", s.boot.SIP.Private.Bind.String()})
-	// The PSTN listener: a dedicated, trusted UDP socket at sip.pstn.match.
-	// FreeSWITCH bridges its outbound PSTN calls to that address, and a
-	// datagram is a PSTN bridge because of the socket it reached, not
-	// because of who it claims to be (see arrival.go).
-	if s.topo.pstnEnabled() {
-		listeners = append(listeners, bound{"udp-pstn", s.topo.pstn.match.String()})
-	}
+	listeners := append(s.publicListeners(), bound{"udp-private", s.privAddr.String()})
 
 	// Bind every socket SYNCHRONOUSLY before serving any of them. Binding
 	// inside the serving goroutines would make a bind failure racy to
@@ -303,26 +390,6 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		opened = append(opened, ln)
 	}
-
-	// A wildcard bind does not come up as the address it was written
-	// with. On a dual-stack host Go gives 0.0.0.0 an IPv6 socket whose
-	// local address is "[::]:port"; with IPv6 disabled it stays
-	// "0.0.0.0:port". sipgo's transport layer keys its connection pool by
-	// each socket's REAL local address (transport_udp.Serve registers
-	// conn.LocalAddr()), so an outbound request pinned to the configured
-	// address — see prepareForward — misses the pool whenever the two
-	// differ, and sipgo answers by opening a second socket on the same
-	// port, which the listener already owns: EADDRINUSE before a byte is
-	// written. Every FreeSWITCH-initiated request toward the public plane
-	// (an inbound INVITE, a session-timer refresh, a callee-side BYE) died
-	// that way in production while the phone-facing direction worked. The topology
-	// every handler reads is therefore BUILT here, from the sockets that
-	// were actually bound, so each UDP side names its socket's real local
-	// address and the pool lookup hits the listener connection itself. The
-	// assignment precedes every goroutine below, which is the
-	// happens-before edge that lets the snapshot be read without a lock for
-	// the rest of the process's life.
-	s.topo = s.topo.pinned(opened)
 
 	errs := make(chan error, len(opened))
 	var wg sync.WaitGroup
@@ -351,16 +418,13 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.log.Info("edge proxy listening",
 		"public_listeners", len(s.topo.public),
-		"private", s.topo.private.laddr.String(),
-		// The alias renders as upstreams=1 upstream_nodes=default — one log
-		// shape for both config forms, so a deployment never has to know
-		// which one it is running to read the line.
-		"upstreams", len(s.topo.upstreamNames),
-		"upstream_nodes", strings.Join(s.topo.upstreamNames, ","),
-		// The INVITE admission posture (admission.go): sip.pstn gateway
-		// IPs plus sip.public.carrier_sources. Empty means only upstreams
-		// and registered clients may place calls on a public listener.
-		"carrier_sources", s.topo.carrierSourcesString(),
+		"private", s.privAddr.String(),
+		"switches", len(s.topo.upstreamNames),
+		"switch_nodes", strings.Join(s.topo.upstreamNames, ","),
+		// The INVITE admission posture (admission.go): edge.carrier_sources
+		// and literal-IP edge.carriers. Empty means only registered clients
+		// may place calls on a public listener.
+		"carrier_sources", s.carriers.snapshot().sourcesString(),
 		"webrtc", s.webrtcEnabled)
 
 	close(s.ready)
@@ -380,8 +444,20 @@ func (s *Server) Run(ctx context.Context) error {
 				if n := s.loc.Prune(); n > 0 {
 					s.log.Debug("pruned expired registration bindings", "count", n)
 				}
+				if n := s.carrierRegs.prune(); n > 0 {
+					s.log.Debug("pruned expired carrier registrations", "count", n)
+				}
+				s.publishCarrierRegistrations()
 			}
 		}
+	}()
+
+	// The carrier directory resolves DNS-name carriers in the background; a
+	// resolver that is down at startup delays those carriers, nothing else.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.carriers.Run(listenCtx)
 	}()
 
 	var runErr error
@@ -466,8 +542,7 @@ func (l listener) Close() {
 
 // Serve drives the socket through sipgo's transport layer until it closes.
 //
-// This deliberately bypasses sipgo's ListenAndServe wrappers, for the same
-// reason package trunk does: as of v1.4.3 those close their internal
+// This deliberately bypasses sipgo's ListenAndServe wrappers, because as of v1.4.3 those close their internal
 // listener from an unsynchronised variable written by Serve and read by a
 // separate shutdown goroutine, which the race detector correctly flags on
 // every graceful shutdown. Owning the handle here gives a clean
@@ -475,7 +550,7 @@ func (l listener) Close() {
 // closes it exists.
 func (l listener) Serve(tl *sip.TransportLayer) error {
 	switch l.transport {
-	case "udp", "udp-private", "udp-pstn":
+	case "udp", "udp-private":
 		return tl.ServeUDP(l.packet)
 	case "ws":
 		return tl.ServeWS(l.stream)
@@ -489,7 +564,7 @@ func (l listener) Serve(tl *sip.TransportLayer) error {
 func (s *Server) openListener(transport, addr string) (listener, error) {
 	l := listener{transport: transport, addr: addr}
 	switch transport {
-	case "udp", "udp-private", "udp-pstn":
+	case "udp", "udp-private":
 		ua, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
 			return l, err
@@ -508,26 +583,15 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		l.stream = s.watchConnections(ln)
 		return l, nil
 	case "wss":
-		cfg := s.boot.SIP.Public.WSS
-		var tlsConf *tls.Config
-		if cfg.CertFile != "" {
-			cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-			if err != nil {
-				return l, fmt.Errorf("wss certificate: %w", err)
-			}
-			tlsConf = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
-		} else {
-			// A browser refuses an untrusted WSS certificate outright, so
-			// a self-signed fallback is close to useless — but failing to
-			// bind would take the whole process down over a missing file.
-			// Bind, and say loudly why it will not work.
-			conf, err := fsip.SelfSignedTLS("freesbc-proxy", []string{"127.0.0.1", "localhost"})
-			if err != nil {
-				return l, err
-			}
-			tlsConf = conf
-			s.log.Warn("wss listener has no cert_file/key_file and is using a self-signed certificate; browsers will refuse to connect", "addr", addr)
+		// validate guarantees tls is set whenever wss is.
+		if s.boot.TLS == nil {
+			return l, errors.New("wss needs the top-level tls cert and key")
 		}
+		cert, err := tls.LoadX509KeyPair(s.boot.TLS.Cert, s.boot.TLS.Key)
+		if err != nil {
+			return l, fmt.Errorf("wss certificate: %w", err)
+		}
+		tlsConf := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 		ln, err := tls.Listen("tcp", addr, tlsConf)
 		if err != nil {
 			return l, err
@@ -601,23 +665,18 @@ const maxMessageSize = fsip.MaxReadSize
 // return an error live in fsip.ReadFilter; what is here is the proxy's own
 // trust decision.
 //
-// There are three kinds of socket. The private bind and the PSTN listener
-// (sip.pstn.match) are TRUSTED: they speak to FreeSWITCH only, so a read
-// from any other IP is dropped before it can become a request, and a
-// request from an upstream IP is stamped with the arrival marker (see
-// arrival.go) so guard can tell which of the two sockets it reached. Every
-// other read is PUBLIC and gets no stamp, whoever it claims to be from.
+// There are two kinds of socket. The private bind is TRUSTED: it speaks
+// to FreeSWITCH only, so a read from any other IP is dropped before it can
+// become a request, and a request from an upstream IP is stamped with the
+// arrival marker (see arrival.go) so guard can tell it reached that socket.
+// Every other read is PUBLIC and gets no stamp, whoever it claims to be from.
 // Trust is keyed on the local socket alone: there is no table of "known
 // FreeSWITCH source addresses", so a datagram that reaches a public
 // listener from FreeSWITCH's own address and port is a public datagram.
 func (s *Server) readFilter() sip.TransportReadFilter {
-	privateAddr := s.boot.SIP.Private.Bind.String()
-	pstnAddr := ""
-	if s.topo.pstnEnabled() {
-		pstnAddr = s.topo.pstn.match.String()
-	}
+	privateAddr := s.privAddr.String()
 	// trusted names the trusted socket a read arrived on, or arrPublic. The
-	// trusted sockets are UDP only; a stream read on the same port number
+	// trusted socket is UDP only; a stream read on the same port number
 	// is a public client in a different port space.
 	trusted := func(info sip.TransportReadProps) arrival {
 		if info.LocalAddr == nil {
@@ -626,9 +685,6 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		local := info.LocalAddr.String()
 		if fsip.SameListener(info.Transport, local, "udp", privateAddr) {
 			return arrPrivate
-		}
-		if pstnAddr != "" && fsip.SameListener(info.Transport, local, "udp", pstnAddr) {
-			return arrPSTN
 		}
 		return arrPublic
 	}
@@ -703,18 +759,6 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		if !ok {
 			return
 		}
-		// The PSTN listener carries FreeSWITCH's outbound PSTN INVITE and
-		// the CANCEL that ends it, and nothing else: everything FreeSWITCH
-		// sends for an established call, and every other method, goes to
-		// the private socket. A stray method there is answered 405 (ACK
-		// gets nothing); the source is an upstream IP, so the answer tells
-		// it nothing it did not know.
-		if arr == arrPSTN && req.Method != sip.INVITE && req.Method != sip.CANCEL {
-			if req.Method != sip.ACK {
-				s.respond(req, tx, methodNotAllowed(req))
-			}
-			return
-		}
 		// FreeSWITCH is not subject to the public abuse plane: it is the
 		// element the proxy exists to serve, and rate-limiting it would
 		// turn a busy switch into a dropped call. That exemption belongs
@@ -786,7 +830,23 @@ type handler func(*sip.Request, sip.ServerTransaction, inbound)
 // onOptions answers a keepalive locally. An OPTIONS ping is a liveness
 // check on FreeSBC itself; forwarding every phone's keepalive upstream
 // would multiply load on FreeSWITCH for no information gain.
-func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, _ inbound) {
+//
+// From the switch an OPTIONS is classified by its Request-URI like every
+// other out-of-dialog request (classifySwitchRequest): addressed to
+// FreeSBC itself or to a registered client's token it is answered here; to
+// a carrier it is proxied to it (optionsToCarrier); to anything else, 404.
+// A public OPTIONS, a carrier's keepalive included, is answered here.
+func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inbound) {
+	if in.private() && fsip.ToTag(req) == "" {
+		switch kind, name := s.classifySwitchRequest(req); kind {
+		case targetCarrier:
+			s.optionsToCarrier(req, tx, name)
+			return
+		case targetNotFound:
+			s.reject(req, tx, 404, "Not Found")
+			return
+		}
+	}
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	res.AppendHeader(sip.NewHeader("Allow", strings.Join(allowedMethods, ", ")))
 	s.respond(req, tx, res)

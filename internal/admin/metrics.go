@@ -16,12 +16,11 @@ type collector struct {
 	activeCalls *prometheus.Desc
 	portsInUse  *prometheus.Desc
 	portsTotal  *prometheus.Desc
-	peerReg     *prometheus.Desc
 	dropsTotal  *prometheus.Desc
 	buildInfo   *prometheus.Desc
 
-	// Edge-proxy plane (nil-safe: Deps.Proxy is nil in a trunk-only
-	// deployment, and Collect skips the whole block then).
+	// Edge-proxy plane (nil-safe: Deps.Proxy is nil when no stats
+	// source is wired, and Collect skips the whole block then).
 	proxyRegs       *prometheus.Desc
 	proxyDialogs    *prometheus.Desc
 	proxyMedia      *prometheus.Desc
@@ -39,6 +38,8 @@ type collector struct {
 	proxyDTLSFail   *prometheus.Desc
 	proxyPanics     *prometheus.Desc
 	proxyAdmission  *prometheus.Desc
+	proxyCarrierReq *prometheus.Desc
+	proxyCarrierReg *prometheus.Desc
 }
 
 func newCollector(deps Deps) *collector {
@@ -47,7 +48,6 @@ func newCollector(deps Deps) *collector {
 		activeCalls: prometheus.NewDesc("freesbc_active_calls", "Currently active bridged calls.", nil, nil),
 		portsInUse:  prometheus.NewDesc("freesbc_media_ports_in_use", "RTP port pairs in use.", nil, nil),
 		portsTotal:  prometheus.NewDesc("freesbc_media_ports_total", "RTP port pairs the range can hold.", nil, nil),
-		peerReg:     prometheus.NewDesc("freesbc_peer_registered", "1 if a register:true peer is currently registered.", []string{"peer"}, nil),
 		dropsTotal:  prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
 
@@ -70,6 +70,10 @@ func newCollector(deps Deps) *collector {
 		proxyDTLSFail:  prometheus.NewDesc("freesbc_webrtc_dtls_failure_total", "WebRTC legs that failed the DTLS handshake or fingerprint check.", nil, nil),
 		proxyPanics:    prometheus.NewDesc("freesbc_sip_handler_panics_total", "Edge SIP handler panics recovered (each one lost a request).", nil, nil),
 		proxyAdmission: prometheus.NewDesc("freesbc_edge_admission_drops_total", "Public requests the edge proxy dropped silently by admission, by reason.", []string{"reason"}, nil),
+		// carrier is a configured name or "unknown"; direction and method
+		// are bounded sets.
+		proxyCarrierReq: prometheus.NewDesc("freesbc_edge_carrier_requests_total", "SIP requests of the carrier path, by carrier, direction (inbound: carrier to switch, outbound: switch to carrier) and method.", []string{"carrier", "direction", "method"}, nil),
+		proxyCarrierReg: prometheus.NewDesc("freesbc_edge_carrier_registrations", "Live carrier registrations (switch to carrier) the edge holds, by carrier.", []string{"carrier"}, nil),
 	}
 }
 
@@ -77,7 +81,6 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.activeCalls
 	ch <- c.portsInUse
 	ch <- c.portsTotal
-	ch <- c.peerReg
 	ch <- c.dropsTotal
 	ch <- c.buildInfo
 	for _, d := range []*prometheus.Desc{
@@ -85,7 +88,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
-		c.proxyAdmission,
+		c.proxyAdmission, c.proxyCarrierReq, c.proxyCarrierReg,
 	} {
 		ch <- d
 	}
@@ -99,16 +102,6 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	inUse, total := c.deps.Ports()
 	g(c.portsInUse, float64(inUse))
 	g(c.portsTotal, float64(total))
-	for _, p := range c.deps.Peers() {
-		if !p.Register {
-			continue
-		}
-		v := 0.0
-		if p.Registered {
-			v = 1
-		}
-		g(c.peerReg, v, p.Name)
-	}
 	st := c.deps.Shield()
 	for reason, n := range st.DropsByReason {
 		ch <- prometheus.MustNewConstMetric(c.dropsTotal, prometheus.CounterValue, float64(n), reason)
@@ -116,7 +109,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	g(c.buildInfo, 1, c.deps.Version)
 
 	if c.deps.Proxy == nil {
-		return // trunk-only deployment: the edge proxy is not running
+		return // no edge stats wired
 	}
 	p := c.deps.Proxy()
 	counter := func(d *prometheus.Desc, v float64, lv ...string) {
@@ -145,6 +138,15 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.proxyPanics, float64(p.HandlerPanics))
 	for reason, v := range p.AdmissionDrops {
 		counter(c.proxyAdmission, float64(v), reason)
+	}
+	for name, n := range p.CarrierRegistrations {
+		g(c.proxyCarrierReg, float64(n), name)
+	}
+	for k, v := range p.CarrierRequests {
+		parts := strings.SplitN(k, "/", 3)
+		if len(parts) == 3 {
+			counter(c.proxyCarrierReq, float64(v), parts[0], parts[1], parts[2])
+		}
 	}
 }
 

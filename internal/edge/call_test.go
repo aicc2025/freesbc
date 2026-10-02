@@ -117,9 +117,8 @@ func TestCaseB_UDPCallWithRTP(t *testing.T) {
 	if upstream.Audio.Port == phonePort {
 		t.Error("upstream offer advertises the phone's own RTP port — media would bypass the SBC")
 	}
-	if privRange := h.store.Current().RTP.Private; upstream.Audio.Port < privRange.PortMin || upstream.Audio.Port > privRange.PortMax {
-		t.Errorf("upstream media port %d is outside the private pool %d-%d",
-			upstream.Audio.Port, privRange.PortMin, privRange.PortMax)
+	if r := h.store.Current().RTP; upstream.Audio.Port < int(r.Min) || upstream.Audio.Port > int(r.Max) {
+		t.Errorf("upstream media port %d is outside the rtp range %d-%d", upstream.Audio.Port, r.Min, r.Max)
 	}
 	// Payload numbers and DTMF must survive verbatim: the proxy does not
 	// transcode, so both legs must agree on the numbers on the wire.
@@ -147,9 +146,8 @@ func TestCaseB_UDPCallWithRTP(t *testing.T) {
 	if answer.Audio.Port == h.fs.rtpPort {
 		t.Error("the phone was given FreeSWITCH's own RTP port")
 	}
-	if pubRange := h.store.Current().RTP.Public; answer.Audio.Port < pubRange.PortMin || answer.Audio.Port > pubRange.PortMax {
-		t.Errorf("public media port %d is outside the public pool %d-%d",
-			answer.Audio.Port, pubRange.PortMin, pubRange.PortMax)
+	if r := h.store.Current().RTP; answer.Audio.Port < int(r.Min) || answer.Audio.Port > int(r.Max) {
+		t.Errorf("public media port %d is outside the rtp range %d-%d", answer.Audio.Port, r.Min, r.Max)
 	}
 	if answer.Audio.Address.String() != "127.0.0.1" {
 		t.Errorf("answer c= = %v", answer.Audio.Address)
@@ -487,6 +485,33 @@ func TestInboundCallToUnknownContact(t *testing.T) {
 	waitForRelease(t, h)
 }
 
+// A switch-originated INVITE finds its client only by the fsbc token: a
+// Request-URI naming a registered address-of-record with no token (or an
+// unknown one) is 404, never resolved by AoR.
+func TestInboundCallWithoutTokenIsNotFoundByAoR(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+	h.fs.mu.Lock()
+	h.fs.challenge = false
+	h.fs.mu.Unlock()
+	if res := phone.do(t, phone.buildRegister("1001", "example.com", 600, ""), h.publicUDP); res.StatusCode != 200 {
+		t.Fatalf("REGISTER: %d", res.StatusCode)
+	}
+	tokParams := sip.NewParams()
+	tokParams.Add(contactTokenParam, "no-such-token")
+	for name, ruri := range map[string]sip.Uri{
+		"no token":      {User: "1001", Host: "example.com", Port: 0},
+		"private host":  {User: "1001", Host: "127.0.0.1", Port: portOf(h.privateSIP)},
+		"unknown token": {User: "1001", Host: "127.0.0.1", Port: portOf(h.privateSIP), UriParams: tokParams},
+	} {
+		res := h.fs.call(t, ruri, h.privateSIP, phoneOfferSDP(h.fs.rtpPort))
+		if res.StatusCode != 404 {
+			t.Errorf("%s: got %d, want 404", name, res.StatusCode)
+		}
+	}
+	waitForRelease(t, h)
+}
+
 // A call whose codecs do not intersect must be rejected, never transcoded.
 func TestCallWithNoCommonCodecRejected(t *testing.T) {
 	h := startHarness(t, false)
@@ -757,9 +782,8 @@ func TestReInviteKeepsMediaAnchored(t *testing.T) {
 	if upstream.Audio.Port == 30302 {
 		t.Error("the re-INVITE handed FreeSWITCH the client's own media port — media would bypass the SBC")
 	}
-	privRange := h.store.Current().RTP.Private
-	if upstream.Audio.Port < privRange.PortMin || upstream.Audio.Port > privRange.PortMax {
-		t.Errorf("re-offer media port %d is outside the private pool", upstream.Audio.Port)
+	if r := h.store.Current().RTP; upstream.Audio.Port < int(r.Min) || upstream.Audio.Port > int(r.Max) {
+		t.Errorf("re-offer media port %d is outside the rtp range", upstream.Audio.Port)
 	}
 	// The direction must survive: it is what puts the call on hold.
 	if upstream.Audio.Direction != sdp.SendOnly {

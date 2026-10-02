@@ -212,7 +212,7 @@ func TestCaseA_UDPRegistration(t *testing.T) {
 // TestCaseC_WebSocketRegistration is acceptance criterion 2: the same
 // exchange from sip.js over a WebSocket, reaching FreeSWITCH over UDP.
 func TestCaseC_WebSocketRegistration(t *testing.T) {
-	h := startHarness(t, false)
+	h := startHarness(t, true)
 	browser := newWSClient(t)
 	runRegistrationCase(t, h, browser, h.publicWS)
 }
@@ -408,7 +408,7 @@ func TestMultipleContactsAreAllReplaced(t *testing.T) {
 // When that connection closes, the binding must go with it — otherwise
 // FreeSBC would keep accepting inbound calls it has no way to deliver.
 func TestWebSocketCloseDropsBindings(t *testing.T) {
-	h := startHarness(t, false)
+	h := startHarness(t, true)
 	browser := newWSClient(t)
 	h.fs.mu.Lock()
 	h.fs.challenge = false

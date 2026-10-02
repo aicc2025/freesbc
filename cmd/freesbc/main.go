@@ -1,4 +1,4 @@
-// Command freesbc is an all-in-one session border controller:
+// Command freesbc is an edge session border controller:
 // one binary, one YAML file, `freesbc run`.
 package main
 
@@ -15,11 +15,11 @@ import (
 	"github.com/freesbc/freesbc/internal/app"
 )
 
-const usage = `FreeSBC — all-in-one session border controller
+const usage = `FreeSBC — SIP/WebRTC edge session border controller
 
 Usage:
-  freesbc run   [-c sbc.yaml]   start the SBC
-  freesbc check [-c sbc.yaml]   validate a config file and exit
+  freesbc run   [-c freesbc.yaml]   start the SBC
+  freesbc check [-c freesbc.yaml]   validate a config file and exit
 `
 
 // version is the build version, overridable via `-ldflags "-X main.version=…"`.
@@ -42,7 +42,7 @@ func run(args []string) int {
 		return 0
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
-	cfgPath := fs.String("c", "sbc.yaml", "path to config file")
+	cfgPath := fs.String("c", "freesbc.yaml", "path to config file")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -50,8 +50,8 @@ func run(args []string) int {
 		return 2
 	}
 	// A positional argument is almost certainly a config path given
-	// without -c (`freesbc run edge.yaml`). Ignoring it would run
-	// ./sbc.yaml instead — possibly a different, valid config serving the
+	// without -c (`freesbc run other.yaml`). Ignoring it would run
+	// ./freesbc.yaml instead — possibly a different, valid config serving the
 	// wrong plane — so it is a usage error (audit P2-APP-007).
 	if fs.NArg() > 0 {
 		fmt.Fprintf(os.Stderr, "freesbc %s: unexpected argument %q (the config file is given with -c)\n\n%s", cmd, fs.Arg(0), usage)

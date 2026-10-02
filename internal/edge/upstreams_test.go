@@ -116,11 +116,11 @@ func registerUser(t *testing.T, c *client, user, dest string) (*sip.Response, *s
 func TestUpstreamHashPlacement(t *testing.T) {
 	addrA := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	addrB := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h, switches := startHarnessUpstreams(t, "", "", map[string]string{"fs-a": addrA, "fs-b": addrB})
-	fsA, fsB := switches["fs-a"], switches["fs-b"]
+	h, switches := startHarnessSwitches(t, []string{addrA, addrB})
+	fsA, fsB := switches[addrA], switches[addrB]
 	topo := h.srv.topo
 
-	user := userForNode(t, topo, nodeIndex(t, topo, "fs-a"))
+	user := userForNode(t, topo, nodeIndex(t, topo, addrA))
 	phone := newUDPClient(t)
 
 	registerUser(t, phone, user, h.publicUDP)
@@ -146,7 +146,7 @@ func TestUpstreamHashPlacement(t *testing.T) {
 
 	// A second user, hashing to the OTHER node, registers there — the
 	// placement is per user, not "the first node".
-	other := userForNode(t, topo, nodeIndex(t, topo, "fs-b"))
+	other := userForNode(t, topo, nodeIndex(t, topo, addrB))
 	registerUser(t, phone, other, h.publicUDP)
 	if got := len(fsB.waitFor(sip.REGISTER, 2, 3*time.Second)); got != 2 {
 		t.Errorf("fs-b saw %d REGISTERs for %s, want 2", got, other)
@@ -191,17 +191,17 @@ func TestUpstreamHashPlacement(t *testing.T) {
 // The phone registers through the node its hash names (fs-a), so that is
 // where its binding lives. A DIFFERENT node (fs-b) then calls it, exactly
 // as FreeSWITCH would when the call arrives on the switch that owns the
-// trunk. The dialog's record names fs-b, and the phone's own in-dialog
+// number. The dialog's record names fs-b, and the phone's own in-dialog
 // traffic must go back there — the hash would send it to fs-a, which
 // knows nothing about the call and would answer 481.
 func TestUpstreamDialogStickiness(t *testing.T) {
 	addrA := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	addrB := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h, switches := startHarnessUpstreams(t, "", "", map[string]string{"fs-a": addrA, "fs-b": addrB})
-	fsA, fsB := switches["fs-a"], switches["fs-b"]
+	h, switches := startHarnessSwitches(t, []string{addrA, addrB})
+	fsA, fsB := switches[addrA], switches[addrB]
 	topo := h.srv.topo
 
-	user := userForNode(t, topo, nodeIndex(t, topo, "fs-a"))
+	user := userForNode(t, topo, nodeIndex(t, topo, addrA))
 	phone := newUDPClient(t)
 	registerUser(t, phone, user, h.publicUDP)
 
@@ -335,14 +335,12 @@ func phoneUASBye(t *testing.T, c *client, invite *sip.Request, toTag string) *si
 // dial order at fs-b.
 func TestUpstreamRegisterCooldownFailsOver(t *testing.T) {
 	addrB := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h, switches := startHarnessUpstreams(t, "", "30s", map[string]string{
-		"fs-a": "192.0.2.1:5060",
-		"fs-b": addrB,
-	})
-	fsB := switches["fs-b"]
+	const addrA = "10.255.255.1:5060" // dead: the send fails at once
+	h, switches := startHarnessSwitches(t, []string{addrA, addrB})
+	fsB := switches[addrB]
 	topo := h.srv.topo
 	// Sorted pool: fs-a is index 0, the dead node.
-	if topo.upstreamNames[0] != "fs-a" {
+	if topo.upstreamNames[0] != addrA {
 		t.Fatalf("pool %v: fs-a must sort first for this test", topo.upstreamNames)
 	}
 	dead := userForNode(t, topo, 0)
@@ -358,7 +356,7 @@ func TestUpstreamRegisterCooldownFailsOver(t *testing.T) {
 	if got := len(fsB.waitFor(sip.REGISTER, 1, 3*time.Second)); got != 1 {
 		t.Fatalf("fs-b saw %d REGISTERs, want 1", got)
 	}
-	if h.srv.upstreamCooldown.Available("fs-a") {
+	if h.srv.upstreamCooldown.Available(addrA) {
 		t.Error("fs-a is still available after a transport error")
 	}
 
@@ -366,7 +364,7 @@ func TestUpstreamRegisterCooldownFailsOver(t *testing.T) {
 	// out of the hash pool, so it sorts last, and a two-node pool hashes
 	// entirely on the live node.
 	order := h.srv.upstreamOrder(other)
-	if len(order) != 2 || order[0] != "fs-b" || order[1] != "fs-a" {
+	if len(order) != 2 || order[0] != addrB || order[1] != addrA {
 		t.Fatalf("dial order for %s = %v, want [fs-b fs-a] while fs-a cools", other, order)
 	}
 	// And the registration really does land there: the phone is challenged
@@ -386,19 +384,19 @@ func TestUpstreamRegisterCooldownFailsOver(t *testing.T) {
 // answered — so the ACK and BYE that follow stick to it.
 func TestUpstreamInviteFailsOverToLiveNode(t *testing.T) {
 	addrB := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h, switches := startHarnessUpstreams(t, "", "30s", map[string]string{
-		"fs-a": "192.0.2.1:5060",
-		"fs-b": addrB,
-	})
-	fsB := switches["fs-b"]
+	const addrA = "10.255.255.1:5060" // dead: the send fails at once
+	h, switches := startHarnessSwitches(t, []string{addrA, addrB})
+	fsB := switches[addrB]
 	topo := h.srv.topo
-	if topo.upstreamNames[0] != "fs-a" {
+	if topo.upstreamNames[0] != addrA {
 		t.Fatalf("pool %v: fs-a must sort first for this test", topo.upstreamNames)
 	}
 	user := userForNode(t, topo, 0)
 
+	// The harness lists 127.0.0.1 as a carrier source, so this call takes
+	// the carrier path, which hashes the Request-URI user (the DID).
 	phone := newUDPClient(t)
-	invite := phone.buildInvite(user, "2002", "example.com", phoneOfferSDP(freePort(t)))
+	invite := phone.buildInvite("2002", user, "example.com", phoneOfferSDP(freePort(t)))
 	res := phone.do(t, invite, h.publicUDP)
 	if res.StatusCode != 200 {
 		t.Fatalf("INVITE via failover: got %d, want 200 from fs-b", res.StatusCode)
@@ -406,7 +404,7 @@ func TestUpstreamInviteFailsOverToLiveNode(t *testing.T) {
 	if got := len(fsB.waitFor(sip.INVITE, 1, 3*time.Second)); got != 1 {
 		t.Fatalf("fs-b saw %d INVITEs, want 1", got)
 	}
-	if h.srv.upstreamCooldown.Available("fs-a") {
+	if h.srv.upstreamCooldown.Available(addrA) {
 		t.Error("fs-a is still available after a transport error")
 	}
 

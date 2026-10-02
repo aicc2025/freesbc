@@ -14,7 +14,6 @@ package edge
 import (
 	"bytes"
 	"fmt"
-	"net"
 	"net/netip"
 	"strings"
 	"testing"
@@ -36,32 +35,6 @@ func warmPrivateSource(t *testing.T, h *harness) {
 }
 
 // audit: P2-EDG-003
-// An INVITE whose Request-URI names sip.pstn.match, sent to a PUBLIC
-// listener from the very socket FreeSWITCH uses on the private bind, is an
-// ordinary public INVITE. It must never dial a carrier gateway: only a
-// datagram that reached the dedicated PSTN listener is a PSTN bridge.
-// Before the fix the source address alone (an upstream IP, plus the cached
-// private source) made it one — toll fraud through a spoofed source.
-func TestAuditPSTNMatchOnPublicListenerNeverDialsGateway(t *testing.T) {
-	h, carrier := startHarnessPSTN(t)
-	warmPrivateSource(t, h)
-	if got := carrier.received(sip.INVITE); len(got) != 0 {
-		t.Fatalf("the carrier saw %d INVITEs before the test's INVITE", len(got))
-	}
-
-	// The public listener, the Request-URI naming the configured match.
-	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.pstnMatch)}
-	_, final := h.fs.callAsync(t, ruri, h.publicUDP, phoneOfferSDP(h.fs.rtpPort))
-	select {
-	case <-final:
-	case <-time.After(3 * time.Second):
-	}
-	if got := carrier.waitFor(sip.INVITE, 1, 500*time.Millisecond); len(got) != 0 {
-		t.Errorf("P2-EDG-003 confirmed: an INVITE naming the PSTN match that reached a public listener dialed a carrier gateway (%d INVITEs)", len(got))
-	}
-}
-
-// audit: P2-EDG-003
 // After a socket has sent to the private bind, the same socket (same source
 // address and port) sending to a PUBLIC listener is still a public client:
 // its REGISTER is forwarded to the registrar like any phone's — not refused
@@ -70,16 +43,16 @@ func TestAuditPSTNMatchOnPublicListenerNeverDialsGateway(t *testing.T) {
 // public listener is banned even though the same socket has been seen on
 // the private bind.
 func TestAuditPrivateSourceOnPublicListenerIsPublic(t *testing.T) {
-	h := startHarness(t, false)
+	h := startHarnessStrict(t, false, false)
 	conn := auditUDP(t)
 	port := auditUDPPort(conn)
 
 	// Warm: this socket talks to the private bind (its source IP is the
 	// upstream's, which is all the trusted socket checks).
-	auditRawRequest(t, conn, h.privateSIP, fmt.Sprintf("OPTIONS sip:proxy@127.0.0.1 SIP/2.0\r\n"+
+	auditRawRequest(t, conn, h.privateSIP, fmt.Sprintf("OPTIONS sip:proxy@%s SIP/2.0\r\n"+
 		"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=z9hG4bK-arr-warm;rport\r\n"+
-		"Max-Forwards: 70\r\nFrom: <sip:fs@127.0.0.1>;tag=warm\r\nTo: <sip:proxy@127.0.0.1>\r\n"+
-		"Call-ID: arr-warm\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n", port))
+		"Max-Forwards: 70\r\nFrom: <sip:fs@127.0.0.1>;tag=warm\r\nTo: <sip:proxy@%s>\r\n"+
+		"Call-ID: arr-warm\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n", h.privateSIP, port, h.privateSIP))
 	if !auditRecvUntil(conn, 2*time.Second, func(b []byte) bool { return bytes.HasPrefix(b, []byte("SIP/2.0 200")) }) {
 		t.Fatal("the private bind never answered the warming OPTIONS")
 	}
@@ -120,49 +93,5 @@ func TestAuditPrivateSourceOnPublicListenerIsPublic(t *testing.T) {
 	}
 	if !h.srv.shield.BannedFrom(self, "udp") {
 		t.Error("P2-EDG-003 confirmed: a scanner datagram from a source seen on the private bind was exempt from the shield on a public listener")
-	}
-}
-
-// audit: P2-EDG-021
-// FreeSWITCH's PSTN INVITE is shield-exempt because of the socket it
-// reaches, with NO warm-up and no cache: here the fake FreeSWITCH's socket
-// has never sent anything to the private bind, and the shield has banned it
-// (a scanner datagram it sent to a public listener), and the PSTN INVITE
-// must still be dialed. Before the fix the exemption depended on a
-// 10-minute cache filled only by private-bind reads, so a cold cache (a
-// restart, a quiet spell) shield-dropped the first PSTN INVITE.
-func TestAuditPSTNInviteIsShieldExemptWithColdCache(t *testing.T) {
-	h, carrier := startHarnessPSTN(t)
-
-	// Ban FreeSWITCH's own socket: a scanner-UA datagram to a public
-	// listener bans the exact source socket.
-	self := netip.MustParseAddrPort(h.upstream)
-	dst, err := net.ResolveUDPAddr("udp", h.publicUDP)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scan := fmt.Sprintf("OPTIONS sip:x@127.0.0.1 SIP/2.0\r\n"+
-		"Via: SIP/2.0/UDP %s;branch=z9hG4bK-cold-scan;rport\r\n"+
-		"Max-Forwards: 70\r\nFrom: <sip:s@127.0.0.1>;tag=scan\r\nTo: <sip:x@127.0.0.1>\r\n"+
-		"Call-ID: cold-scan\r\nCSeq: 1 OPTIONS\r\nUser-Agent: friendly-scanner\r\nContent-Length: 0\r\n\r\n", h.upstream)
-	if _, err := h.fs.conn.WriteToUDP([]byte(scan), dst); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for !h.srv.shield.BannedFrom(self, "udp") && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !h.srv.shield.BannedFrom(self, "udp") {
-		t.Fatal("the fake FreeSWITCH socket was never banned")
-	}
-
-	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.pstnMatch)}
-	_, final := h.fs.callAsync(t, ruri, h.pstnMatch, phoneOfferSDP(h.fs.rtpPort))
-	select {
-	case <-final:
-	case <-time.After(5 * time.Second):
-	}
-	if got := carrier.waitFor(sip.INVITE, 1, time.Second); len(got) != 1 {
-		t.Errorf("P2-EDG-021 confirmed: the PSTN INVITE from FreeSWITCH was shield-checked with a cold source cache: the carrier saw %d INVITEs, want 1", len(got))
 	}
 }

@@ -153,7 +153,7 @@ func TestAuditMED003SeedReflectsToLocalService(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := newAuditPool("audit", 24180, 24199, "127.0.0.1")
-			s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchStrict}, Timeout: 5 * time.Second})
+			s, err := AllocateAcross(pool.PlanePool, pool.PlanePool, SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchStrict}, Timeout: 5 * time.Second})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -192,7 +192,7 @@ func TestAuditMED003SeedReflectsToLocalService(t *testing.T) {
 func TestAuditMED004OneWaySilenceNeverReclaimed(t *testing.T) {
 	pool := newAuditPool("audit", 24200, 24219, "127.0.0.1")
 	const timeout = 200 * time.Millisecond
-	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchLoose}, Timeout: timeout})
+	s, err := AllocateAcross(pool.PlanePool, pool.PlanePool, SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchLoose}, Timeout: timeout})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestAuditMED006LooseLatchFirstPacketHijack(t *testing.T) {
 	// loopback, and without that FreeSWITCH, which never sends first here,
 	// would have no destination and could hear nobody at all.
 	pool.loopback.Store(true)
-	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchStrict}, Timeout: 5 * time.Second})
+	s, err := AllocateAcross(pool.PlanePool, pool.PlanePool, SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchStrict}, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,16 +322,16 @@ func TestAuditMED011StatsInUseExceedsTotalAfterShrink(t *testing.T) {
 // so each packet allocates. The relay is otherwise allocation-free per
 // packet; this reports the per-packet cost.
 func TestAuditMED007SRTPAllocsPerPacket(t *testing.T) {
-	key := NewSDESKey()
-	send, err := NewSRTPContext(SuiteAES128CM80, key)
+	key := newTestKey()
+	send, err := newTestCtx(key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	recv, err := NewSRTPContext(SuiteAES128CM80, key)
+	recv, err := newTestCtx(key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gen, err := NewSRTPContext(SuiteAES128CM80, key)
+	gen, err := newTestCtx(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,13 +373,13 @@ func TestAuditMED007SRTPAllocsPerPacket(t *testing.T) {
 // unprotectRTP under the same key. On an RTP→SRTP interworking call the
 // relay (relay.go:80-89) forwards such packets as undecryptable SRTP.
 func TestAuditMED_P3_001SRTPRoundTripEmptyHeaderExtension(t *testing.T) {
-	key := NewSDESKey()
+	key := newTestKey()
 	// V=2, X=1, then the minimised fuzz input: extension profile 0xC2DE
 	// (neither RFC 8285 one-byte nor two-byte), length 0, 1-byte payload.
 	pkt := []byte("\x9000000000000\xc2\xde\x00\x000")[:17]
 	pkt[0] = 0x90
-	send, _ := NewSRTPContext(SuiteAES128CM80, key)
-	recv, _ := NewSRTPContext(SuiteAES128CM80, key)
+	send, _ := newTestCtx(key)
+	recv, _ := newTestCtx(key)
 	prot, ok := send.protectRTP(append([]byte(nil), pkt...))
 	if !ok {
 		t.Skip("protectRTP rejected the packet; nothing is forwarded")

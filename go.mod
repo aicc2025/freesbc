@@ -6,7 +6,6 @@ require (
 	github.com/emiago/sipgo v1.4.3
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/goccy/go-yaml v1.19.2
-	github.com/icholy/digest v1.1.0
 	github.com/pion/dtls/v3 v3.1.8
 	github.com/pion/ice/v4 v4.4.1
 	github.com/pion/logging v0.2.4
@@ -27,6 +26,7 @@ require (
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gobwas/ws v1.3.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/icholy/digest v1.1.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pion/mdns/v2 v2.1.0 // indirect

@@ -3,8 +3,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"sort"
-	"strings"
 
 	"github.com/goccy/go-yaml"
 )
@@ -19,8 +17,7 @@ func Load(path string) (*Config, error) {
 }
 
 // Parse strictly unmarshals the raw YAML (unknown keys are errors, reported
-// with line numbers against the user's own file), rejects null map/list
-// entries, then expands ${ENV_VAR} references in the decoded string fields,
+// with line numbers against the user's own file), then expands ${ENV_VAR} references in the decoded string fields,
 // applies defaults, and validates.
 //
 // Expansion runs after unmarshalling — not on the raw bytes — so that: (a)
@@ -37,9 +34,6 @@ func Load(path string) (*Config, error) {
 func Parse(data []byte) (*Config, error) {
 	var c Config
 	if err := unmarshalStrict(data, &c); err != nil {
-		return nil, err
-	}
-	if err := rejectNullEntries(&c); err != nil {
 		return nil, err
 	}
 	if err := expandEnv(&c); err != nil {
@@ -65,55 +59,6 @@ func unmarshalStrict(data []byte, c *Config) (err error) {
 	}()
 	if uerr := yaml.UnmarshalWithOptions(data, c, yaml.Strict()); uerr != nil {
 		return fmt.Errorf("parse config:\n%s", yaml.FormatError(uerr, false, true))
-	}
-	return nil
-}
-
-// rejectNullEntries fails on map values and list items that decoded to nil
-// (an empty `name:` block or a `- ~` item). The rest of the lifecycle
-// (withDefaults, validate) dereferences these entries, and a null entry is
-// always an operator mistake: there is no meaningful "empty peer".
-func rejectNullEntries(c *Config) error {
-	var errs []string
-	nullKeys := func(section string, keys []string) {
-		sort.Strings(keys)
-		for _, k := range keys {
-			errs = append(errs, fmt.Sprintf("%s.%s: empty entry (null); give it its settings or remove it", section, k))
-		}
-	}
-	var peers []string
-	for name, p := range c.Peers {
-		if p == nil {
-			peers = append(peers, name)
-		}
-	}
-	nullKeys("peers", peers)
-	for i, r := range c.Routes {
-		if r == nil {
-			errs = append(errs, fmt.Sprintf("routes[%d]: empty entry (null)", i))
-		}
-	}
-	var nodes []string
-	for name, n := range c.SIP.Upstreams.Nodes {
-		if n == nil {
-			nodes = append(nodes, name)
-		}
-	}
-	nullKeys("sip.upstreams.nodes", nodes)
-	var gws []string
-	for name, g := range c.SIP.Pstn.Gateways {
-		if g == nil {
-			gws = append(gws, name)
-		}
-	}
-	nullKeys("sip.pstn.gateways", gws)
-	for i, r := range c.SIP.Pstn.Routes {
-		if r == nil {
-			errs = append(errs, fmt.Sprintf("sip.pstn.routes[%d]: empty entry (null)", i))
-		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("invalid config:\n%s", strings.Join(errs, "\n"))
 	}
 	return nil
 }

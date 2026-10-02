@@ -45,12 +45,12 @@ func TestAPICallsEmptyIsEmptyArray(t *testing.T) {
 }
 
 func TestAPIConfigRedactsSecrets(t *testing.T) {
-	// a config with a peer password and admin hash; assert redaction.
-	s := testServerWithSecretConfig(t, "s3cr3t-carrier-pw")
+	// a config with an admin hash; assert redaction.
+	s := testServerWithSecretConfig(t, "s3cr3t-admin-hash")
 	body := authGET(t, s, "/api/config")
 	str := string(body)
-	if strings.Contains(str, "s3cr3t-carrier-pw") {
-		t.Fatal("peer password LEAKED in /api/config")
+	if strings.Contains(str, "s3cr3t-admin-hash") {
+		t.Fatal("admin password hash LEAKED in /api/config")
 	}
 	if !strings.Contains(str, "***") {
 		t.Fatal("redaction marker missing")

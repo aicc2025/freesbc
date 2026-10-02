@@ -1,7 +1,4 @@
 # Long-running checks, nightly and on demand:
-#   soak    - places calls through the trunk plane for a fixed duration
-#             under -race and fails on goroutine, heap or fd growth
-#             (internal/trunk/soak_test.go, gated by FREESBC_SOAK).
 #   repeat  - the whole suite N times under -race, to surface flaky or
 #             order-dependent tests and slow leaks the single run misses.
 #   fuzz    - each native Go fuzz target for a fixed time; a crashing
@@ -13,9 +10,6 @@ on:
     - cron: "17 19 * * *" # daily, 19:17 UTC
   workflow_dispatch:
     inputs:
-      soak_duration:
-        description: Trunk soak duration (Go duration)
-        default: 30m
       repeat_count:
         description: go test -count for the repeat job
         default: "3"
@@ -31,20 +25,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  soak:
-    name: trunk soak (-race)
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      FREESBC_SOAK: ${{ inputs.soak_duration || '30m' }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: soak
-        run: go test -race -run '^TestSoakTrunkCalls$' -count=1 -v -timeout 110m ./internal/trunk 2>&1 | grep -v 'UDP ref went negative on try close'; exit "${PIPESTATUS[0]}"
-
   repeat:
     name: go test -race -count=N
     runs-on: ubuntu-latest
@@ -77,10 +57,6 @@ jobs:
           - { pkg: ./internal/sip, target: FuzzAuditSIPMessageHelpers }
           - { pkg: ./internal/sip/sdp, target: FuzzAuditParseBuild }
           - { pkg: ./internal/sip/sdp, target: FuzzAuditBuildNoSentinelLeak }
-          - { pkg: ./internal/trunk, target: FuzzAuditChallengeRealm }
-          - { pkg: ./internal/trunk, target: FuzzAuditSIPHeaderHelpers }
-          - { pkg: ./internal/trunk, target: FuzzAuditParseCryptoAttrs }
-          - { pkg: ./internal/trunk, target: FuzzAuditTrunkSDP }
     env:
       FUZZTIME: ${{ inputs.fuzz_time || '5m' }}
     steps:

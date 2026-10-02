@@ -3,12 +3,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -17,11 +17,12 @@ import (
 // every problem in the file is reported in one pass.
 type failFunc func(format string, args ...any)
 
-// validate checks cross-references and value constraints, collecting every
-// problem instead of stopping at the first. On success it also compiles
-// derived state (peer allowed-IP prefixes, route match regexes). It is
-// unexported: Parse is the only supported entry point into the lifecycle
-// described on Config.
+// validate checks value constraints and cross-references, collecting every
+// problem instead of stopping at the first, and compiles derived state
+// (switch nodes, carrier list, carrier source prefixes). It does no
+// locality checks (whether an address is assigned to this host is `run`'s
+// business) and opens no files. It is unexported: Parse is the only
+// supported entry point into the lifecycle described on Config.
 func (c *Config) validate() error {
 	var errs []string
 	// Messages may name a value, and validation runs after ${VAR}
@@ -32,16 +33,13 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Sprintf(format, c.envRedact.args(args)...))
 	}
 
-	c.validateTrunkListen(fail)
-	c.validateTrunkNAT(fail)
-	c.validateTrunkMediaRange(fail)
-	c.validateTimers(fail)
-	c.validatePeers(fail)
-	c.validateRoutes(fail)
+	c.validateTopology(fail)
+	c.validateRTP(fail)
+	c.validateTLS(fail)
+	c.validateEdge(fail)
+	c.validateCarriers(fail)
 	c.validateShield(fail)
 	c.validateAdmin(fail)
-	c.validateTLSPairs(fail)
-	c.validateProxy(fail)
 	c.validateSockets(fail)
 
 	if len(errs) > 0 {
@@ -50,202 +48,355 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// validateTrunkListen checks listen.sip/listen.media.
-func (c *Config) validateTrunkListen(fail failFunc) {
-	// The trunk B2BUA plane needs a listener and at least one peer — but a
-	// proxy-only deployment (edge proxy on, no trunks) legitimately has
-	// neither. Both requirements are therefore conditional on the proxy
-	// plane being off; validateProxy enforces the proxy plane's own
-	// listener requirement.
-	if len(c.Listen.SIP) == 0 && c.SIP.BindIP == "" && !c.ProxyEnabled() {
-		fail("listen.sip or sip.bind_ip: at least one SIP listener required")
+// specificIP parses an address that must be a specific unicast-style
+// literal: set, valid, not 0.0.0.0 / ::.
+func specificIP(fail failFunc, label, value string) (netip.Addr, bool) {
+	if value == "" {
+		fail("%s: required", label)
+		return netip.Addr{}, false
 	}
-	if pr := c.Listen.Media.PortRange; pr != (PortRange{}) && pr.Min < 1024 {
-		fail("listen.media.port_range: must start at or above 1024, got %d-%d", pr.Min, pr.Max)
+	ip, err := netip.ParseAddr(value)
+	if err != nil {
+		fail("%s: %q is not a valid IP", label, value)
+		return netip.Addr{}, false
 	}
-	if pub := c.Listen.Media.PublicIP; pub != "auto" {
-		if _, err := netip.ParseAddr(pub); err != nil {
-			fail("listen.media.public_ip: %q is neither \"auto\" nor a valid IP", pub)
-		}
+	if ip.IsUnspecified() {
+		fail("%s: %q is unspecified; a specific local address is required (no wildcard binds)", label, value)
+		return netip.Addr{}, false
 	}
-	if c.Listen.Media.RTPTimeout.Std() <= 0 {
-		fail("listen.media.rtp_timeout: must be > 0, got %v", c.Listen.Media.RTPTimeout.Std())
+	return ip.Unmap(), true
+}
+
+// validateTopology checks public and private.
+func (c *Config) validateTopology(fail failFunc) {
+	specificIP(fail, "public.ip", c.Public.IP)
+	bind, bindOK := specificIP(fail, "public.bind", c.Public.Bind)
+	priv, privOK := specificIP(fail, "private.ip", c.Private.IP)
+	if bindOK && privOK && bind == priv {
+		fail("private.ip: %q must differ from public.bind; the two sides need separate sockets", c.Private.IP)
 	}
 }
 
-// validateTrunkNAT checks the sip/rtp bind-advertised topology (NAT/VPN).
-func (c *Config) validateTrunkNAT(fail failFunc) {
-	// Any configured sip.* field requires the full bind pair, and the
-	// section is mutually exclusive with the legacy listen.sip list — two
-	// listener sources would be ambiguous.
-	sipSet := c.SIP.BindIP != "" || c.SIP.BindPort != 0 ||
-		c.SIP.AdvertisedIP != "" || c.SIP.AdvertisedPort != 0
-	if sipSet && c.SIP.BindIP == "" {
-		fail("sip.bind_ip: required when any sip.* field is configured")
-	}
-	if sipSet && c.SIP.BindPort == 0 {
-		fail("sip.bind_port: required when any sip.* field is configured")
-	}
-	if c.SIP.BindIP != "" {
-		checkIP(fail, "sip.bind_ip", c.SIP.BindIP)
-		if len(c.Listen.SIP) > 0 {
-			fail("sip.bind_ip and listen.sip are mutually exclusive: the sip section replaces the listen.sip listener list — configure one or the other")
-		}
-	}
-	checkPort(fail, "sip.bind_port", c.SIP.BindPort)
-	switch c.SIP.Transport {
-	case "udp", "tcp", "tls":
-	default:
-		fail("sip.transport: must be udp, tcp, or tls, got %q", c.SIP.Transport)
-	}
-	checkAdvertisedIP(fail, "sip.advertised_ip", c.SIP.AdvertisedIP, "advertising it in Contact/From would be unroutable")
-	checkPort(fail, "sip.advertised_port", c.SIP.AdvertisedPort)
-	checkIP(fail, "rtp.bind_ip", c.RTP.BindIP)
-	checkAdvertisedIP(fail, "rtp.advertised_ip", c.RTP.AdvertisedIP, "advertising it in SDP would blackhole media")
-	// Blackhole guard for the NAT/VPN topology: with sip.bind_ip configured
-	// there are no listen.sip hosts for the SDP media IP to fall back on
-	// (see Server.mediaIP), so without an explicit rtp.advertised_ip — and
-	// with public_ip left "auto", since STUN discovery isn't implemented —
-	// every SDP would advertise 127.0.0.1.
-	if c.SIP.BindIP != "" && c.RTP.AdvertisedIP == "" && c.Listen.Media.PublicIP == "auto" {
-		fail("rtp.advertised_ip: required when sip.bind_ip is configured and listen.media.public_ip is \"auto\" — otherwise SDP media would advertise 127.0.0.1")
-	}
-}
-
-// trunkPairsPerCall is how many RTP/RTCP port pairs one trunk call binds:
-// PlanePool.Allocate anchors both legs on the SBC, one pair per leg.
-const trunkPairsPerCall = 2
-
-// validateTrunkMediaRange checks rtp.port_min/port_max against the legacy
-// listen.media.port_range, and that the effective trunk range holds a call.
-func (c *Config) validateTrunkMediaRange(fail failFunc) {
-	// rtp.port_min/port_max: both-or-neither, and mutually exclusive with
-	// the legacy listen.media.port_range — two range sources would be
-	// ambiguous. Bounds mirror the legacy range (>= 1024 keeps the pool
-	// unprivileged; <= 65535 is the UDP port ceiling).
-	rtpRangeSet := c.RTP.PortMin != 0 || c.RTP.PortMax != 0
-	if rtpRangeSet && (c.RTP.PortMin == 0 || c.RTP.PortMax == 0) {
-		fail("rtp.port_min and rtp.port_max must be set together")
-	}
-	if c.RTP.PortMin != 0 {
-		if c.Listen.Media.PortRange != (PortRange{}) {
-			fail("rtp.port_min/port_max and listen.media.port_range are mutually exclusive: the rtp section replaces the legacy range — configure one or the other")
-		}
-		// A degenerate (min == max) range can never hold an RTP+RTCP pair —
-		// checkPortRange rejects it up front rather than let every call fail
-		// with "exhausted".
-		checkPortRange(fail, "rtp", "rtp.port_min/port_max", "call", c.RTP.PortMin, c.RTP.PortMax)
-	}
-	// Only the trunk plane allocates from this range, and a trunk call
-	// needs two pairs: a range that validates must hold at least one call,
-	// or every INVITE would be answered 503 (audit P2-CFG-009).
-	if len(c.Peers) == 0 {
+// validateRTP checks the RTP range. PortRange already guarantees 0 < min <
+// max; the pool needs an unprivileged range that holds a pair.
+func (c *Config) validateRTP(fail failFunc) {
+	r := c.RTP
+	if r.Min < 1024 {
+		fail("rtp: must start at or above 1024, got %d-%d", r.Min, r.Max)
 		return
 	}
-	tr := c.RTPPortRange()
-	if tr == (PortRange{}) || tr.Min >= tr.Max {
-		return // no range, or already reported as inverted
+	if rtpPairs(int(r.Min), int(r.Max)) < 1 {
+		fail("rtp: %d-%d holds no RTP/RTCP pair (RTP on an even port, RTCP on RTP+1) — widen it", r.Min, r.Max)
 	}
-	if n := rtpPairs(int(tr.Min), int(tr.Max)); n < trunkPairsPerCall {
-		label := "listen.media.port_range"
-		if c.RTP.PortMin != 0 {
-			label = "rtp.port_min/port_max"
+}
+
+// validateTLS checks the top-level tls pair and who requires it.
+func (c *Config) validateTLS(fail failFunc) {
+	if c.TLS != nil {
+		if c.TLS.Cert == "" || c.TLS.Key == "" {
+			fail("tls: cert and key must both be set")
 		}
-		fail("%s: %d-%d holds %d RTP/RTCP pair(s) (RTP on even ports), but a trunk call needs %d — widen it to at least 4 ports starting on an even port",
-			label, tr.Min, tr.Max, n, trunkPairsPerCall)
+		return
+	}
+	if c.Edge.Listen.WSS != 0 {
+		fail("tls: required by edge.listen.wss (browsers refuse an untrusted WSS certificate)")
+	}
+	if c.Admin != nil && c.Admin.AllowRemote {
+		fail("tls: required by admin.allow_remote (the admin API must not serve Basic credentials in the clear)")
 	}
 }
 
-// validateTimers checks the global durations and the global call quota.
-func (c *Config) validateTimers(fail failFunc) {
-	if c.RingTimeout.Std() <= 0 {
-		fail("ring_timeout: must be > 0, got %v", c.RingTimeout.Std())
+// validateEdge checks edge.switch, switch_carrier_port, listen and
+// carrier_sources.
+func (c *Config) validateEdge(fail failFunc) {
+	e := &c.Edge
+	priv := c.PrivateAddr()
+	e.switches = nil
+	if len(e.Switch) == 0 {
+		fail("edge.switch: at least one switch node (literal IP:port) required")
 	}
-	if c.RegisterExpires.Std() < time.Second {
-		fail("register_expires: must be at least 1s, got %v", c.RegisterExpires.Std())
+	seen := map[netip.AddrPort]bool{}
+	for i, s := range e.Switch {
+		label := fmt.Sprintf("edge.switch[%d]", i)
+		ap, ok := parseIPPort(fail, label, s)
+		if !ok {
+			continue
+		}
+		if seen[ap] {
+			fail("%s: %q is listed twice", label, s)
+			continue
+		}
+		seen[ap] = true
+		if c.Private.IP != "" && ap == priv {
+			fail("%s: %q is FreeSBC's own private socket", label, s)
+			continue
+		}
+		e.switches = append(e.switches, ap)
 	}
-	if c.MinSE.Std() < time.Second {
-		fail("min_se: must be at least 1s, got %v", c.MinSE.Std())
+	if p := e.SwitchCarrierPort; p < 0 || p > 65535 {
+		fail("edge.switch_carrier_port: must be 1-65535 (0 = the node's switch port), got %d", p)
 	}
-	if c.SessionExpires.Std() < c.MinSE.Std() {
-		fail("session_expires: must be >= min_se (%v), got %v", c.MinSE.Std(), c.SessionExpires.Std())
-	}
-	if c.PeerCooldown.Std() <= 0 {
-		fail("peer_cooldown: must be > 0, got %v", c.PeerCooldown.Std())
-	}
-	if c.SRVCacheTTL.Std() < time.Second {
-		fail("srv_cache_ttl: must be at least 1s, got %v", c.SRVCacheTTL.Std())
-	}
-	if c.MaxConcurrentCalls < 0 {
-		fail("max_concurrent_calls: must be >= 0 (0 = unlimited), got %d", c.MaxConcurrentCalls)
-	}
-}
 
-// validatePeers checks every peer, in name order, and compiles allowed_ips.
-func (c *Config) validatePeers(fail failFunc) {
-	if len(c.Peers) == 0 && !c.ProxyEnabled() {
-		fail("peers: at least one peer required")
+	l := e.Listen
+	if l.UDP == 0 && l.WS == 0 && l.WSS == 0 {
+		fail("edge.listen: at least one of udp, ws, wss required")
 	}
-	peerNames := make([]string, 0, len(c.Peers))
-	for name := range c.Peers {
-		peerNames = append(peerNames, name)
+	checkPort(fail, "edge.listen.udp", l.UDP)
+	checkPort(fail, "edge.listen.ws", l.WS)
+	checkPort(fail, "edge.listen.wss", l.WSS)
+	if l.WS != 0 && l.WS == l.WSS {
+		fail("edge.listen.wss: port %d already used by edge.listen.ws", l.WSS)
 	}
-	sort.Strings(peerNames)
-	for _, name := range peerNames {
-		validatePeer(fail, name, c.Peers[name])
-	}
-}
 
-func validatePeer(fail failFunc, name string, p *Peer) {
-	if p.Address == "" {
-		fail("peers.%s: address required", name)
-	}
-	switch p.Transport {
-	case "udp", "tcp", "tls":
-	default:
-		fail("peers.%s: transport must be udp, tcp, or tls, got %q", name, p.Transport)
-	}
-	switch p.MediaLatch {
-	case "strict", "loose":
-	default:
-		fail("peers.%s: media_latch must be strict or loose, got %q", name, p.MediaLatch)
-	}
-	switch p.SRTP {
-	case "disabled", "optional", "required":
-	default:
-		fail("peers.%s: srtp must be disabled, optional, or required, got %q", name, p.SRTP)
-	}
-	// Sub-second is rejected (not just <= 0): registerOnce's Expires
-	// header is uint32(expires.Seconds()), which truncates e.g. 500ms to
-	// 0 — silently turning a "register" into an un-register that then
-	// leaves the peer falsely marked registered.
-	if p.RegisterExpires != 0 && p.RegisterExpires.Std() < time.Second {
-		fail("peers.%s: register_expires must be at least 1s when set, got %v", name, p.RegisterExpires.Std())
-	}
-	if p.Register && p.Auth == nil {
-		fail("peers.%s: register: true requires auth credentials", name)
-	}
-	if p.MaxConcurrentCalls < 0 {
-		fail("peers.%s: max_concurrent_calls: must be >= 0 (0 = unlimited), got %d", name, p.MaxConcurrentCalls)
-	}
-	p.allowedNets = nil
-	if len(p.AllowedIPs) == 0 {
-		// An empty list silently failed closed before —
-		// the peer could never be identified and the operator got no
-		// signal. That's a config mistake, not a posture: refuse it.
-		fail("peers.%s: allowed_ips: at least one prefix required", name)
-	}
-	for _, s := range p.AllowedIPs {
-		if pfx, ok := allowedPrefix(fail, "peers."+name+": allowed_ips", s); ok {
-			p.allowedNets = append(p.allowedNets, pfx)
+	e.carrierNets = nil
+	for _, s := range e.CarrierSources {
+		if pfx, ok := allowedPrefix(fail, "edge.carrier_sources", s); ok {
+			e.carrierNets = append(e.carrierNets, pfx)
 		}
 	}
 }
 
-// allowedPrefix parses and checks one source-prefix entry — a trunk peer's
-// allowed_ips or the edge's sip.public.carrier_sources — returning the
+// dnsLabel is one DNS label: letters, digits and interior hyphens.
+var dnsLabel = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+
+// carrierName is the allowed shape of an edge.carriers key: it ends up in
+// logs, metrics labels and a SIP header value.
+var carrierName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// ParseCarrierHost splits an edge.carriers value "host[:port]" (port
+// default 5060; IPv6 literals with a port need brackets) into its parts.
+// host is a literal IP or a DNS name; the returned host is lower-cased
+// without a trailing dot. It exists so the edge applies the same grammar
+// the validator did.
+func ParseCarrierHost(s string) (host string, port int, addr netip.Addr, err error) {
+	port = DefaultCarrierPort
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", 0, netip.Addr{}, errors.New("empty")
+	}
+	if a, perr := netip.ParseAddr(s); perr == nil { // bare IP, incl. IPv6
+		return finishCarrierHost(a.Unmap().String(), port)
+	}
+	h := s
+	if strings.HasPrefix(s, "[") || strings.Count(s, ":") == 1 {
+		hh, ps, serr := net.SplitHostPort(s)
+		if serr != nil {
+			return "", 0, netip.Addr{}, fmt.Errorf("%q is not host[:port]", s)
+		}
+		p, perr := strconv.Atoi(ps)
+		if perr != nil || p < 1 || p > 65535 {
+			return "", 0, netip.Addr{}, fmt.Errorf("bad port in %q", s)
+		}
+		h, port = hh, p
+	} else if strings.Contains(s, ":") {
+		return "", 0, netip.Addr{}, fmt.Errorf("%q is not host[:port] (bracket an IPv6 literal that has a port)", s)
+	}
+	return finishCarrierHost(h, port)
+}
+
+// carrierHasPort reports whether a (valid) edge.carriers value wrote a
+// port: a bare IP never does, anything bracketed or with exactly one colon
+// does.
+func carrierHasPort(s string) bool {
+	s = strings.TrimSpace(s)
+	if _, err := netip.ParseAddr(s); err == nil {
+		return false
+	}
+	return strings.HasPrefix(s, "[") || strings.Count(s, ":") == 1
+}
+
+func finishCarrierHost(h string, port int) (string, int, netip.Addr, error) {
+	if a, err := netip.ParseAddr(h); err == nil {
+		a = a.Unmap()
+		if a.IsUnspecified() {
+			return "", 0, netip.Addr{}, fmt.Errorf("%q is an unspecified address", h)
+		}
+		return a.String(), port, a, nil
+	}
+	h = strings.ToLower(strings.TrimSuffix(h, "."))
+	if h == "" || len(h) > 253 {
+		return "", 0, netip.Addr{}, fmt.Errorf("%q is not a valid host name", h)
+	}
+	for _, lab := range strings.Split(h, ".") {
+		if !dnsLabel.MatchString(lab) {
+			return "", 0, netip.Addr{}, fmt.Errorf("%q is not a valid host name", h)
+		}
+	}
+	return h, port, netip.Addr{}, nil
+}
+
+// validateCarriers checks edge.carriers and compiles the carrier list.
+func (c *Config) validateCarriers(fail failFunc) {
+	e := &c.Edge
+	e.carriers = nil
+	if len(e.Carriers) == 0 {
+		return
+	}
+	if e.Listen.UDP == 0 {
+		fail("edge.carriers: requires edge.listen.udp (carrier traffic is SIP over UDP on the public side)")
+	}
+	own := netip.AddrPort{}
+	if e.Listen.UDP != 0 {
+		own = netip.AddrPortFrom(c.PublicBind(), uint16(e.Listen.UDP))
+	}
+	pubAdv := netip.AddrPort{}
+	if e.Listen.UDP != 0 {
+		pubAdv = netip.AddrPortFrom(c.PublicIP(), uint16(e.Listen.UDP))
+	}
+	taken := map[string]string{}
+	for _, name := range sortedKeys(e.Carriers) {
+		label := "edge.carriers." + name
+		if !carrierName.MatchString(name) {
+			fail("edge.carriers: name %q must match [A-Za-z0-9._-]+", name)
+			continue
+		}
+		host, port, addr, err := ParseCarrierHost(e.Carriers[name])
+		if err != nil {
+			fail("%s: %v", label, c.envRedact.detail(e.Carriers[name], err))
+			continue
+		}
+		key := net.JoinHostPort(host, strconv.Itoa(port))
+		if prev, dup := taken[key]; dup {
+			fail("%s: %s is already used by edge.carriers.%s", label, key, prev)
+			continue
+		}
+		taken[key] = name
+		if addr.IsValid() {
+			ap := netip.AddrPortFrom(addr, uint16(port))
+			if ap == own || ap == pubAdv {
+				fail("%s: %s is FreeSBC's own public UDP socket", label, key)
+				continue
+			}
+			for _, sw := range e.switches {
+				if sw == ap {
+					fail("%s: %s is an edge.switch node, not a carrier", label, key)
+					break
+				}
+			}
+		}
+		e.carriers = append(e.carriers, Carrier{Name: name, Host: host, Port: port, Addr: addr,
+			ExplicitPort: carrierHasPort(e.Carriers[name])})
+	}
+}
+
+// validateShield checks the shield section.
+func (c *Config) validateShield(fail failFunc) {
+	if _, err := ParseRateLimit(c.Shield.RateLimit); err != nil {
+		fail("shield.rate_limit: %v", c.envRedact.detail(c.Shield.RateLimit, err))
+	}
+	if _, err := ParseRateLimit(c.Shield.CarrierRateLimit); err != nil {
+		fail("shield.carrier_rate_limit: %v", c.envRedact.detail(c.Shield.CarrierRateLimit, err))
+	}
+	if c.Shield.Ban <= 0 {
+		fail("shield.ban: must be > 0, got %s", c.Shield.Ban.Std())
+	}
+}
+
+// validateAdmin checks the optional admin section.
+func (c *Config) validateAdmin(fail failFunc) {
+	if c.Admin == nil {
+		return
+	}
+	ap, err := netip.ParseAddrPort(c.Admin.Listen)
+	if err != nil {
+		fail("admin.listen: %q is not IP:port", c.Admin.Listen)
+	} else if !ap.Addr().IsLoopback() && !c.Admin.AllowRemote {
+		// The admin API exposes the full config guarded only by Basic
+		// auth: a non-loopback bind must be an explicit opt-in.
+		fail("admin.listen: %q is not loopback; set admin.allow_remote: true (requires tls) to bind it", c.Admin.Listen)
+	}
+	cost, cerr := bcrypt.Cost([]byte(c.Admin.PasswordHash))
+	if cerr != nil {
+		fail("admin.password_hash: must be a bcrypt hash: %v", c.envRedact.detail(c.Admin.PasswordHash, cerr))
+	} else if cost < 10 {
+		// Cost 4 (min) makes offline cracking ~50x cheaper; the hash
+		// travels in backups, logs and the config itself.
+		fail("admin.password_hash: bcrypt cost %d is below the minimum of 10; regenerate the hash at cost 10 or higher", cost)
+	}
+}
+
+// validateSockets rejects two listeners that would bind the same socket:
+// `run` would fail with "address already in use", so `check` must too. The
+// public UDP and TCP ports are separate namespaces; the admin API shares
+// the TCP one with ws/wss when it binds the same address.
+func (c *Config) validateSockets(fail failFunc) {
+	if c.Admin == nil {
+		return
+	}
+	ap, err := netip.ParseAddrPort(c.Admin.Listen)
+	if err != nil {
+		return
+	}
+	bind := c.Public.Bind
+	for _, l := range []struct {
+		key  string
+		port int
+	}{{"edge.listen.ws", c.Edge.Listen.WS}, {"edge.listen.wss", c.Edge.Listen.WSS}} {
+		if l.port != 0 && l.port == int(ap.Port()) && hostsCollide(bind, ap.Addr().String()) {
+			fail("admin.listen: tcp/%s already bound by %s", c.Admin.Listen, l.key)
+		}
+	}
+}
+
+// hostsCollide reports whether two listeners on one protocol and port bind
+// overlapping addresses: an empty or unspecified host is every interface
+// and collides with anything; two IPs collide only when equal.
+func hostsCollide(a, b string) bool {
+	wildcard := func(h string) bool {
+		ip, err := netip.ParseAddr(h)
+		return h == "" || (err == nil && ip.IsUnspecified())
+	}
+	if wildcard(a) || wildcard(b) {
+		return true
+	}
+	ia, errA := netip.ParseAddr(a)
+	ib, errB := netip.ParseAddr(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return ia.Unmap() == ib.Unmap()
+}
+
+// sortedKeys returns m's keys in order, so errors come out stable.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// parseIPPort parses a literal "IP:port" with a port in 1-65535. The edge
+// does no DNS for its switch nodes, so `check` rejects a hostname exactly
+// as `run` would. label is the full config key.
+func parseIPPort(fail failFunc, label, address string) (netip.AddrPort, bool) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		fail("%s: %q is not \"IP:port\"", label, address)
+		return netip.AddrPort{}, false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		fail("%s: %q is not a literal IP — the switch is addressed by IP, no DNS", label, host)
+		return netip.AddrPort{}, false
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 {
+		fail("%s: bad port in %q", label, address)
+		return netip.AddrPort{}, false
+	}
+	if ip.IsUnspecified() {
+		fail("%s: %q is an unspecified address", label, address)
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(ip.Unmap(), uint16(p)), true
+}
+
+// allowedPrefix parses and checks one source-prefix entry — the edge's
+// carrier_sources — returning the
 // canonical prefix to match sources against. label names the list in the
-// error messages (e.g. "peers.carrier-a: allowed_ips").
+// error messages (e.g. "edge.carrier_sources").
 func allowedPrefix(fail failFunc, label, s string) (netip.Prefix, bool) {
 	pfx, err := parsePrefixOrAddr(s)
 	if err != nil {
@@ -263,272 +414,23 @@ func allowedPrefix(fail failFunc, label, s string) (netip.Prefix, bool) {
 		}
 		pfx = netip.PrefixFrom(pfx.Addr().Unmap(), pfx.Bits()-96)
 	}
-	// Cap prefix width. allowed_ips IS the whole
-	// inbound trust boundary (source-IP identification), so a
-	// fat-fingered 0.0.0.0/0 — or an over-wide range — silently
-	// opens toll fraud to every host it covers. The floors are /8
-	// (IPv4) and /32 (IPv6): the widest real-world allocation
-	// boundaries (10/8, an RIR site allocation), because this
-	// repo's own example config ships a 10.0.0.0/8 peer. A bare IP
+	// Cap prefix width. carrier_sources is a trust boundary (source-IP
+	// admission), so a fat-fingered 0.0.0.0/0 — or an over-wide range —
+	// silently admits every host it covers. The floors are /8 (IPv4) and
+	// /32 (IPv6): the widest real-world allocation boundaries. A bare IP
 	// parses as its full-length prefix and always passes.
 	minBits := 8
 	if pfx.Addr().Is6() {
 		minBits = 32
 	}
 	if pfx.Bits() < minBits {
-		fail("%s: %q is wider than /%d (T-11 width cap)", label, s, minBits)
+		fail("%s: %q is wider than /%d", label, s, minBits)
 		return netip.Prefix{}, false
 	}
 	// Store the canonical (Masked) form: a non-canonical input like
 	// 10.0.1.5/16 matches exactly what the operator intended once
 	// normalized, instead of silently mismatching netip semantics.
 	return pfx.Masked(), true
-}
-
-// validateRoutes checks every trunk route and compiles match.to.
-func (c *Config) validateRoutes(fail failFunc) {
-	for i, r := range c.Routes {
-		label := r.Name
-		if label == "" {
-			label = fmt.Sprintf("#%d", i+1)
-			fail("routes[%d]: name required", i)
-		}
-		if _, ok := c.Peers[r.From]; !ok {
-			fail("routes.%s: from: unknown peer %q", label, r.From)
-		}
-		if len(r.To) == 0 {
-			fail("routes.%s: to: at least one target peer required", label)
-		}
-		for _, t := range r.To {
-			if _, ok := c.Peers[t]; !ok {
-				fail("routes.%s: to: unknown peer %q", label, t)
-			}
-		}
-		r.matchTo = nil
-		if r.Match != nil && r.Match.To != "" {
-			re, err := regexp.Compile(r.Match.To)
-			if err != nil {
-				fail("routes.%s: match.to: %v", label, c.envRedact.detail(r.Match.To, err))
-			} else {
-				r.matchTo = re
-			}
-		}
-		if r.Transform != nil && r.Transform.To != "" {
-			validateTransform(fail, label, r)
-		}
-	}
-}
-
-// validateTransform checks transform.to against the compiled match.to.
-func validateTransform(fail failFunc, label string, r *Route) {
-	if r.Match == nil || r.Match.To == "" {
-		fail("routes.%s: transform.to requires match.to (capture groups come from it)", label)
-		return
-	}
-	if r.matchTo == nil {
-		return // match.to did not compile; already reported
-	}
-	g, names := groupRefs(r.Transform.To)
-	if g > r.matchTo.NumSubexp() {
-		fail("routes.%s: transform.to references capture group %d but match.to has %d group(s)", label, g, r.matchTo.NumSubexp())
-	}
-	// transform.to is not ${ENV}-expanded, so ${name} is always a group
-	// reference; one match.to does not define would expand to nothing at
-	// call time. Only env-shaped names are checked (the ones expansion
-	// used to substitute), so a config that relied on that fails loudly
-	// instead of losing the value; digit-led names such as $01 keep
-	// regexp.Expand's semantics.
-	for _, n := range names {
-		if envRef.MatchString("${"+n+"}") && r.matchTo.SubexpIndex(n) < 0 {
-			fail("routes.%s: transform.to references capture group %q but match.to has no group of that name (transform.to is a regexp template; ${ENV} is not expanded there)", label, n)
-		}
-	}
-}
-
-// validateShield checks the shield section.
-func (c *Config) validateShield(fail failFunc) {
-	if _, err := ParseRateLimit(c.Shield.RateLimit); err != nil {
-		fail("shield.rate_limit: %v", c.envRedact.detail(c.Shield.RateLimit, err))
-	}
-	if _, err := ParseRateLimit(c.Shield.PeerRateLimit); err != nil {
-		fail("shield.peer_rate_limit: %v", c.envRedact.detail(c.Shield.PeerRateLimit, err))
-	}
-	// withDefaults fills a zero value before validate normally runs, so this
-	// only trips on an explicitly negative value reaching here (e.g. a
-	// Config built directly without withDefaults). Checked defensively
-	// regardless.
-	if c.Shield.AutoBan.Duration <= 0 {
-		fail("shield.auto_ban.duration: must be > 0, got %s", c.Shield.AutoBan.Duration.Std())
-	}
-}
-
-// validateAdmin checks the optional admin section.
-func (c *Config) validateAdmin(fail failFunc) {
-	if c.Admin == nil {
-		return
-	}
-	ap, err := netip.ParseAddrPort(c.Admin.Listen)
-	if err != nil {
-		fail("admin.listen: %q is not host:port", c.Admin.Listen)
-	} else if !ap.Addr().IsLoopback() && !c.Admin.AllowRemote {
-		// The admin API is the full-config exposure point
-		// guarded only by Basic auth — non-loopback binding must be an
-		// explicit opt-in, and the error points at the TLS route.
-		fail("admin.listen: %q is not loopback; set admin.allow_remote: true to bind it "+
-			"(prefer admin.tls_cert/tls_key or a TLS reverse proxy — this listener serves the full config over plaintext otherwise)", c.Admin.Listen)
-	}
-	if c.Admin.Auth.Username == "" {
-		fail("admin.auth.username: required when admin is configured")
-	}
-	cost, cerr := bcrypt.Cost([]byte(c.Admin.Auth.PasswordHash))
-	if cerr != nil {
-		fail("admin.auth.password_hash: must be a bcrypt hash: %v", c.envRedact.detail(c.Admin.Auth.PasswordHash, cerr))
-	} else if cost < 10 {
-		// Cost 4 (min) makes offline cracking ~50x cheaper;
-		// the hash travels in backups, logs, and the config itself.
-		fail("admin.auth.password_hash: bcrypt cost %d is below the minimum of 10; regenerate the hash at cost 10 or higher", cost)
-	}
-	// Both-or-neither, so a half-configured pair can't leave the
-	// operator believing TLS is on while it silently isn't.
-	checkFilePair(fail, "admin", "tls_cert", c.Admin.TLSCert, "tls_key", c.Admin.TLSKey)
-}
-
-// validateTLSPairs checks the SIP-plane TLS pairs — same both-or-neither
-// rationale as the admin pair.
-func (c *Config) validateTLSPairs(fail failFunc) {
-	checkFilePair(fail, "listen", "tls_cert", c.Listen.TLSCert, "tls_key", c.Listen.TLSKey)
-	if c.Listen.TLSClientCA != "" && c.Listen.TLSCert == "" {
-		fail("listen.tls_client_ca requires listen.tls_cert and tls_key")
-	}
-	for name, p := range c.Peers {
-		checkFilePair(fail, "peers."+name, "tls_client_cert", p.TLSClientCert, "tls_client_key", p.TLSClientKey)
-	}
-	c.validateTLSPeerHosts(fail)
-}
-
-// groupRefs parses a regexp replacement template the way regexp.Expand
-// does: $$ is a literal dollar; $name or ${name} is a reference where name
-// is a run of [A-Za-z0-9_]; a purely numeric name without a leading zero is
-// a group index ($0 = whole match), anything else a group name. It returns
-// the highest index (-1 if none) and the names, in order of appearance.
-func groupRefs(template string) (max int, names []string) {
-	max = -1
-	for i := 0; i < len(template); {
-		if template[i] != '$' {
-			i++
-			continue
-		}
-		i++ // consume '$'
-		if i >= len(template) {
-			break
-		}
-		if template[i] == '$' {
-			i++ // literal "$$"
-			continue
-		}
-		braced := false
-		if template[i] == '{' {
-			braced = true
-			i++
-		}
-		start := i
-		for i < len(template) && isNameByte(template[i]) {
-			i++
-		}
-		name := template[start:i]
-		closedBrace := false
-		if braced && i < len(template) && template[i] == '}' {
-			closedBrace = true
-			i++
-		}
-		// Unterminated brace: treat as literal text, not a reference
-		if braced && !closedBrace {
-			continue
-		}
-		if name == "" {
-			continue
-		}
-		// Leading zeros: $01, $012, $00 etc. are named refs in Go regexp, not group indices
-		if !allDigits(name) || (len(name) > 1 && name[0] == '0') {
-			names = append(names, name)
-			continue
-		}
-		n, err := strconv.Atoi(name)
-		if err != nil {
-			continue
-		}
-		if n > max {
-			max = n
-		}
-	}
-	return max, names
-}
-
-func isNameByte(b byte) bool {
-	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
-}
-
-func allDigits(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return len(s) > 0
-}
-
-// checkIP fails unless value is empty or a valid IP literal. label is the
-// full config key ("rtp.bind_ip"), so the message reads the same as a
-// hand-written one.
-func checkIP(fail failFunc, label, value string) {
-	if value == "" {
-		return
-	}
-	if _, err := netip.ParseAddr(value); err != nil {
-		fail("%s: %q is not a valid IP", label, value)
-	}
-}
-
-// checkAdvertisedIP is checkIP plus the unspecified-address rejection every
-// advertised_ip key needs: 0.0.0.0/:: is a valid literal but putting it in
-// Contact/Via/SDP is never routable. why completes the sentence after the
-// em dash, which is the only part that differs between the keys.
-func checkAdvertisedIP(fail failFunc, label, value, why string) {
-	if value == "" {
-		return
-	}
-	ip, err := netip.ParseAddr(value)
-	if err != nil {
-		fail("%s: %q is not a valid IP", label, value)
-	} else if ip.IsUnspecified() {
-		fail("%s: %q is unspecified — %s", label, value, why)
-	}
-}
-
-// checkFilePair enforces the both-or-neither rule shared by every
-// cert/key pair: half a pair would leave the operator believing TLS (or
-// DTLS) is configured while it silently isn't.
-func checkFilePair(fail failFunc, prefix, aKey, aVal, bKey, bVal string) {
-	if (aVal == "") != (bVal == "") {
-		fail("%s: %s and %s must be set together", prefix, aKey, bKey)
-	}
-}
-
-// checkPortRange validates one RTP port pool: each end unprivileged and
-// within the UDP port space, and min strictly below max because every
-// session needs an RTP+RTCP port pair. boundsLabel prefixes the per-key
-// messages ("rtp" -> "rtp.port_min: ..."), rangeLabel the pair-wide one,
-// and unit names what a pair is allocated for on this plane.
-func checkPortRange(fail failFunc, boundsLabel, rangeLabel, unit string, min, max int) {
-	if min < 1024 || min > 65535 {
-		fail("%s.port_min: must be 1024-65535, got %d", boundsLabel, min)
-	}
-	if max < 1024 || max > 65535 {
-		fail("%s.port_max: must be 1024-65535, got %d", boundsLabel, max)
-	}
-	if min >= max {
-		fail("%s: port_min must be less than port_max (each %s needs an RTP+RTCP port pair), got %d-%d", rangeLabel, unit, min, max)
-	}
 }
 
 // rtpPairs is how many RTP/RTCP pairs the media pool can bind in

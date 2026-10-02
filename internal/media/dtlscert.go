@@ -48,16 +48,6 @@ func ProcessDTLSIdentity() (*DTLSIdentity, error) {
 	return processIdentity, processIdentityErr
 }
 
-// LoadDTLSIdentity reads a configured certificate/key pair and derives its
-// fingerprint, for deployments that want a pinned DTLS identity.
-func LoadDTLSIdentity(certFile, keyFile string) (*DTLSIdentity, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("media: load dtls identity: %w", err)
-	}
-	return identityFrom(cert)
-}
-
 func generateDTLSIdentity() (*DTLSIdentity, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

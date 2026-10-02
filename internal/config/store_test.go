@@ -96,3 +96,12 @@ func TestStoreReplaceNeverBlocksWithSlowSubscriber(t *testing.T) {
 		t.Fatal("Replace blocked on an undrained subscriber")
 	}
 }
+
+// validConfig is a parsed minimal v2 config; each call returns a fresh one.
+func validConfig() *Config {
+	c, err := Parse([]byte(minimalYAML))
+	if err != nil {
+		panic(err)
+	}
+	return c
+}

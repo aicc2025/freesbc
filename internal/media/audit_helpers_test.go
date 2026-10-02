@@ -20,7 +20,7 @@ import (
 // 24000-24999, which no pre-existing suite in the repository uses.
 
 // auditPool builds a loopback-bound pool whose range can be changed at
-// runtime, standing in for a hot-reloaded listen.media.port_range.
+// runtime, standing in for a hot-reloaded rtp port range.
 type auditPool struct {
 	*PlanePool
 	lo, hi atomic.Int32

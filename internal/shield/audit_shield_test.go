@@ -9,7 +9,7 @@ import (
 	"github.com/freesbc/freesbc/internal/config"
 )
 
-// Audit tests (docs/audit/REPORT.md). A failing test here is the
+// Audit tests. A failing test here is the
 // deliverable: it demonstrates a defect. Do not make it pass by editing the
 // test; fix the production code instead.
 
@@ -19,14 +19,14 @@ func auditEdgeShield(t *testing.T) *Shield {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	s := NewNoKernel(config.NewStore(cfg), discard())
+	s := New(config.NewStore(cfg), discard(), nil)
 	t.Cleanup(func() { s.Close() })
 	return s
 }
 
 // audit: P2-SHD-001
 // docs/design.md §14.1: a forgeable datagram must not blackhole a third
-// party. The edge plane (NewNoKernel) enforces the in-memory ban on every
+// party. The edge plane (New) enforces the in-memory ban on every
 // later request, so one spoofed UDP scanner datagram locks the victim out.
 func TestAuditUDPScannerVerdictDoesNotBanVictim(t *testing.T) {
 	s := auditEdgeShield(t)
@@ -137,7 +137,7 @@ func TestAuditShieldCloseReleasesGoroutines(t *testing.T) {
 	runtime.GC()
 	base := runtime.NumGoroutine()
 	for i := 0; i < 20; i++ {
-		s := NewNoKernel(config.NewStore(cfg), discard())
+		s := New(config.NewStore(cfg), discard(), nil)
 		s.Check(netip.MustParseAddr("198.51.100.50"), "x", "udp")
 		s.Close()
 	}

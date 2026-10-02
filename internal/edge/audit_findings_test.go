@@ -1,6 +1,6 @@
 package edge
 
-// Phase 3 audit tests for internal/edge (docs/audit/phase3/edge.md). Each
+// Phase 3 audit tests for internal/edge. Each
 // test asserts the behaviour the RFC or the documented invariant requires;
 // a FAIL confirms the Phase 2 finding named in its `// audit:` marker, a
 // PASS refutes it. None of these tests is meant to be made green by
@@ -18,7 +18,6 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 
-	"github.com/freesbc/freesbc/internal/config"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
@@ -441,7 +440,7 @@ func TestAuditReInvite2xxUnanchorableIsACKed(t *testing.T) {
 // and its later BYE gets 481.
 func TestAuditMediaTimeoutSendsBye(t *testing.T) {
 	h := startHarness(t, false)
-	auditReplaceConfig(h, func(c *config.Config) { c.Listen.Media.RTPTimeout = config.Duration(time.Second) })
+	h.srv.setRTPTimeout(time.Second)
 	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
 	phone := newUDPClient(t)
 	invite, _, _ := auditPhoneCall(t, h, phone)

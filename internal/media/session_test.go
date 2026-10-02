@@ -112,7 +112,7 @@ func TestRelatchMovesToNewRemote(t *testing.T) {
 
 func TestSessionRelatchBothKinds(t *testing.T) {
 	p := testPool(22500, 22507)
-	s, err := p.Allocate(SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: time.Minute})
+	s, err := AllocateAcross(p, p, SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,44 +151,9 @@ func TestSetLatchModeChangesAcceptBehavior(t *testing.T) {
 	}
 }
 
-// TestSessionSetLatchModeChangesBothKinds mirrors
-// TestSessionRelatchBothKinds: SetLatchMode on a Session must flip both the
-// RTP and RTCP latches of the given side, not just one of them.
-func TestSessionSetLatchModeChangesBothKinds(t *testing.T) {
-	p := testPool(22510, 22517)
-	s, err := p.Allocate(SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	// Strict with no expectation set: both latches reject.
-	src := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 4000}
-	if s.rtp[SideB].accept(src) || s.rtcp[SideB].accept(src) {
-		t.Fatal("strict latches must reject before SetLatchMode/SetExpectedRemote")
-	}
-
-	s.SetLatchMode(SideB, LatchLoose)
-	if !s.rtp[SideB].accept(src) {
-		t.Error("rtp latch not switched to loose")
-	}
-	if !s.rtcp[SideB].accept(src) {
-		t.Error("rtcp latch not switched to loose")
-	}
-}
-
-func TestParseLatchMode(t *testing.T) {
-	if ParseLatchMode("loose") != LatchLoose {
-		t.Error("loose")
-	}
-	if ParseLatchMode("strict") != LatchStrict || ParseLatchMode("") != LatchStrict {
-		t.Error("strict default")
-	}
-}
-
 func TestAllocateAndPorts(t *testing.T) {
 	p := testPool(22300, 22315)
-	s, err := p.Allocate(SessionConfig{Timeout: time.Minute})
+	s, err := AllocateAcross(p, p, SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
@@ -201,7 +166,7 @@ func TestAllocateAndPorts(t *testing.T) {
 
 func TestAllocateDefaultsTimeoutFromConfig(t *testing.T) {
 	p := testPool(22320, 22327)
-	s, err := p.Allocate(SessionConfig{}) // zero timeout
+	s, err := AllocateAcross(p, p, SessionConfig{}) // zero timeout
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,11 +178,11 @@ func TestAllocateDefaultsTimeoutFromConfig(t *testing.T) {
 
 func TestSessionCloseIdempotentAndReleases(t *testing.T) {
 	p := testPool(22400, 22403) // exactly 2 pairs = 1 session
-	s, err := p.Allocate(SessionConfig{Timeout: time.Minute})
+	s, err := AllocateAcross(p, p, SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Allocate(SessionConfig{Timeout: time.Minute}); err == nil {
+	if _, err := AllocateAcross(p, p, SessionConfig{Timeout: time.Minute}); err == nil {
 		t.Fatal("second session must exhaust the 2-pair range")
 	}
 	if err := s.Close(); err != nil {
@@ -231,7 +196,7 @@ func TestSessionCloseIdempotentAndReleases(t *testing.T) {
 	default:
 		t.Fatal("Done must be closed after Close")
 	}
-	s2, err := p.Allocate(SessionConfig{Timeout: time.Minute})
+	s2, err := AllocateAcross(p, p, SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatalf("ports not released by Close: %v", err)
 	}

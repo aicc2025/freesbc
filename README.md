@@ -1,19 +1,17 @@
 # FreeSBC
 
-An all-in-one open-source Session Border Controller with the Caddy experience: **one binary, one YAML file, `./freesbc run`.**
+An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, one YAML file, `./freesbc run`.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/go-1.27.1-00ADD8.svg)](go.mod)
 
-- **Pure Go, one static binary, zero external dependencies** — no database, no Redis, no kernel modules, no container orchestration, and **no external media process**.
-- **Keeps FreeSWITCH off the public internet** — the edge proxy is the only thing with a public address; FreeSWITCH stays on the private LAN and only ever talks to FreeSBC.
-- **Two independent planes, either or both** — a [**Trunk B2BUA**](docs/trunk.md) for carrier/PBX interconnect, and an [**Edge proxy**](docs/edge.md) for SIP phones and browsers in front of FreeSWITCH.
-- **Embedded WebUI, REST API and Prometheus metrics** — a live dashboard and a validated editor for the same YAML file, behind bcrypt Basic Auth.
-
-Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables + Ansible) means many components, four languages, and a config pipeline that spans four layers. FreeSBC collapses all of that into one process with a declarative config file as the single source of truth.
+- **Pure Go, one static binary, zero external dependencies**: no database, no Redis, no kernel modules, and **no external media process**.
+- **Keeps your switch off the public internet**: FreeSBC is the only element with a public address. FreeSWITCH or Asterisk stays on a private LAN and only ever talks to FreeSBC.
+- **Phones, browsers and carriers through one public address**: SIP/UDP phones, WS/WSS WebRTC browsers, and carriers (the switch uses FreeSBC as its outbound proxy).
+- **Embedded WebUI, REST API and Prometheus metrics** behind bcrypt Basic Auth.
 
 ## Install
 
-**Prebuilt binary** — each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and both example configs:
+**Prebuilt binary**: each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and `freesbc.example.yaml`:
 
 ```sh
 v=v0.1.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
@@ -21,10 +19,10 @@ curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/freesbc_${v}_
 curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/SHA256SUMS
 shasum -a 256 -c --ignore-missing SHA256SUMS   # Linux: sha256sum -c --ignore-missing SHA256SUMS
 tar -xzf freesbc_${v}_${os}_${arch}.tar.gz && cd freesbc_${v}_${os}_${arch}
-./freesbc check -c edge.example.yaml
+./freesbc check -c freesbc.example.yaml
 ```
 
-**From source** — requires Go ≥ 1.27.1:
+**From source**: requires Go >= 1.27.1:
 
 ```sh
 go build -o freesbc ./cmd/freesbc
@@ -32,129 +30,93 @@ go build -o freesbc ./cmd/freesbc
 
 ## Quick start
 
-> **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (the networking and deployment topology section and the security model section).
-
-**Trunk** — carrier/PBX interconnect (`cp sbc.example.yaml sbc.yaml`, then edit peers/routes for your setup):
-
-```yaml
-listen:
-  sip: [udp://0.0.0.0:5060]
-peers:
-  carrier-a:    { address: sip.carrier-a.com:5060, allowed_ips: [203.0.113.0/24] }
-  internal-pbx: { address: 10.0.0.10:5060, allowed_ips: [10.0.0.0/8] }
-routes:
-  - { name: outbound, from: internal-pbx, to: [carrier-a] }
-```
-
-**Edge** — proxy in front of FreeSWITCH (`cp edge.example.yaml edge.yaml`):
-
-```yaml
-network:
-  public:  { bind_ip: 0.0.0.0, advertised_ip: 203.0.113.7 }
-  private: { bind_ip: 10.77.0.2 }
-sip:
-  public:
-    udp: { enabled: true, bind: 0.0.0.0:16060 }
-  private:
-    bind: 10.77.0.2:5060
-  upstream:
-    address: 10.77.0.10:5060
-rtp:
-  public:  { bind_ip: 0.0.0.0, advertised_ip: 203.0.113.7, port_min: 30000, port_max: 39999 }
-  private: { bind_ip: 10.77.0.2, port_min: 40000, port_max: 49999 }
-```
-
-Then validate and run. Both local copies, `sbc.yaml` and `edge.yaml`, are gitignored, since they may hold credentials and real addresses:
+> **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (networking and deployment topology, security model) and [`docs/edge.md`](docs/edge.md) (switch-side requirements).
 
 ```sh
-./freesbc check -c sbc.yaml    # validate: errors name the line and field (use edge.yaml for the edge deployment)
-./freesbc run   -c sbc.yaml
+cp freesbc.example.yaml freesbc.yaml   # then edit the addresses
+./freesbc check -c freesbc.yaml        # validate; errors name the line and key
+./freesbc run   -c freesbc.yaml
 ```
 
-The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged. Listener sockets, TLS certificates, the edge topology (`network`, upstreams, PSTN gateways/routes/match, WebRTC), the edge media planes (`rtp.public`/`rtp.private`), which planes run and the `admin` listener are read once at startup and need a restart; a reload that edits them is logged as a warning listing the keys, and the running process keeps its startup values.
+A minimal config (every key is documented in [`docs/config.md`](docs/config.md)):
 
-On SIGINT/SIGTERM the trunk plane refuses new calls (503), sends a BYE on both legs of every live call and waits up to 12 s for them before it un-registers and closes its listeners; edge-proxy calls are dropped with their media released. A second SIGINT/SIGTERM exits at once.
+```yaml
+public:
+  ip: 203.0.113.7            # advertised to phones, browsers, carriers
+private:
+  ip: 10.77.0.2              # faces the switch
+edge:
+  switch: [10.77.0.10:5060]  # the switch, literal IP:port
+  listen:
+    udp: 5060                # ports on public.bind
+```
 
-## Keep FreeSWITCH off the public internet
+`freesbc.yaml` is gitignored since it may hold real addresses and a password hash. `-c` defaults to `freesbc.yaml`; a positional argument is a usage error.
 
-The edge plane exists so that FreeSBC is the only element with a public address. FreeSWITCH is a literal private `IP:port` upstream and never needs a public IP, a port forward, or NAT handling of its own.
+The config file is watched. A `shield` edit is validated and applied atomically; a bad edit never takes down the process, because the previous config stays active and the error is logged. Everything else (addresses, `rtp`, `tls`, `edge`, `admin`) is read once at startup: a reload that edits it is logged as a warning listing the keys, and the running process keeps its startup values until restarted.
+
+On SIGINT/SIGTERM FreeSBC drops its calls with their media released; no BYE is sent. A second SIGINT/SIGTERM exits at once.
+
+## How it fits together
 
 ```text
-  Internet ──▶ FreeSBC  203.0.113.7   public: SIP/UDP, WS/WSS, RTP, WebRTC
+  Internet ──> FreeSBC  203.0.113.7   public: SIP/UDP, WS/WSS, RTP, WebRTC
                   │
-                  │ private LAN/VPN: plain SIP/UDP + RTP, sent from 10.77.0.2
-                  ▼
-              FreeSWITCH  10.77.0.10:5060   no public IP, no port forward
+                  │ private LAN/VPN: plain SIP/UDP + RTP
+                  │ one fixed socket, 10.77.0.2:5060
+                  v
+              switch (FreeSWITCH / Asterisk)  10.77.0.10   no public IP, no port forward
+                  │
+                  └── carriers: the switch sends carrier traffic to FreeSBC as its outbound proxy
 ```
 
-What the SBC absorbs, so FreeSWITCH never sees it:
+- **Clients.** REGISTER is proxied to the switch verbatim (the switch is the registrar; FreeSBC holds no credential) with the Contact rewritten to carry an `fsbc=` token. Calls to clients and from clients are proxied with FreeSBC on the path.
+- **Carriers.** The switch owns carrier accounts, line selection and failover, and points each gateway at FreeSBC as outbound proxy. Requests to a host listed in `edge.carriers` are proxied to that carrier with the switch's private addresses hidden; inbound carrier requests are delivered to the switch's carrier port with an `X-FreeSBC-Carrier` header.
+- **Topology hiding.** Every SDP body is constructed by FreeSBC, never copied from the other leg, and all media is anchored on FreeSBC ports. A public party never gets the switch's address, and the switch never gets the public party's address in SDP, Contact or Request-URI.
+- **Shield.** Per-IP rate limiting (separate limits for carrier sources) and scanner fingerprinting with an in-memory ban; every denial is a silent drop. FreeSBC touches no kernel firewall state. The private socket is trusted and exempt, so keep it unreachable from anywhere else.
 
-- **Public traffic itself.** Every request FreeSWITCH receives is sent from FreeSBC's private socket (`sip.private.bind`), so its sofia profile only has to accept that one address. In the other direction the edge's pre-parse read filter drops anything arriving on the private bind whose source is not a configured upstream.
-- **Scanners and floods.** Per-IP rate limiting and the scanner User-Agent signature list (an instant ban of the source IP over TCP/TLS/WS/WSS; over UDP, whose source can be forged, only the source socket for a minute) run on every public request; the private plane is exempt from the shield entirely, and every denial is a silent drop rather than a response that confirms the SBC exists. Bans are in-memory only; FreeSBC touches no kernel firewall state.
-- **Its own addresses.** Every SDP body the edge plane emits is constructed, never derived from the other leg, so a public client is never given FreeSWITCH's address and FreeSWITCH is never given the client's; the REGISTER Contact is rewritten toward the SBC and restored on the way back, and all media is anchored on FreeSBC ports. The Via stack is ordinary proxy behaviour, not hidden: FreeSBC annotates the sender's Via with `received=`, so FreeSWITCH does see the public client's address there.
-- **Transport and NAT variety.** WS/WSS and WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) are terminated at the edge and relayed to FreeSWITCH as plain SIP over UDP and plain RTP. `received=`/`rport` handling and symmetric-RTP latching happen at the SBC.
-
-What stays with FreeSWITCH: it remains the authoritative registrar and owns users, credentials, dial plans and all call logic. REGISTER and its digest challenge are proxied verbatim and FreeSBC never holds a credential. The private plane is trusted and unmetered by design — FreeSBC does not enforce that; your network must keep it unreachable from anywhere else.
-
-Details: [`docs/edge.md`](docs/edge.md) (topology, behaviour table, known limitations) and [`docs/design.md`](docs/design.md) (§12 networking and deployment topology, §14 security model).
-
-## Which plane do I need?
-
-| Goal | Plane | Configure |
-|---|---|---|
-| Interconnect carriers with a PBX/softswitch over SIP trunks | [Trunk B2BUA](docs/trunk.md) | `peers:` and `routes:` |
-| Put SIP phones and sip.js browsers in front of FreeSWITCH, keeping FreeSWITCH itself on the private LAN | [Edge proxy](docs/edge.md) | `network:`, `sip.public/private`, `sip.upstream` (or `sip.upstreams`), `rtp.public/private`, `webrtc:` |
-| Both at once, in one process | Both | both sets of sections in one file |
+Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, limitations) and [`docs/design.md`](docs/design.md).
 
 ## Features
 
-- **SIP trunk interconnect** — UDP, TCP and TLS transports, real certificate or a self-signed fallback, optional mTLS, IP-authenticated peers, and registration-based trunks via outbound REGISTER with digest auth. Outbound TLS is per peer: each peer is trusted only through its own `tls_ca` (or the system roots) and gets only its own client certificate, and two TLS peers may not share an address host ([details](docs/trunk.md#tls-peers))
-- **B2BUA with topology hiding** — two independent call legs with their own Call-ID, From-tag and Via, and SDP built from scratch per leg (the SBC's own `o=`, address and port; only codec lines and direction carried over)
-- **Routing engine** — regex matching, number transformation, ordered failover with passive per-endpoint cooldown, and DNS SRV resolution with RFC 3263 priority/weight ordering, cached
-- **RTP relay + SRTP (SDES)** — media anchoring, `a=crypto` negotiation with a per-peer `disabled`/`optional`/`required` policy on the trunk plane, SRTP↔RTP interworking in both directions, and NAT traversal via hardened first-packet latching
-- **Edge proxy plane** — the only public-facing element in front of a FreeSWITCH that stays on the private LAN: registration proxying to FreeSWITCH, UDP/WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) relayed to plain RTP, a multi-upstream pool with per-user hashing and dialog stickiness, and an optional peer-to-peer PSTN trunk with gateway failover
-- **Built-in security** — per-IP rate limiting, scanner fingerprinting against known-tool User-Agent signatures with an instant in-memory ban; no kernel firewall integration and no extra capabilities needed
-- **Embedded WebUI + REST API** — a live dashboard and an editor for the same YAML file, with validated atomic write-back, hot reload, Prometheus metrics and bcrypt Basic Auth
-- **Carrier interop baseline** — OPTIONS answering and session-timer negotiation (RFC 4028), including the 422/Min-SE exchange on both legs
+- **Edge proxy**: SIP/UDP, WS and WSS interworking in front of a private switch; REGISTER proxying; a multi-switch pool with per-user hashing.
+- **Carrier path**: carrier directory by literal IP or DNS (SRV/A/AAAA, cached), switch-to-carrier proxying with topology hiding, inbound carrier delivery to the switch's carrier port, and deterministic carrier registration tokens.
+- **Media anchoring**: RTP relay on FreeSBC ports with hardened first-packet latching and a silence watchdog; no transcoding.
+- **WebRTC**: ICE-Lite, DTLS-SRTP and RTCP-mux terminated for browsers (any of `edge.listen.ws`/`wss`), relayed to plain RTP.
+- **Built-in security**: per-IP rate limiting, scanner fingerprinting, in-memory bans, admission control for public INVITEs and REGISTER enumeration.
+- **Embedded WebUI + REST API**: a live dashboard and a validated, atomic editor for the same YAML file, Prometheus metrics, bcrypt Basic Auth.
 
 ## Documentation
 
-- [`docs/trunk.md`](docs/trunk.md) — trunk plane: `peers`/`routes` configuration, NAT/VPN bind vs advertised addresses, trunk features and roadmap
-- [`docs/edge.md`](docs/edge.md) — edge plane: topology, behaviour table, PSTN trunk, multiple FreeSWITCHes, known limitations, interop verification
-- [`docs/design.md`](docs/design.md) — the design document: what the code does, as implemented
-- [`sbc.example.yaml`](sbc.example.yaml) — full annotated example, trunk plane plus an optional edge section
-- [`edge.example.yaml`](edge.example.yaml) — full annotated example, proxy-only deployment
+- [`docs/config.md`](docs/config.md): every key, default, validation rule and reload class
+- [`docs/edge.md`](docs/edge.md): topology, behaviour, switch-side requirements, non-goals, known limitations
+- [`docs/design.md`](docs/design.md): the design document, what the code does as implemented
+- [`freesbc.example.yaml`](freesbc.example.yaml): annotated example
 
 ## Admin & WebUI
 
-Enable the optional `admin` block (a bcrypt `password_hash` — generate with `htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'`), then:
+Enable the optional `admin` block (a bcrypt `password_hash`; generate with `htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'`; the user is always `admin`), then:
 
-- browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard (active calls, peers, port/registration status) and the raw-config editor — edits are validated, written atomically, and hot-reloaded; keep secrets as `${ENV}` references (plain string keys only; a validation error shows the `${ENV}` text, never the value),
+- browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard and the raw-config editor. Edits are validated, written atomically and reloaded; keep secrets as `${ENV}` references,
 - scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the scrape config),
-- tear down a stuck call: `curl -u admin:… -X DELETE http://<admin.listen>/api/calls/<call-id>` (204 killed, 404 already gone) — the `<call-id>` is the `id` from `GET /api/calls`.
+- read live state from `/api/status`, `/api/calls` and `/api/config`.
 
-Bind the admin listener **private** — front it with a reverse proxy for remote access, or serve HTTPS directly with `admin.tls_cert` / `admin.tls_key`. Validation rejects a non-loopback `admin.listen` unless `admin.allow_remote: true` is set; read the security model section of [`docs/design.md`](docs/design.md) before setting it.
+Bind the admin listener **private**. Validation rejects a non-loopback `admin.listen` unless `admin.allow_remote: true` is set, which also requires the top-level `tls` identity and then serves HTTPS. Read the security model section of [`docs/design.md`](docs/design.md) before setting it.
 
 ## Status & limitations
 
-FreeSBC targets small/medium businesses and ITSPs running a single node; hundreds to a few thousand concurrent calls is the design target, not a measured result — the repo carries no benchmarks and no load-test harness.
+FreeSBC targets small and medium deployments on a single node. The repo carries no benchmarks and no load-test harness.
 
-Explicit non-goals: transcoding, CDR, clustering, and being a registrar in its own right — the edge proxy PROXIES registrations to FreeSWITCH rather than owning users or credentials. See the [design doc](docs/design.md).
+Non-goals: transcoding, CDR, clustering, and being a registrar in its own right. The edge proxy proxies registrations to the switch rather than owning users or credentials.
 
-- **No transcoding**, on either plane — left to the softswitch behind.
-- Session timers are negotiated, but no timer tears a call down on session expiry (on the trunk plane, a refresh the SBC itself sends that fails does end the call).
-- The edge plane never offers or reads `a=crypto`: a SIP phone there gets plain RTP, and only browser legs get DTLS-SRTP.
-- The admin API lists edge-proxy dialogs alongside trunk calls, but teardown (`DELETE /api/calls/{id}`) covers trunk-plane calls only.
-- The edge proxy relays a public out-of-dialog INVITE only from a registered client's transport address or a carrier source (`sip.pstn` gateway IPs plus `sip.public.carrier_sources`); anything else is dropped silently, so inbound carrier IPs must be listed. A source whose REGISTERs are rejected 403/404 for 10 distinct AoRs within 10 minutes is silently ignored until the window ends. See [inbound calls from carriers](docs/edge.md#inbound-calls-from-carriers).
-- The edge proxy has further structural limits — offerless INVITE, no PRACK/UPDATE/100rel, UDP-only literal upstreams, no TURN/full ICE, no SUBSCRIBE (NOTIFY is forwarded, but MWI and BLF need SUBSCRIBE), and more: see [known limitations](docs/edge.md#known-limitations).
+- No transcoding; left to the switch.
+- All state is in memory; a restart drops every call, dialog and binding.
+- The edge never offers or reads `a=crypto`: a SIP phone gets plain RTP, and only browser legs get DTLS-SRTP.
+- Switches and carrier gateways are UDP only; switches are literal `IP:port`, with no DNS.
+- Call-ID passes through the proxy unchanged.
+- No SUBSCRIBE, PRACK or UPDATE, and no TURN or full ICE.
 
-## Roadmap
-
-Items not yet implemented. Trunk-plane items are listed in [`docs/trunk.md`](docs/trunk.md#roadmap-trunk-plane); the edge proxy's [known limitations](docs/edge.md#known-limitations) are structural rather than scheduled.
-
-- **Scanner heuristics beyond User-Agent** — method and traffic-shape fingerprinting
-- **SUBSCRIBE through the edge proxy** — needed before MWI and BLF reach phones (NOTIFY is already forwarded, including FreeSWITCH's MWI NOTIFY to a registered phone)
-- **Consistent hashing for `sip.upstreams`** — the pool is modulo-hashed, so changing the node set reshuffles users between switches
+See [known limitations](docs/edge.md#known-limitations) for the full list.
 
 ## Development
 
@@ -163,7 +125,7 @@ go vet ./...
 go test ./... -race
 ```
 
-Some trunk tests bind `127.0.0.2`, and one trunk test also binds `127.0.0.9`. Linux routes all of `127.0.0.0/8` to loopback; on macOS add both aliases first (`sudo ifconfig lo0 alias 127.0.0.2 up` and `sudo ifconfig lo0 alias 127.0.0.9 up`) or those tests fail.
+The edge suite runs entirely on `127.0.0.1` and passes on macOS and Linux. See CLAUDE.md for per-package test ports and the opt-in FreeSWITCH interop test.
 
 ## Layout
 
@@ -171,18 +133,16 @@ Some trunk tests bind `127.0.0.2`, and one trunk test also binds `127.0.0.9`. Li
 cmd/freesbc/          argv parsing, signal handling, exit codes
 internal/
   app/                construction and lifecycle: builds every component and runs it
-  config/             sbc.yaml: parse, validate, hot reload
-  sip/                SIP protocol primitives shared by both planes
+  config/             freesbc.yaml: parse, validate, hot reload
+  sip/                SIP protocol primitives
   sip/sdp/            SDP subsystem (parse, codec negotiation, construction)
-  trunk/              trunk plane: B2BUA between carriers and a PBX
-  edge/               edge plane: SIP/RTP/WebRTC proxy in front of FreeSWITCH
+  edge/               SIP/RTP/WebRTC proxy between public parties and the switch
   media/              RTP/RTCP relay, port pools, WebRTC leg (ICE/DTLS/SRTP)
   shield/             per-IP rate limiting, scanner fingerprinting, in-memory bans
   admin/              operator HTTP API, Prometheus metrics, embedded WebUI
-test/interop/         SIPp scenarios and config for manual interop runs
 ```
 
-`trunk` and `edge` are the two SIP planes and are named for the side each serves, not the protocol both speak. Neither imports the other: besides the protocol primitives (`sip`, `sip/sdp`) they share only `config`, `media` and `shield`; dependencies run one way, and only `app` wires the planes and `admin` together. Everything is under `internal/`: the only consumer is `cmd/freesbc`, so no package here carries an API promise.
+Everything is under `internal/`: the only consumer is `cmd/freesbc`, so no package here carries an API promise. Dependencies run one way: `cmd/freesbc -> app -> {edge, admin}`.
 
 ## License
 

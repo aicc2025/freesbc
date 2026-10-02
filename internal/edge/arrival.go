@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/emiago/sipgo/sip"
 )
@@ -23,11 +24,6 @@ const (
 	// arrPrivate is a datagram that reached the private bind from an
 	// upstream IP: FreeSWITCH talking to its own edge proxy.
 	arrPrivate
-	// arrPSTN is a datagram that reached the dedicated PSTN listener
-	// (sip.pstn.match) from an upstream IP: FreeSWITCH bridging an outbound
-	// call. The listener is trusted and shield-exempt, but it is not the
-	// private plane: only an INVITE (and its CANCEL) is expected on it.
-	arrPSTN
 )
 
 // arrivalHeader is the internal header the read filter stamps on a request
@@ -43,7 +39,6 @@ const arrivalHeader = "X-FreeSBC-Arrival"
 // secret, and a wrong or absent value simply means arrPublic.
 type arrivalMarker struct {
 	private []byte // full header value for the private bind
-	pstn    []byte // full header value for the PSTN listener
 }
 
 func newArrivalMarker() (*arrivalMarker, error) {
@@ -54,7 +49,6 @@ func newArrivalMarker() (*arrivalMarker, error) {
 	secret := hex.EncodeToString(b[:])
 	return &arrivalMarker{
 		private: []byte(secret + ";private"),
-		pstn:    []byte(secret + ";pstn"),
 	}, nil
 }
 
@@ -63,8 +57,6 @@ func (m *arrivalMarker) value(a arrival) []byte {
 	switch a {
 	case arrPrivate:
 		return m.private
-	case arrPSTN:
-		return m.pstn
 	}
 	return nil
 }
@@ -114,45 +106,67 @@ func (m *arrivalMarker) stamp(a arrival, data []byte) []byte {
 	return out
 }
 
-// take reads the arrival marker off req and returns the request the
-// handler should use, together with the arrival. Every occurrence of the
-// header — whatever its case and whoever wrote it — is gone from the
-// returned request, so it can never be forwarded or echoed. sipgo's
-// RemoveHeader is exact-name and removes one header per call, so the
-// headers are found case-insensitively first and removed under the exact
-// name each carries.
-//
-// A request that carries the header is CLONED and stripped on the copy, and
-// the copy is returned: the original is shared with sipgo's own server
-// transaction, whose "100 Trying" timer reads its headers from another
-// goroutine (sipgo v1.4.3 transaction_server_tx.go), so editing it in place
-// is a data race. A request with no marker — every ordinary public request
-// — is returned as it is, at no cost.
-//
-// The arrival is trusted only when the first occurrence — the one the read
-// filter inserts directly after the request line — equals a marker value
-// exactly (constant-time). Anything else, a forged value included, is
-// arrPublic.
-func (m *arrivalMarker) take(req *sip.Request) (*sip.Request, arrival) {
-	hs := req.GetHeaders(arrivalHeader)
-	if len(hs) == 0 {
-		return req, arrPublic
+// internalHeaderPrefix starts the name of every header only FreeSBC adds
+// (the arrival marker, X-FreeSBC-Carrier, ...). A message from outside
+// never carries one that is believed: they are all stripped on arrival,
+// whatever their case, and again on everything forwarded or relayed.
+const internalHeaderPrefix = "x-freesbc-"
+
+// headerMessage is what the strip helpers need of a request or a response.
+type headerMessage interface {
+	Headers() []sip.Header
+	RemoveHeader(name string) bool
+}
+
+// internalHeaderNames lists, one entry per occurrence, the exact names of
+// the X-FreeSBC-* headers m carries.
+func internalHeaderNames(m headerMessage) []string {
+	var names []string
+	for _, h := range m.Headers() {
+		if strings.HasPrefix(strings.ToLower(h.Name()), internalHeaderPrefix) {
+			names = append(names, h.Name())
+		}
 	}
-	got := []byte(hs[0].Value())
+	return names
+}
+
+// stripInternalHeaders removes every X-FreeSBC-* header from m, in place.
+// sipgo's RemoveHeader is exact-name and removes one header per call, so
+// the names are collected first and removed once per occurrence. Callers
+// pass a message they own (a clone), never one shared with sipgo.
+func stripInternalHeaders(m headerMessage) {
+	for _, name := range internalHeaderNames(m) {
+		m.RemoveHeader(name)
+	}
+}
+
+// take reads the arrival marker off req and returns the request the
+// handler should use, together with the arrival. Every X-FreeSBC-* header
+// — the marker itself, a forged one, whatever its case and whoever wrote
+// it — is gone from the returned request before anything else sees it, so
+// none can be believed, forwarded or echoed.
+//
+// A request that carries any such header is CLONED and stripped on the
+// copy, and the copy is returned: the original is shared with sipgo's own
+// server transaction, whose "100 Trying" timer reads its headers from
+// another goroutine (sipgo v1.4.3 transaction_server_tx.go), so editing it
+// in place is a data race. A request with none — every ordinary public
+// request — is returned as it is, at no cost.
+//
+// The arrival is trusted only when the first occurrence of the marker —
+// the one the read filter inserts directly after the request line — equals
+// a marker value exactly (constant-time). Anything else, a forged value
+// included, is arrPublic.
+func (m *arrivalMarker) take(req *sip.Request) (*sip.Request, arrival) {
 	result := arrPublic
-	// Both comparisons always run, so the time taken does not depend on
-	// which socket the value names.
-	priv := subtle.ConstantTimeCompare(got, m.private)
-	pstn := subtle.ConstantTimeCompare(got, m.pstn)
-	switch {
-	case priv == 1:
+	if hs := req.GetHeaders(arrivalHeader); len(hs) > 0 &&
+		subtle.ConstantTimeCompare([]byte(hs[0].Value()), m.private) == 1 {
 		result = arrPrivate
-	case pstn == 1:
-		result = arrPSTN
+	}
+	if len(internalHeaderNames(req)) == 0 {
+		return req, result
 	}
 	clean := req.Clone()
-	for _, h := range clean.GetHeaders(arrivalHeader) {
-		clean.RemoveHeader(h.Name())
-	}
+	stripInternalHeaders(clean)
 	return clean, result
 }

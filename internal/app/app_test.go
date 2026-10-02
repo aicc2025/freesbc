@@ -7,39 +7,55 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/freesbc/freesbc/internal/edge"
 )
 
-// appMediaPortMin..appMediaPortMax is this package's slice of the test
-// port map (CLAUDE.md, "Test ports"). The trunk plane binds media ports
-// only per call, and this test places none, but the range still has to be
-// valid and must not overlap another package's.
-const (
-	appMediaPortMin = 10000
-	appMediaPortMax = 10009
-)
+// edgeRunYAML is a v2 config for Run tests: public UDP on pubPort at
+// 127.0.0.1, the switch at 127.0.0.1:upPort (never contacted before a call
+// arrives). private.ip is a non-local placeholder: tests override the fixed
+// private socket with edge.WithPrivateAddr (see setPrivate). The RTP range
+// sits in this package's slice of the test port map (CLAUDE.md, "Test
+// ports").
+func edgeRunYAML(pubPort, upPort int) string {
+	return fmt.Sprintf(`
+public: { ip: 127.0.0.1 }
+private: { ip: 192.0.2.250 }
+rtp: 10010-10029
+edge:
+  switch: [127.0.0.1:%d]
+  listen: { udp: %d }
+`, upPort, pubPort)
+}
 
-// TestCheckExamples is the guard on the shipped examples: both must keep
-// loading and validating exactly as `freesbc check` runs them.
+// setPrivate points the edge's private socket at 127.0.0.1:port for the
+// rest of the test.
+func setPrivate(t *testing.T, port int) {
+	t.Helper()
+	testHookEdgeOptions = []edge.Option{edge.WithPrivateAddr(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", port)))}
+	t.Cleanup(func() { testHookEdgeOptions = nil })
+}
+
+// TestCheckExamples is the guard on the shipped example: it must keep
+// loading and validating exactly as `freesbc check` runs it.
 func TestCheckExamples(t *testing.T) {
-	t.Setenv("CARRIER_A_PASS", "x")
-	for _, name := range []string{"sbc.example.yaml", "edge.example.yaml"} {
-		if err := Check(filepath.Join("..", "..", name)); err != nil {
-			t.Errorf("Check(%s): %v", name, err)
-		}
+	if err := Check(filepath.Join("..", "..", "freesbc.example.yaml")); err != nil {
+		t.Errorf("Check(freesbc.example.yaml): %v", err)
 	}
 	if err := Check(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
 		t.Error("Check on a missing file must fail")
 	}
 }
 
-// TestRunStartsAndStopsOnCancel starts the trunk plane on a real port,
-// proves it is actually serving (a peer's OPTIONS is answered), and checks
+// TestRunStartsAndStopsOnCancel starts the edge plane on a real port,
+// proves it is actually serving (an OPTIONS to the public listener is answered), and checks
 // that cancelling the context is a clean shutdown (nil error) that releases
 // the listener.
 //
@@ -53,8 +69,9 @@ func TestRunStartsAndStopsOnCancel(t *testing.T) {
 	// a bind error from Run before the server answers; retry on fresh
 	// ports rather than flake.
 	for attempt := 1; ; attempt++ {
-		sipPort, peerPort := freeUDPPort(t), freeUDPPort(t)
-		done, cancel := startRun(t, sipPort, peerPort)
+		sipPort, privPort, upPort := freeUDPPort(t), freeUDPPort(t), freeUDPPort(t)
+		setPrivate(t, privPort)
+		done, cancel := startRun(t, sipPort, upPort)
 		err := waitServing(sipPort, done)
 		if err != nil {
 			cancel()
@@ -62,7 +79,7 @@ func TestRunStartsAndStopsOnCancel(t *testing.T) {
 				t.Logf("attempt %d: %v; retrying on fresh ports", attempt, err)
 				continue
 			}
-			t.Fatalf("trunk plane never served: %v", err)
+			t.Fatalf("edge plane never served: %v", err)
 		}
 
 		cancel()
@@ -85,27 +102,11 @@ func TestRunStartsAndStopsOnCancel(t *testing.T) {
 	}
 }
 
-// startRun runs the process with a one-peer trunk config on sipPort.
+// startRun runs the process with an edge-only config on sipPort.
 // Run's result arrives on done; the returned cancel stops it.
-func startRun(t *testing.T, sipPort, peerPort int) (<-chan error, context.CancelFunc) {
+func startRun(t *testing.T, sipPort, upPort int) (<-chan error, context.CancelFunc) {
 	t.Helper()
-	path := writeConfig(t, fmt.Sprintf(`
-listen:
-  sip:
-    - udp://127.0.0.1:%d
-  media:
-    port_range: %d-%d
-    public_ip: 127.0.0.1
-peers:
-  p1:
-    address: 127.0.0.1:%d
-    transport: udp
-    allowed_ips: [127.0.0.1/32]
-routes:
-  - name: r1
-    from: p1
-    to: [p1]
-`, sipPort, appMediaPortMin, appMediaPortMax, peerPort))
+	path := writeConfig(t, edgeRunYAML(sipPort, upPort))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -120,8 +121,7 @@ routes:
 	return done, cancel
 }
 
-// waitServing polls the trunk listener with OPTIONS from 127.0.0.1, an
-// allowed peer source, until it answers 200. It fails fast if Run returns
+// waitServing polls the public listener with OPTIONS from 127.0.0.1 until it answers 200. It fails fast if Run returns
 // first — which is how a bind error surfaces.
 func waitServing(sipPort int, done <-chan error) error {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -173,7 +173,7 @@ func isAddrInUse(err error) bool {
 
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "sbc.yaml")
+	path := filepath.Join(t.TempDir(), "freesbc.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}

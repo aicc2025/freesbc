@@ -50,15 +50,6 @@ func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-// handlePeers lists configured peers and their operator-visible status.
-func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
-	peers := s.deps.Peers()
-	if peers == nil {
-		peers = []PeerStatus{}
-	}
-	writeJSON(w, peers)
-}
-
 // handleConfigGet returns the running configuration with secrets redacted.
 // See redact.go: redactConfig never returns a live secret value.
 func (s *Server) handleConfigGet(w http.ResponseWriter, r *http.Request) {

@@ -38,22 +38,15 @@ func TestRunStartsFromOneSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sipPort, peerPort, adminPort := freeUDPPort(t), freeUDPPort(t), freeTCPPort(t)
-	trunk := fmt.Sprintf(`
-listen:
-  sip: [udp://127.0.0.1:%d]
-  media: { port_range: %d-%d, public_ip: 127.0.0.1 }
-peers:
-  p1: { address: 127.0.0.1:%d, allowed_ips: [127.0.0.1/32] }
-routes:
-  - { name: r1, from: p1, to: [p1] }
-`, sipPort, appMediaPortMin, appMediaPortMax, peerPort)
-	withAdmin := trunk + fmt.Sprintf(`
+	sipPort, privPort, upPort, adminPort := freeUDPPort(t), freeUDPPort(t), freeUDPPort(t), freeTCPPort(t)
+	setPrivate(t, privPort)
+	edgeYAML := edgeRunYAML(sipPort, upPort)
+	withAdmin := edgeYAML + fmt.Sprintf(`
 admin:
   listen: 127.0.0.1:%d
-  auth: { username: admin, password_hash: %q }
+  password_hash: %q
 `, adminPort, hash)
-	noAdmin, err := config.Parse([]byte(trunk))
+	noAdmin, err := config.Parse([]byte(edgeYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +67,7 @@ admin:
 		}
 	})
 	if err := waitServing(sipPort, done); err != nil {
-		t.Fatalf("trunk plane never served: %v", err)
+		t.Fatalf("edge plane never served: %v", err)
 	}
 	url := fmt.Sprintf("http://127.0.0.1:%d/api/status", adminPort)
 	deadline := time.Now().Add(3 * time.Second)

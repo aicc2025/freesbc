@@ -49,11 +49,13 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 		s.rejectMedia(req, tx, err)
 		return
 	}
-	out, err := s.prepareForward(req, from, to, dest, false)
+	hide, resp := s.carrierLeg(req, d, from, to)
+	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
 	}
+	s.noteOutbound(req, d, hide)
 	s.retargetInDialog(req, out, to, d)
 	fsip.SetContact(out, to.uri())
 	fsip.SetSDPBody(out, reOffer)
@@ -122,7 +124,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 				continue
 			}
 			is2xx := res.StatusCode/100 == 2
-			err := s.relayResponse(req, tx, res, func(relayed *sip.Response) error {
+			err := s.relayResponseHide(req, tx, res, resp, func(relayed *sip.Response) error {
 				fsip.SetContact(relayed, from.uri())
 				if len(res.Body()) > 0 && answer == nil {
 					reAnswer, parsedAnswer, err := s.rebuildInDialogAnswer(d, parsed, res.Body(), from.plane)
@@ -220,11 +222,19 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	if !ok {
 		return // nothing to forward it to; an ACK gets no response
 	}
-	out, err := s.prepareForward(req, from, to, dest, false)
+	hide, _ := s.carrierLeg(req, d, from, to)
+	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		return
 	}
+	s.noteOutbound(req, d, hide)
 	s.retargetInDialog(req, out, to, d)
+	if d == nil && !in.private() {
+		s.restoreCarrierRURI(req, out)
+	}
+	if !in.private() {
+		s.stampCarrier(out, req, d)
+	}
 	if err := s.client.WriteRequest(out, noBuild); err != nil {
 		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
 	}
@@ -279,6 +289,21 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 		s.reject(req, tx, 481, "Subscription Does Not Exist")
 		return
 	}
+	if in.private() && fsip.ToTag(req) == "" {
+		// An out-of-dialog request from the switch is classified by its
+		// Request-URI alone (classifySwitchRequest). Only a client token
+		// goes on to directionFor; a carrier accepts REGISTER, INVITE and
+		// OPTIONS only; anything else is nobody's.
+		switch kind, _ := s.classifySwitchRequest(req); kind {
+		case targetClient:
+		case targetCarrier:
+			s.respond(req, tx, methodNotAllowed(req))
+			return
+		default:
+			s.reject(req, tx, 404, "Not Found")
+			return
+		}
+	}
 	from, to, dest, d, ok := s.directionFor(req, in.private())
 	if !ok && req.Method == sip.NOTIFY && fsip.ToTag(req) != "" && in.private() {
 		from, to, dest, d, ok = s.relaxedNotifyDirection(req)
@@ -290,17 +315,25 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 	if d != nil {
 		d.noteCSeq(req)
 	}
-	out, err := s.prepareForward(req, from, to, dest, false)
+	hide, resp := s.carrierLeg(req, d, from, to)
+	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
 	}
+	s.noteOutbound(req, d, hide)
 	s.retargetInDialog(req, out, to, d)
+	if d == nil && !in.private() {
+		s.restoreCarrierRURI(req, out)
+	}
 	fsip.SetContact(out, to.uri())
+	if !in.private() {
+		s.stampCarrier(out, req, d)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
-	final, err := s.forwardAndRelay(ctx, req, tx, out)
+	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, nil)
 	if err != nil {
 		s.log.Warn("forward in-dialog request failed", "err", err,
 			"method", req.Method.String(), "sip_call_id", fsip.CallID(req))
@@ -461,13 +494,24 @@ func (s *Server) directionFor(req *sip.Request, onPrivate bool) (from, to side, 
 	// is found above; the record of which switch carries it is the whole
 	// stickiness guarantee — a dialog must never migrate between switches
 	// mid-call.)
+	//
+	// A carrier's request is hashed by the DID (as its INVITE was) and goes
+	// to the node's carrier port; stampCarrier names the carrier.
+	if _, isCarrier := s.carrierFallback(req); isCarrier {
+		if name, entry, found := s.selectUpstream(carrierHashUser(req)); found {
+			s.log.Debug("carrier in-dialog request without a dialog record; hashing upstream",
+				"sip_call_id", fsip.CallID(req), "upstream", name)
+			return from, s.topo.private, entry.carrierAddr().String(), nil, true
+		}
+		return side{}, side{}, "", nil, false
+	}
 	if name, entry, found := s.selectUpstream(hashUserFor(req)); found {
 		s.log.Debug("in-dialog request without a dialog record; hashing upstream",
 			"sip_call_id", fsip.CallID(req), "upstream", name)
 		return from, s.topo.private, entry.host, nil, true
 	}
-	// An empty pool cannot happen on a validated config: sip.upstream.address
-	// or sip.upstreams.nodes is exactly what enables the proxy at all.
+	// An empty pool cannot happen on a validated config: edge.switch
+	// is exactly what enables the proxy at all.
 	return side{}, side{}, "", nil, false
 }
 
@@ -546,6 +590,11 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 	req.AppendHeader(toward.via(fsip.NewBranch()))
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
+	if b.carrier && toward.plane == planePublic {
+		// Identity toward a carrier never names the switch (hide.go).
+		s.maskURI(&b.fromURI, toward.advIP)
+		s.maskURI(&b.toURI, toward.advIP)
+	}
 	from := &sip.FromHeader{Address: b.fromURI, Params: sip.NewParams()}
 	from.Params.Add("tag", b.fromTag)
 	req.AppendHeader(from)

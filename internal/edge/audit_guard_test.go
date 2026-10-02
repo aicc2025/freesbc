@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -48,7 +49,7 @@ func auditRawRequest(t *testing.T, c *net.UDPConn, dst string, msg string) {
 // banned; a malformed request from it afterwards — one sipgo would answer
 // with a stateless 400 before any handler runs — must get no response.
 func TestAuditBannedSourceGetsNoResponse(t *testing.T) {
-	h := startHarness(t, false)
+	h := startHarnessStrict(t, false, false)
 	c := auditUDP(t)
 	port := auditUDPPort(c)
 	auditRawRequest(t, c, h.publicUDP, fmt.Sprintf("OPTIONS sip:x@127.0.0.1 SIP/2.0\r\n"+
@@ -88,10 +89,18 @@ func TestAuditBannedSourceGetsNoResponse(t *testing.T) {
 // FreeSWITCH that rings forever: the extra one is refused and allocates
 // nothing.
 func TestAuditUnansweredInvitesPerSourceAreCapped(t *testing.T) {
-	h := startHarness(t, false)
+	// A registered client: carrier sources are exempt from the cap (see
+	// TestCarrierExemptFromEarlyCap), so the shared harness, which lists
+	// 127.0.0.1 as one, would not exercise it.
+	h := startHarnessStrict(t, false, false)
 	h.fs.setInviteHook(h.fs.silentHook())
 	c := auditUDP(t)
 	port := auditUDPPort(c)
+	if _, err := h.srv.loc.Put(Binding{Token: "flood-token", AOR: "1001@example.com", User: "1001",
+		Transport: "udp", Source: netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", port)),
+		ExpiresAt: time.Now().Add(time.Hour), CallID: "flood-reg"}); err != nil {
+		t.Fatal(err)
+	}
 	const n = maxEarlyPerSource + 1
 	for i := 0; i < n; i++ {
 		body := phoneOfferSDP(31000 + 2*i)

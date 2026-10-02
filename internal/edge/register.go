@@ -29,8 +29,15 @@ const registerTimeout = 32 * time.Second
 func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived inbound) {
 	src := arrived.src
 	if arrived.private() {
-		// FreeSWITCH does not register through its own edge proxy.
-		s.reject(req, tx, 403, "Forbidden")
+		// FreeSWITCH does not register through its own edge proxy. A
+		// REGISTER from the switch is only ever a carrier registration, and
+		// it is classified by its Request-URI like everything else the
+		// switch originates.
+		if kind, name := s.classifySwitchRequest(req); kind == targetCarrier {
+			s.registerToCarrier(req, tx, arrived, name)
+			return
+		}
+		s.reject(req, tx, 404, "Not Found")
 		return
 	}
 	if s.enumLimit.blocked(src.Addr()) {
@@ -89,10 +96,7 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived 
 	ctx, cancel := context.WithTimeout(context.Background(), registerTimeout)
 	defer cancel()
 
-	// The budget is re-read from the store on every REGISTER, so a reload
-	// changes it for the next registration without a restart; the node set
-	// is a startup snapshot like the rest of the topology (see budgets.go).
-	cooldown := s.upstreamPenalty()
+	cooldown := switchCooldown
 
 	// The user's hash order, cooled nodes at the tail: the registrar a
 	// refresh lands on is the one that holds the binding, and a node that

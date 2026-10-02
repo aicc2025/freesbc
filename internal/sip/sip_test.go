@@ -11,7 +11,7 @@ import (
 )
 
 // Unit tests for the shared primitives. Most of these functions are also
-// exercised end to end by the trunk and edge suites, but a regression in
+// exercised end to end by the edge suite, but a regression in
 // one of them should fail here, next to the code, and not only as an
 // unexplained call failure two packages away (audit P1-010).
 
@@ -92,13 +92,13 @@ func TestSourceAddrPort(t *testing.T) {
 	}
 }
 
-func TestParseHostPortAddrAndAddrOf(t *testing.T) {
-	if got, ok := ParseHostPortAddr("[::ffff:192.0.2.7]:5060"); !ok || got != netip.MustParseAddr("192.0.2.7") {
-		t.Errorf("ParseHostPortAddr(4in6) = %v, %v; want 192.0.2.7, true", got, ok)
+func TestHostPortAddrAndAddrOf(t *testing.T) {
+	if got, ok := parseHostPortAddr("[::ffff:192.0.2.7]:5060"); !ok || got != netip.MustParseAddr("192.0.2.7") {
+		t.Errorf("parseHostPortAddr(4in6) = %v, %v; want 192.0.2.7, true", got, ok)
 	}
 	for _, bad := range []string{"192.0.2.7", "name.example:5060", ""} {
-		if _, ok := ParseHostPortAddr(bad); ok {
-			t.Errorf("ParseHostPortAddr(%q) ok = true, want false", bad)
+		if _, ok := parseHostPortAddr(bad); ok {
+			t.Errorf("parseHostPortAddr(%q) ok = true, want false", bad)
 		}
 	}
 	if _, ok := AddrOf(nil); ok {
@@ -328,23 +328,6 @@ func TestGrantedExpires(t *testing.T) {
 		res := parseResponse(t, base+tc.extra+"Content-Length: 0\r\n\r\n")
 		if got := GrantedExpires(res, time.Hour); got != tc.want {
 			t.Errorf("%s: GrantedExpires = %v, want %v", tc.name, got, tc.want)
-		}
-	}
-}
-
-// audit: P2-SIP-008
-// An unset bind address is every interface; an unparseable one is an
-// error, never every interface.
-func TestParseBindIP(t *testing.T) {
-	if got, err := ParseBindIP(""); got.IsValid() || err != nil {
-		t.Errorf("ParseBindIP(\"\") = %v, %v; want the zero Addr, nil", got, err)
-	}
-	if got, err := ParseBindIP("10.1.2.3"); got != netip.MustParseAddr("10.1.2.3") || err != nil {
-		t.Errorf("ParseBindIP(10.1.2.3) = %v, %v", got, err)
-	}
-	for _, bad := range []string{"10.1.2", "eth0", "10.1.2.3:5060", " 10.1.2.3"} {
-		if got, err := ParseBindIP(bad); err == nil || got.IsValid() {
-			t.Errorf("ParseBindIP(%q) = %v, %v; want an error and no address", bad, got, err)
 		}
 	}
 }

@@ -314,7 +314,7 @@ func TestAuditMED005RelatchKeepsSendingToNewAddress(t *testing.T) {
 			Timeout: 30 * time.Second, AllowLoopback: true,
 		}
 	})
-	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: 5 * time.Second})
+	s, err := AllocateAcross(pool, pool, SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +390,7 @@ func TestAuditP1012RelayBufferMatchesMaxPacketSize(t *testing.T) {
 			Timeout: 30 * time.Second, AllowLoopback: true,
 		}
 	})
-	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchLoose}, Timeout: 5 * time.Second})
+	s, err := AllocateAcross(pool, pool, SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchLoose}, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,9 +430,9 @@ func TestAuditP1012RelayBufferMatchesMaxPacketSize(t *testing.T) {
 // which have room for the SRTP overhead: no allocation at all, not even
 // the slab the generic API draws from.
 func TestAuditMED007RelayPathInPlaceAllocatesNothing(t *testing.T) {
-	key := NewSDESKey()
-	send, _ := NewSRTPContext(SuiteAES128CM80, key)
-	recv, _ := NewSRTPContext(SuiteAES128CM80, key)
+	key := newTestKey()
+	send, _ := newTestCtx(key)
+	recv, _ := newTestCtx(key)
 	// Relay-style buffers: room for the SRTP overhead past the packet.
 	// AllocsPerRun makes one extra warm-up call, hence runs+1.
 	const runs = 1000
@@ -471,8 +471,7 @@ func TestAuditMED007RelayPathInPlaceAllocatesNothing(t *testing.T) {
 // audit: P2-MED-013
 //
 // Stats named side A "public" and side B "private", which is the edge
-// proxy's orientation only: on the trunk B2BUA both legs face carriers or
-// PBXs. The counters are now per side, with the orientation documented
+// proxy's orientation only: the plane is not otherwise public or private. The counters are now per side, with the orientation documented
 // per plane.
 func TestAuditMED013StatsAreSideNeutral(t *testing.T) {
 	var names []string

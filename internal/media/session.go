@@ -278,37 +278,25 @@ type SessionConfig struct {
 	// Latch is the per-side latching mode (zero value = strict).
 	Latch [2]LatchMode
 	// Timeout tears the session down after this much silence; zero means
-	// the pool's PlaneParams.Timeout (listen.media.rtp_timeout), read with
+	// the pool's PlaneParams.Timeout, read with
 	// the rest of the allocation's parameters.
 	Timeout time.Duration
 }
 
 // Session is the media half of one call: two port pairs relaying RTP and
-// RTCP between side A and side B. Lifecycle: Allocate → SetExpectedRemote
+// RTCP between side A and side B. Lifecycle: AllocateAcross → SetExpectedRemote
 // (from SDP) → Start → Close, or automatic teardown on RTP silence,
 // observable via Done. Safe for concurrent use.
 type Session struct {
 	// pools[side] is the pool that side's pair came from. Two entries
 	// rather than one shared pool because the edge proxy allocates side A
 	// from the PUBLIC plane and side B from the PRIVATE one (see
-	// AllocateAcross); the trunk B2BUA plane simply passes the same pool
-	// twice.
+	// AllocateAcross).
 	pools   [2]*PlanePool
 	pairs   [2]*portPair
 	rtp     [2]*latch
 	rtcp    [2]*latch
 	timeout time.Duration
-
-	// srtpIn/srtpOut are atomic.Pointer, not plain fields: the relay's forward
-	// loops (media/relay.go) read them per-packet from already-running
-	// goroutines, and SetSRTP can legitimately be called again after Start —
-	// e.g. a failover target's answer replacing an earlier target's early-media
-	// contexts (see processAnswerSDP in sig/b2bua.go). Plain fields would be a
-	// data race under -race and, worse, could tear under concurrent
-	// read/write. atomic.Pointer makes every Store/Load a single atomic op, so
-	// SetSRTP is safe to call at any point in the session's lifecycle.
-	srtpIn  [2]atomic.Pointer[SRTPContext] // decrypt packets received FROM this side (nil = plaintext)
-	srtpOut [2]atomic.Pointer[SRTPContext] // encrypt packets sent TO this side (nil = plaintext)
 
 	lastRx   [2]atomic.Int64 // per sending side: unix nanos of its last genuine packet
 	counters counters
@@ -331,21 +319,6 @@ const (
 
 // Stats returns the session's packet counters, per side.
 func (s *Session) Stats() Stats { return s.counters.snapshot() }
-
-// Allocate binds two port pairs (side A and side B) for one call from
-// this single pool — the trunk B2BUA plane's shape. The caller must Close
-// the session — or rely on silence teardown — to return the ports.
-// Returns ErrPortsExhausted when the range is full.
-func (p *PlanePool) Allocate(cfg SessionConfig) (*Session, error) {
-	return p.AllocateWith(p.params(), cfg)
-}
-
-// AllocateWith is Allocate with the pool's parameters supplied by the
-// caller, for a signalling plane that takes one config snapshot per call
-// and must not let the pool read a second, newer one (audit P2-TRK-005).
-func (p *PlanePool) AllocateWith(par PlaneParams, cfg SessionConfig) (*Session, error) {
-	return allocateAcross(p, par, p, par, cfg)
-}
 
 // AllocateAcross binds side A from poolA and side B from poolB. This is
 // the edge proxy's shape: the public side's socket lives in the public
@@ -455,42 +428,6 @@ func (s *Session) Relatch(side Side, addr netip.AddrPort) {
 		rtcp = netip.AddrPortFrom(addr.Addr(), 0) // re-arm the source check only
 	}
 	s.rtcp[side].relatch(rtcp)
-}
-
-// SetLatchMode changes both the RTP and RTCP latch policy of one side at
-// runtime, to align it with the peer actually selected for the call — e.g.
-// a failover winner whose media_latch differs from the target the session
-// was originally Allocated against. Safe to call at any point in the
-// session's lifecycle, including after packets have already latched (it
-// only changes how a not-yet-latched or future latch decides acceptance;
-// see latch.accept).
-func (s *Session) SetLatchMode(side Side, mode LatchMode) {
-	s.rtp[side].setMode(mode)
-	s.rtcp[side].setMode(mode)
-}
-
-// ParseLatchMode maps a peer's media_latch config string to a LatchMode.
-// Anything other than "loose" is strict (the safe default).
-func ParseLatchMode(s string) LatchMode {
-	if s == "loose" {
-		return LatchLoose
-	}
-	return LatchStrict
-}
-
-// SetSRTP installs the SRTP contexts for one side: inbound decrypts what we
-// receive from that side, outbound encrypts what we send to it. A nil context
-// means that direction is plaintext. Safe to call at any point in the
-// session's lifecycle, including after Start and more than once for the same
-// side (srtpIn/srtpOut are atomic.Pointer) — e.g. a B-leg failover target's
-// answer must be able to replace (or clear) the contexts an earlier target's
-// early media already installed, without racing the relay's forward loops.
-func (s *Session) SetSRTP(side Side, inbound, outbound *SRTPContext) {
-	if s.state.Load() == sessClosed {
-		return // the relay is gone; installing keys on it would be a lie
-	}
-	s.srtpIn[side].Store(inbound)
-	s.srtpOut[side].Store(outbound)
 }
 
 // Done is closed when the session ends (Close or silence timeout).

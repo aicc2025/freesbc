@@ -50,7 +50,7 @@ jobs:
               -ldflags "-s -w -X main.version=${TAG}" \
               -o "${stage}/freesbc" ./cmd/freesbc
             chmod 0755 "${stage}/freesbc"
-            cp README.md sbc.example.yaml edge.example.yaml "$stage"/
+            cp README.md freesbc.example.yaml "$stage"/
             if [ -f LICENSE ]; then cp LICENSE "$stage"/; fi
             tar -C dist -czf "dist/${name}.tar.gz" "$name"
             rm -rf "$stage"
@@ -67,8 +67,7 @@ jobs:
           # The CLI has no version flag, so confirm the stamped version is in the binary.
           grep -aqF "$TAG" "${dir}/freesbc"
           file "${dir}/freesbc"
-          "${dir}/freesbc" check -c "${dir}/edge.example.yaml"
-          CARRIER_A_PASS=x "${dir}/freesbc" check -c "${dir}/sbc.example.yaml"
+          "${dir}/freesbc" check -c "${dir}/freesbc.example.yaml"
 
       - name: publish release assets
         run: |

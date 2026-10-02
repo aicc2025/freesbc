@@ -17,7 +17,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// Audit tests (docs/audit/REPORT.md). A failing test here is the
+// Audit tests. A failing test here is the
 // deliverable: it demonstrates a defect. Do not make it pass by editing the
 // test; fix the production code instead.
 
@@ -29,7 +29,7 @@ func TestAuditConfigPutDoesNotEchoEnv(t *testing.T) {
 	const sentinel = "audit-sentinel-env-value"
 	t.Setenv("AUDIT_SECRET", sentinel)
 	s, _ := newTestServerWithFile(t, validCfg)
-	body := strings.Replace(validCfg, "public_ip: 127.0.0.1", `public_ip: "${AUDIT_SECRET}"`, 1)
+	body := strings.Replace(validCfg, "ip: 127.0.0.1", `ip: "${AUDIT_SECRET}"`, 1)
 	rr := authPUT(t, s, "/api/config", body, "")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("PUT status %d, want 400; body=%s", rr.Code, rr.Body.String())
@@ -48,10 +48,8 @@ func TestAuditAuthLimiterHoldsUnderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acfg := &config.AdminConfig{Listen: "127.0.0.1:0"}
-	acfg.Auth.Username = "admin"
-	acfg.Auth.PasswordHash = string(hash)
-	s := New(acfg, config.NewStore(mustCfg(t)), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
+	acfg := &config.AdminConfig{Listen: "127.0.0.1:0", PasswordHash: string(hash)}
+	s := New(acfg, nil, config.NewStore(mustCfg(t)), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 	h := s.handler()
 
 	const n = 50
@@ -144,7 +142,7 @@ func TestAuditConfigPutIfMatchIsAtomic(t *testing.T) {
 func TestAuditConfigPutFollowsSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "real.yaml")
-	link := filepath.Join(dir, "sbc.yaml")
+	link := filepath.Join(dir, "freesbc.yaml")
 	if err := os.WriteFile(target, []byte(validCfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -156,10 +154,8 @@ func TestAuditConfigPutFollowsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
-	acfg := &config.AdminConfig{Listen: "127.0.0.1:0"}
-	acfg.Auth.Username = "admin"
-	acfg.Auth.PasswordHash = string(hash)
-	s := New(acfg, config.NewStore(cfg), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), link)
+	acfg := &config.AdminConfig{Listen: "127.0.0.1:0", PasswordHash: string(hash)}
+	s := New(acfg, nil, config.NewStore(cfg), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), link)
 
 	body := validCfg + "# edited\n"
 	if rr := authPUT(t, s, "/api/config", body, ""); rr.Code != http.StatusOK {

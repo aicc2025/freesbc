@@ -23,7 +23,7 @@ func TestAllocationReadsParamsOncePerPool(t *testing.T) {
 	var n, na, nb atomic.Int32
 
 	p := countingPool("trunk", 23840, 23847, &n)
-	s, err := p.Allocate(SessionConfig{})
+	s, err := AllocateAcross(p, p, SessionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

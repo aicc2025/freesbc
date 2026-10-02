@@ -45,30 +45,6 @@ func TestPortRangeUnmarshalYAML(t *testing.T) {
 	}
 }
 
-func TestSIPListenUnmarshalYAML(t *testing.T) {
-	var s SIPListen
-	if err := s.UnmarshalYAML([]byte("udp://0.0.0.0:5060")); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if s.Transport != "udp" || s.Host != "0.0.0.0" || s.Port != 5060 {
-		t.Errorf("got %+v", s)
-	}
-	if err := s.UnmarshalYAML([]byte("tls://0.0.0.0:5061")); err != nil {
-		t.Fatalf("tls listener: %v", err)
-	}
-	for _, bad := range []string{"sctp://0.0.0.0:5060", "udp://nohost", "5060"} {
-		if err := s.UnmarshalYAML([]byte(bad)); err == nil {
-			t.Errorf("expected error for %q", bad)
-		}
-	}
-	if err := s.UnmarshalYAML([]byte(`"udp://0.0.0.0:5060"`)); err != nil {
-		t.Fatalf("quoted listener must parse: %v", err)
-	}
-	if s.Transport != "udp" || s.Port != 5060 {
-		t.Errorf("quoted: got %+v", s)
-	}
-}
-
 func TestParseRateLimit(t *testing.T) {
 	rl, err := ParseRateLimit("20/s per_ip")
 	if err != nil {

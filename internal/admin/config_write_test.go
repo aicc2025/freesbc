@@ -70,7 +70,7 @@ func TestEtagOf(t *testing.T) {
 func newTestServerWithFile(t *testing.T, yaml string) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "sbc.yaml")
+	path := filepath.Join(dir, "freesbc.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatalf("write temp config: %v", err)
 	}
@@ -79,11 +79,9 @@ func newTestServerWithFile(t *testing.T, yaml string) (*Server, string) {
 		t.Fatalf("parse test config: %v", err)
 	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
-	admincfg := &config.AdminConfig{Listen: "127.0.0.1:0"}
-	admincfg.Auth.Username = "admin"
-	admincfg.Auth.PasswordHash = string(hash)
+	admincfg := &config.AdminConfig{Listen: "127.0.0.1:0", PasswordHash: string(hash)}
 	store := config.NewStore(cfg)
-	s := New(admincfg, store, emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), path)
+	s := New(admincfg, nil, store, emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), path)
 	return s, path
 }
 
@@ -121,19 +119,11 @@ func authREQ(t *testing.T, s *Server, method, path, body, ifMatch string) *httpt
 }
 
 const validCfg = `
-listen:
-  sip: [udp://127.0.0.1:5060]
-  media:
-    port_range: 16384-32768
-    public_ip: 127.0.0.1
-peers:
-  p:
-    address: 127.0.0.1:5070
-    allowed_ips: [127.0.0.1/32]
-routes:
-  - name: r
-    from: p
-    to: [p]
+public: { ip: 127.0.0.1 }
+private: { ip: 10.77.0.2 }
+edge:
+  switch: [10.77.0.10:5060]
+  listen: { udp: 5060 }
 `
 
 func TestConfigRawReturnsFileAndEtag(t *testing.T) {
@@ -188,14 +178,8 @@ func TestConfigWriteStaleIfMatch409(t *testing.T) {
 }
 
 func TestConfigWritePreservesEnvRef(t *testing.T) {
-	t.Setenv("CFGTEST_PW", "s3cr3t")
-	// Block style, not flow style: an unquoted ${VAR} contains '{' and '}',
-	// which are flow indicators forbidden inside a flow-mapping plain scalar
-	// (YAML spec, ns-plain-safe-in) — `{ password: ${CFGTEST_PW} }` fails to
-	// parse. Block style has no such restriction.
-	base := strings.Replace(validCfg,
-		"    allowed_ips: [127.0.0.1/32]",
-		"    allowed_ips: [127.0.0.1/32]\n    auth:\n      username: u\n      password: ${CFGTEST_PW}", 1)
+	t.Setenv("CFGTEST_PW", "10.77.0.3")
+	base := strings.Replace(validCfg, "ip: 10.77.0.2", "ip: \"${CFGTEST_PW}\"", 1)
 	s, path := newTestServerWithFile(t, validCfg)
 	rr := authPUT(t, s, "/api/config", base, "")
 	if rr.Code != 200 {
@@ -205,7 +189,7 @@ func TestConfigWritePreservesEnvRef(t *testing.T) {
 	if !strings.Contains(string(got), "${CFGTEST_PW}") {
 		t.Fatal("env ref not preserved on disk (expansion leaked to file!)")
 	}
-	if strings.Contains(string(got), "s3cr3t") {
+	if strings.Contains(string(got), "10.77.0.3") {
 		t.Fatal("EXPANDED secret written to disk")
 	}
 }
@@ -304,7 +288,7 @@ func TestConfigWritePreservesFileMode(t *testing.T) {
 func TestWriteFileAtomicFollowsSymlinkAcrossDirs(t *testing.T) {
 	linkDir, targetDir := t.TempDir(), t.TempDir()
 	target := filepath.Join(targetDir, "real.yaml")
-	link := filepath.Join(linkDir, "sbc.yaml")
+	link := filepath.Join(linkDir, "freesbc.yaml")
 	if err := os.WriteFile(target, []byte("old\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
