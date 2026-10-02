@@ -9,7 +9,7 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-// Audit tests (docs/audit/REPORT.md). A failing test here is the
+// Audit tests. A failing test here is the
 // deliverable: it demonstrates a defect. Do not make it pass by editing the
 // test; fix the production code instead.
 

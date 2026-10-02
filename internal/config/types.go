@@ -1,4 +1,4 @@
-// Package config loads, validates, and hot-reloads the sbc.yaml
+// Package config loads, validates, and hot-reloads the freesbc.yaml
 // configuration file — the single source of truth for FreeSBC.
 package config
 

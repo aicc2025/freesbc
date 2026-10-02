@@ -191,7 +191,7 @@ func TestUpstreamHashPlacement(t *testing.T) {
 // The phone registers through the node its hash names (fs-a), so that is
 // where its binding lives. A DIFFERENT node (fs-b) then calls it, exactly
 // as FreeSWITCH would when the call arrives on the switch that owns the
-// trunk. The dialog's record names fs-b, and the phone's own in-dialog
+// number. The dialog's record names fs-b, and the phone's own in-dialog
 // traffic must go back there — the hash would send it to fs-a, which
 // knows nothing about the call and would answer 481.
 func TestUpstreamDialogStickiness(t *testing.T) {

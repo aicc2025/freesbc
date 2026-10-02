@@ -1,6 +1,6 @@
 package edge
 
-// Phase 3 SDP leak property test (docs/audit). The edge must build every
+// Phase 3 SDP leak property test. The edge must build every
 // SDP body from scratch: nothing learned from one leg's SDP (addresses,
 // ports, free text) may appear in the body it sends to the other leg
 // (docs/edge.md:65 "constructed, never derived"; CLAUDE.md topology

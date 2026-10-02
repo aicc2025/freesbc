@@ -9,9 +9,7 @@ import "sync/atomic"
 // The sides are SideA and SideB, not "public" and "private": that is only
 // the edge proxy's orientation. On the edge, A is the client-facing
 // (public) leg and B the FreeSWITCH-facing (private) one — the browser
-// and FreeSWITCH on a WebRTCSession. On the trunk B2BUA, A is the leg the
-// call arrived on and B the one it was placed on, and neither is public
-// or private.
+// and FreeSWITCH on a WebRTCSession.
 //
 // Deliberately not a full RTCP analytics engine: these are the numbers an
 // operator needs to answer "is media flowing, and which way isn't it",

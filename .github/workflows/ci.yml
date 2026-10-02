@@ -60,8 +60,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Linux routes all of 127/8, so the tests that bind 127.0.0.2 and
-      # 127.0.0.9 run here (they fail on a stock macOS runner).
+      # Linux routes all of 127/8, so the test that binds 127.0.0.2 runs
+      # here (it skips on a stock macOS runner).
       - name: go test -race
         run: go test -race -count=1 -timeout 20m ./... 2>&1 | grep -v 'UDP ref went negative on try close'; exit "${PIPESTATUS[0]}"
 

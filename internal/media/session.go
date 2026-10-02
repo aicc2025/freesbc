@@ -278,7 +278,7 @@ type SessionConfig struct {
 	// Latch is the per-side latching mode (zero value = strict).
 	Latch [2]LatchMode
 	// Timeout tears the session down after this much silence; zero means
-	// the pool's PlaneParams.Timeout (listen.media.rtp_timeout), read with
+	// the pool's PlaneParams.Timeout, read with
 	// the rest of the allocation's parameters.
 	Timeout time.Duration
 }

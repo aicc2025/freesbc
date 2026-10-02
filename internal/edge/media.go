@@ -177,7 +177,7 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 	var sess *mediaSession
 	if offer.Audio.WebRTC() {
 		if !s.webrtcEnabled {
-			return nil, errors.New("proxy: a WebRTC offer arrived but webrtc.enabled is false")
+			return nil, errors.New("proxy: a WebRTC offer arrived but WebRTC is not enabled")
 		}
 		if err := requireRTCPMux(offer); err != nil {
 			return nil, err
@@ -601,7 +601,7 @@ func (s *Server) pointMedia(sess *mediaSession, p plane, remote, rtcp netip.Addr
 // a=rtcp-mux and a=setup:actpass. That leg is allocated here, so the offer
 // carries its local credentials and socket, but it starts only when the
 // browser's answer arrives (negotiateFork → startOfferedWebRTC). The
-// caller must not ask for a browser leg while webrtc.enabled is false:
+// caller must not ask for a browser leg while WebRTC is not enabled:
 // there is no DTLS identity to offer (inviteToClient refuses with 488).
 func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (*offerResult, error) {
 	offer, err := s.parseSDP(offerBody)
@@ -686,8 +686,8 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (
 }
 
 // errWebRTCDisabled: a call to a browser needs a DTLS-SRTP offer, which
-// cannot be built without webrtc.enabled (there is no DTLS identity).
-var errWebRTCDisabled = errors.New("proxy: the client is a WebSocket (browser) client and webrtc.enabled is false, so no DTLS-SRTP offer can be built")
+// cannot be built without edge.listen.ws or edge.listen.wss (there is no DTLS identity).
+var errWebRTCDisabled = errors.New("proxy: the client is a WebSocket (browser) client and WebRTC is not enabled, so no DTLS-SRTP offer can be built")
 
 // isBrowserTransport reports whether a client registered over this public
 // transport is a browser, which accepts only DTLS-SRTP media. ws and wss

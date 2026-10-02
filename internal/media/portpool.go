@@ -61,9 +61,7 @@ type PlaneParams struct {
 // PlanePool allocates RTP/RTCP port pairs from one network plane's range.
 // The edge proxy runs two of them — a public pool facing phones and
 // browsers, a private pool facing FreeSWITCH — so the two planes can bind
-// different addresses and draw from disjoint ranges. The trunk B2BUA
-// plane runs a single pool and allocates both sides of a call from it
-// (Allocate).
+// different addresses and draw from disjoint ranges.
 //
 // Safe for concurrent use; allocation is O(range) in the worst case. A
 // candidate port is RESERVED under the mutex (so no two callers can ever
@@ -180,7 +178,7 @@ func (p *PlanePool) Stats() (inUse, total int) {
 		lo++
 	}
 	total = (hi - lo + 1) / 2
-	// listen.media.port_range is not validated for max > min, so an
+	// the rtp port range is not validated for max > min, so an
 	// inverted range is reachable and would report a negative capacity.
 	if total < 0 {
 		total = 0

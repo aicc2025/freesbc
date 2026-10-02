@@ -1,6 +1,6 @@
 package edge
 
-// Phase 3 audit tests for internal/edge (docs/audit/phase3/edge.md). Each
+// Phase 3 audit tests for internal/edge. Each
 // test asserts the behaviour the RFC or the documented invariant requires;
 // a FAIL confirms the Phase 2 finding named in its `// audit:` marker, a
 // PASS refutes it. None of these tests is meant to be made green by

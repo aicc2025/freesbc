@@ -11,7 +11,7 @@ import (
 )
 
 // Unit tests for the shared primitives. Most of these functions are also
-// exercised end to end by the trunk and edge suites, but a regression in
+// exercised end to end by the edge suite, but a regression in
 // one of them should fail here, next to the code, and not only as an
 // unexplained call failure two packages away (audit P1-010).
 

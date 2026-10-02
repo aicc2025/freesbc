@@ -510,8 +510,8 @@ func (s *Server) directionFor(req *sip.Request, onPrivate bool) (from, to side, 
 			"sip_call_id", fsip.CallID(req), "upstream", name)
 		return from, s.topo.private, entry.host, nil, true
 	}
-	// An empty pool cannot happen on a validated config: sip.upstream.address
-	// or sip.upstreams.nodes is exactly what enables the proxy at all.
+	// An empty pool cannot happen on a validated config: edge.switch
+	// is exactly what enables the proxy at all.
 	return side{}, side{}, "", nil, false
 }
 

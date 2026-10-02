@@ -424,7 +424,7 @@ func allowedPrefix(fail failFunc, label, s string) (netip.Prefix, bool) {
 		minBits = 32
 	}
 	if pfx.Bits() < minBits {
-		fail("%s: %q is wider than /%d (T-11 width cap)", label, s, minBits)
+		fail("%s: %q is wider than /%d", label, s, minBits)
 		return netip.Prefix{}, false
 	}
 	// Store the canonical (Masked) form: a non-canonical input like

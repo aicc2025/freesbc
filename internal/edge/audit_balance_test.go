@@ -1,6 +1,6 @@
 package edge
 
-// Phase 3 resource-balance tests for the edge plane (docs/audit). Each test
+// Phase 3 resource-balance tests for the edge plane. Each test
 // drives calls through one exit path and asserts that every port went back
 // to its pool, the dialog table (any state) and the registration table are
 // empty, and the goroutines owned by edge/media/pion are back to baseline

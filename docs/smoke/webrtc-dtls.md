@@ -61,67 +61,38 @@ FreeSWITCH version in your test notes.
 - Optional but recommended: an `admin:` section so the Prometheus metrics
   are readable (see below).
 
-### Minimal `edge.yaml`
+### Minimal `freesbc.yaml`
 
 ```yaml
-network:
-  public:
-    bind_ip: 0.0.0.0
-    advertised_ip: 203.0.113.7    # what the browser is told
-  private:
-    bind_ip: 10.77.0.2
+public:
+  ip: 203.0.113.7               # what the browser is told
 
-sip:
-  public:
-    wss:
-      enabled: true
-      bind: 0.0.0.0:18443
-      cert_file: /etc/freesbc/wss-cert.pem   # trusted by the browser
-      key_file: /etc/freesbc/wss-key.pem
-  private:
-    bind: 10.77.0.2:5060
-  upstream:
-    address: 10.77.0.10:5060      # FreeSWITCH: a literal IP:port
-    transport: udp
+private:
+  ip: 10.77.0.2
 
-rtp:
-  public:
-    bind_ip: 0.0.0.0
-    advertised_ip: 203.0.113.7
-    port_min: 30000
-    port_max: 39999
-  private:
-    bind_ip: 10.77.0.2
-    port_min: 40000
-    port_max: 49999
+rtp: 30000-39999                # one range, allocated per bind IP
 
-webrtc:
-  enabled: true
-  ice_mode: lite
-  rtcp_mux: true
-  # dtls_cert_file / dtls_key_file are optional; without them FreeSBC
-  # makes one self-signed identity per process.
+tls:
+  cert: /etc/freesbc/wss-cert.pem   # trusted by the browser
+  key: /etc/freesbc/wss-key.pem
 
-listen:
-  media:
-    rtp_timeout: 5m
+edge:
+  switch: [10.77.0.10:5060]     # FreeSWITCH: a literal IP:port
+  listen:
+    wss: 18443                  # enables WebRTC; DTLS identity is one
+                                # self-signed certificate per process
 
 admin:
   listen: 127.0.0.1:8080
-  auth:
-    username: admin
-    password_hash: "<bcrypt hash, cost >= 10>"
+  password_hash: "<bcrypt hash, cost >= 10>"
 ```
 
 Check the file, then run it:
 
 ```sh
-./freesbc check -c edge.yaml
-./freesbc run -c edge.yaml 2>&1 | tee freesbc.log
+./freesbc check -c freesbc.yaml
+./freesbc run -c freesbc.yaml 2>&1 | tee freesbc.log
 ```
-
-Do not set `peers:` or `listen.sip`: those turn on the trunk plane, and a
-trunk listener without peers fails validation.
 
 ## What to watch
 
@@ -160,19 +131,19 @@ Neither fingerprint and no ICE password is ever logged. Lines starting
 `ice ERROR` come from pion's own logger. `Failed to read UDP packet: … use
 of closed network connection` after a leg closes is expected noise.
 
-**Sockets.** Every browser leg holds one UDP socket in the public RTP range
-and a pair in the private range:
+**Sockets.** The public and private sides share one RTP range but bind
+different local addresses, so filter by local address. Every browser leg
+holds one UDP socket on the public IP and a pair on the private IP:
 
 ```sh
-ss -uanp 'sport >= :30000 and sport <= :39999' | grep -c freesbc   # public WebRTC legs
-ss -uanp 'sport >= :40000 and sport <= :49999' | grep -c freesbc   # private RTP/RTCP (2 per call)
+ss -uanp 'src 203.0.113.7 and sport >= :30000 and sport <= :39999' | grep -c freesbc   # public WebRTC legs
+ss -uanp 'src 10.77.0.2 and sport >= :30000 and sport <= :39999' | grep -c freesbc   # private RTP/RTCP (2 per call)
 ```
 
 **Stopping FreeSBC.** Stop it only between cases, with no call up. On
 the edge plane, shutdown (SIGINT/SIGTERM) ends every call's media but
 sends no BYE, by design (`docs/design.md` §4.5): a browser still in a
-call only sees its audio stop. That is not a regression. The trunk plane
-does BYE its calls on shutdown, but this runbook does not use it.
+call only sees its audio stop. That is not a regression.
 
 **Goroutines.** FreeSBC does not export a goroutine count. The #16 leak
 left pion ICE goroutines behind while the port was released correctly, so
@@ -216,7 +187,7 @@ of the call ending.
 
 ### T1: browser registers and calls FreeSWITCH, audio both ways
 
-1. Start FreeSBC with `edge.yaml`. Open `chrome://webrtc-internals` in
+1. Start FreeSBC with `freesbc.yaml`. Open `chrome://webrtc-internals` in
    another tab.
 2. In the browser client, register as `1000`.
    **Expected:** the client shows registered. In `fs_cli`,
@@ -265,16 +236,6 @@ late).
 4. Hang up from the browser.
    **Expected:** everything returns to baseline and the failure counters
    are unchanged.
-5. Repeat steps 1-4 with the browser registered over the other signaling
-   transport: `wss://` straight to the SBC's `sip.public.wss` listener
-   if you used a TLS-terminating proxy in front of `sip.public.ws`, or
-   the reverse. **Expected:** identical results; only the recorded
-   transport differs.
-
-If the SBC runs with `webrtc.enabled: false`, the same `originate` fails
-with **488** from the SBC and the log line `rejecting call to WebSocket
-client: webrtc.enabled is false, so no DTLS-SRTP offer can be built`; the
-browser never rings. That is expected and is not a T2 pass.
 
 ### T3: re-INVITE and hold during the call
 
@@ -309,8 +270,7 @@ browser never rings. That is expected and is not a T2 pass.
    shows `call ended`, and everything returns to baseline.
 3. Call `9196` again, then close the browser **tab** while the call is up.
    **Expected:** there is no BYE from the browser. Media stops, so after
-   `listen.media.rtp_timeout` (5 minutes here; set `rtp_timeout: 30s` to
-   shorten the test) the silence watchdog ends the call. FreeSWITCH gets
+   the 5-minute RTP silence timeout the silence watchdog ends the call. FreeSWITCH gets
    a BYE, and everything returns to baseline.
 
 ### T5 (negative): mismatched fingerprint fails before any media
@@ -347,7 +307,7 @@ same line, works too.)
 
 1. Note both failure counters and `freesbc_rtp_packets_tx_total`. On the
    FreeSBC host, start
-   `tcpdump -ni any 'udp and src host 10.77.0.2 and dst host 10.77.0.10 and portrange 40000-49999'`.
+   `tcpdump -ni any 'udp and src host 10.77.0.2 and dst host 10.77.0.10 and portrange 30000-39999'`.
    This captures RTP from the SBC to FreeSWITCH.
 2. Paste the snippet, register, and dial `9664`.
    **Expected:** the console prints `fingerprint tampered`, and signaling

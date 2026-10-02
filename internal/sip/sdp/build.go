@@ -44,8 +44,7 @@ type Build struct {
 	// DTLS turns on the browser-facing block: the UDP/TLS/RTP/SAVPF
 	// profile, ICE-Lite credentials, a host candidate at Address:Port, the
 	// certificate fingerprint and the DTLS role. It is the only secure
-	// profile this package builds — SDES/RTP/SAVP belongs to the trunk
-	// plane, which writes its own bodies.
+	// profile this package builds; SDES/RTP/SAVP is not built.
 	DTLS bool
 	// RTCPMux writes a=rtcp-mux.
 	RTCPMux     bool

@@ -33,8 +33,8 @@ type WebRTCSession struct {
 	priv     *portPair
 	privPool *PlanePool
 
-	// Private-side latches: the same hardened first-packet latching the
-	// trunk relay uses (see session.go). The public side needs none — ICE
+	// Private-side latches: the same hardened first-packet latching
+	// the plain RTP relay uses (see session.go). The public side needs none — ICE
 	// already fixed the peer, and SRTP authenticates every packet.
 	privRTP  *latch
 	privRTCP *latch

@@ -1,6 +1,6 @@
 package edge
 
-// Helpers shared by the audit_*_test.go files (docs/audit, Phase 3). They
+// Helpers shared by the audit_*_test.go files. They
 // reuse the package's existing harness and add only what the audit tests
 // need to observe: pool usage, the dialog table, owned goroutines, and a
 // fake switch whose BYE handler a test chooses.

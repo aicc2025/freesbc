@@ -409,12 +409,12 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	// A client registered over ws or wss is a browser: it accepts only a
-	// DTLS-SRTP offer, and without webrtc.enabled there is no DTLS identity
-	// to build one with. Offering plain RTP would only ring the browser
+	// DTLS-SRTP offer, and without edge.listen.ws or edge.listen.wss there is no
+	// DTLS identity to build one with. Offering plain RTP would only ring the browser
 	// into a failure it reports as an opaque 480, so refuse here, loudly.
 	toBrowser := isBrowserTransport(binding.Transport)
 	if toBrowser && !s.webrtcEnabled {
-		s.log.Warn("rejecting call to WebSocket client: webrtc.enabled is false, so no DTLS-SRTP offer can be built",
+		s.log.Warn("rejecting call to WebSocket client: WebRTC is not enabled, so no DTLS-SRTP offer can be built",
 			"sip_call_id", fsip.CallID(req), "aor", binding.AOR, "transport", binding.Transport)
 		s.reject(req, tx, 488, "Not Acceptable Here")
 		return

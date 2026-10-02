@@ -471,8 +471,7 @@ func TestAuditMED007RelayPathInPlaceAllocatesNothing(t *testing.T) {
 // audit: P2-MED-013
 //
 // Stats named side A "public" and side B "private", which is the edge
-// proxy's orientation only: on the trunk B2BUA both legs face carriers or
-// PBXs. The counters are now per side, with the orientation documented
+// proxy's orientation only: the plane is not otherwise public or private. The counters are now per side, with the orientation documented
 // per plane.
 func TestAuditMED013StatsAreSideNeutral(t *testing.T) {
 	var names []string

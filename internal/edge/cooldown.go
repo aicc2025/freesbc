@@ -5,8 +5,7 @@ import (
 	"time"
 )
 
-// cooldownTable tracks per-name cooldowns passively, mirroring the trunk
-// plane's endpointHealth: a target that produced no response at all across a
+// cooldownTable tracks per-name cooldowns passively: a target that produced no response at all across a
 // whole attempt (a failDial) is Penalized and then skipped in favour of
 // alternatives until the cooldown window elapses — lazily, with no
 // background sweeper — or a later successful exchange Recovers it. There is
