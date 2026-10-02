@@ -238,12 +238,8 @@ type RouteTransform struct {
 }
 
 type ShieldConfig struct {
-	RateLimit string `yaml:"rate_limit"`
-	// PeerRateLimit is the looser per-IP limit applied to CONFIGURED peer
-	// sources: peers are exempt from the ban/scanner plane but
-	// not from rate limiting, so a spoofed peer source still has a ceiling.
-	PeerRateLimit string  `yaml:"peer_rate_limit"`
-	AutoBan       AutoBan `yaml:"auto_ban"`
+	RateLimit string  `yaml:"rate_limit"`
+	AutoBan   AutoBan `yaml:"auto_ban"`
 }
 
 // AutoBan holds the scanner ban's lifetime: a source the edge shield
@@ -313,9 +309,6 @@ func withDefaults(c *Config) {
 	proxyWithDefaults(c)
 	if c.Shield.RateLimit == "" {
 		c.Shield.RateLimit = "20/s per_ip"
-	}
-	if c.Shield.PeerRateLimit == "" {
-		c.Shield.PeerRateLimit = "200/s per_ip"
 	}
 	if c.Shield.AutoBan.Duration == 0 {
 		c.Shield.AutoBan.Duration = Duration(time.Hour)

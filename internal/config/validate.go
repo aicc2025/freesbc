@@ -350,9 +350,6 @@ func (c *Config) validateShield(fail failFunc) {
 	if _, err := ParseRateLimit(c.Shield.RateLimit); err != nil {
 		fail("shield.rate_limit: %v", c.envRedact.detail(c.Shield.RateLimit, err))
 	}
-	if _, err := ParseRateLimit(c.Shield.PeerRateLimit); err != nil {
-		fail("shield.peer_rate_limit: %v", c.envRedact.detail(c.Shield.PeerRateLimit, err))
-	}
 	// withDefaults fills a zero value before validate normally runs, so this
 	// only trips on an explicitly negative value reaching here (e.g. a
 	// Config built directly without withDefaults). Checked defensively

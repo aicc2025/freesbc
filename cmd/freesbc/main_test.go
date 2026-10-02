@@ -21,11 +21,19 @@ func TestPositionalArgumentIsUsageError(t *testing.T) {
 	// A valid ./sbc.yaml would make the old behaviour exit 0.
 	good := filepath.Join(dir, "sbc.yaml")
 	if err := os.WriteFile(good, []byte(`
-listen: { sip: [udp://127.0.0.1:5060] }
-peers:
-  p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
-routes:
-  - { name: r, from: p, to: [p] }
+network:
+  public:  { bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1 }
+  private: { bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1 }
+sip:
+  public:
+    udp: { enabled: true, bind: "127.0.0.1:5060" }
+  private:
+    bind: "127.0.0.1:5061"
+  upstream:
+    address: 127.0.0.1:5062
+rtp:
+  public:  { port_min: 10010, port_max: 10019 }
+  private: { port_min: 10020, port_max: 10029 }
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}

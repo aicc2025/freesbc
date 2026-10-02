@@ -1,8 +1,11 @@
 package media
 
 import (
+	"fmt"
+
 	"bytes"
 	"crypto/rand"
+	"github.com/pion/srtp/v3"
 	"sync"
 	"testing"
 )
@@ -27,7 +30,7 @@ func testRTCPPacket() []byte {
 
 func mustKey(t *testing.T) []byte {
 	t.Helper()
-	k := make([]byte, SDESKeyLen)
+	k := make([]byte, testKeyLen)
 	if _, err := rand.Read(k); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
@@ -36,11 +39,11 @@ func mustKey(t *testing.T) []byte {
 
 func TestSRTPContextRoundTripRTP(t *testing.T) {
 	key := mustKey(t)
-	enc, err := NewSRTPContext(SuiteAES128CM80, key)
+	enc, err := newTestCtx(key)
 	if err != nil {
 		t.Fatalf("enc ctx: %v", err)
 	}
-	dec, err := NewSRTPContext(SuiteAES128CM80, key)
+	dec, err := newTestCtx(key)
 	if err != nil {
 		t.Fatalf("dec ctx: %v", err)
 	}
@@ -63,8 +66,8 @@ func TestSRTPContextRoundTripRTP(t *testing.T) {
 
 func TestSRTPContextRoundTripRTCP(t *testing.T) {
 	key := mustKey(t)
-	enc, _ := NewSRTPContext(SuiteAES128CM32, key)
-	dec, _ := NewSRTPContext(SuiteAES128CM32, key)
+	enc, _ := newTestCtx(key)
+	dec, _ := newTestCtx(key)
 	plain := testRTCPPacket()
 	cipher, ok := enc.protectRTCP(append([]byte(nil), plain...))
 	if !ok {
@@ -81,8 +84,8 @@ func TestSRTPContextRoundTripRTCP(t *testing.T) {
 
 func TestSRTPContextTamperedPacketDropped(t *testing.T) {
 	key := mustKey(t)
-	enc, _ := NewSRTPContext(SuiteAES128CM80, key)
-	dec, _ := NewSRTPContext(SuiteAES128CM80, key)
+	enc, _ := newTestCtx(key)
+	dec, _ := newTestCtx(key)
 	cipher, _ := enc.protectRTP(testRTPPacket())
 	cipher[len(cipher)-1] ^= 0xff // corrupt the auth tag
 	if _, ok := dec.unprotectRTP(cipher); ok {
@@ -91,8 +94,8 @@ func TestSRTPContextTamperedPacketDropped(t *testing.T) {
 }
 
 func TestSRTPContextWrongKeyDropped(t *testing.T) {
-	enc, _ := NewSRTPContext(SuiteAES128CM80, mustKey(t))
-	dec, _ := NewSRTPContext(SuiteAES128CM80, mustKey(t)) // different key
+	enc, _ := newTestCtx(mustKey(t))
+	dec, _ := newTestCtx(mustKey(t)) // different key
 	cipher, _ := enc.protectRTP(testRTPPacket())
 	if _, ok := dec.unprotectRTP(cipher); ok {
 		t.Fatal("wrong-key decrypt must fail (ok=false)")
@@ -100,7 +103,7 @@ func TestSRTPContextWrongKeyDropped(t *testing.T) {
 }
 
 func TestSRTPContextBadKeyLength(t *testing.T) {
-	if _, err := NewSRTPContext(SuiteAES128CM80, make([]byte, 10)); err == nil {
+	if _, err := newTestCtx(make([]byte, 10)); err == nil {
 		t.Fatal("want error for short key value")
 	}
 }
@@ -110,8 +113,8 @@ func TestSRTPContextBadKeyLength(t *testing.T) {
 // a captured valid packet must never be re-injected into the stream.
 func TestSRTPReplayDropped(t *testing.T) {
 	key := mustKey(t)
-	enc, _ := NewSRTPContext(SuiteAES128CM80, key)
-	dec, _ := NewSRTPContext(SuiteAES128CM80, key)
+	enc, _ := newTestCtx(key)
+	dec, _ := newTestCtx(key)
 	cipher, ok := enc.protectRTP(testRTPPacket())
 	if !ok {
 		t.Fatal("protectRTP failed")
@@ -128,8 +131,8 @@ func TestSRTPReplayDropped(t *testing.T) {
 // RTCP replay detector is a separate window, so it needs its own guard).
 func TestSRTCPReplayDropped(t *testing.T) {
 	key := mustKey(t)
-	enc, _ := NewSRTPContext(SuiteAES128CM32, key)
-	dec, _ := NewSRTPContext(SuiteAES128CM32, key)
+	enc, _ := newTestCtx(key)
+	dec, _ := newTestCtx(key)
 	cipher, ok := enc.protectRTCP(testRTCPPacket())
 	if !ok {
 		t.Fatal("protectRTCP failed")
@@ -150,8 +153,8 @@ func TestSRTCPReplayDropped(t *testing.T) {
 // three times would just produce one ciphertext three times.
 func TestSRTPReplayWindowAcceptsOutOfOrder(t *testing.T) {
 	key := mustKey(t)
-	enc, _ := NewSRTPContext(SuiteAES128CM80, key)
-	dec, _ := NewSRTPContext(SuiteAES128CM80, key)
+	enc, _ := newTestCtx(key)
+	dec, _ := newTestCtx(key)
 	plain := testRTPPacket()
 	p1 := append([]byte(nil), plain...)
 	p2 := append([]byte(nil), plain...)
@@ -181,7 +184,7 @@ func TestSRTPReplayWindowAcceptsOutOfOrder(t *testing.T) {
 // does) must be race-free — the wrapper's mutex guards pion's lockless Context.
 func TestSRTPContextConcurrentRTPandRTCP(t *testing.T) {
 	key := mustKey(t)
-	enc, _ := NewSRTPContext(SuiteAES128CM80, key)
+	enc, _ := newTestCtx(key)
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(2)
@@ -191,26 +194,22 @@ func TestSRTPContextConcurrentRTPandRTCP(t *testing.T) {
 	wg.Wait() // -race is the assertion
 }
 
-func TestNewSDESKeyLengthAndRandomness(t *testing.T) {
-	a := NewSDESKey()
-	if len(a) != SDESKeyLen {
-		t.Fatalf("key value len=%d, want %d", len(a), SDESKeyLen)
+// testKeyLen is a 16-byte master key plus 14-byte master salt.
+const testKeyLen = 30
+
+func newTestKey() []byte {
+	k := make([]byte, testKeyLen)
+	if _, err := rand.Read(k); err != nil {
+		panic(err)
 	}
-	if string(a) == string(NewSDESKey()) {
-		t.Fatal("two generated keys are identical (not random)")
-	}
+	return k
 }
 
-func TestParseCryptoSuiteRoundTrip(t *testing.T) {
-	for _, want := range []CryptoSuite{SuiteAES128CM80, SuiteAES128CM32} {
-		got, ok := ParseCryptoSuite(want.String())
-		if !ok || got != want {
-			t.Errorf("ParseCryptoSuite(%q) = %v/%v, want %v/true", want.String(), got, ok, want)
-		}
+// newTestCtx builds a context for AES_CM_128_HMAC_SHA1_80 from key
+// (16-byte master key followed by 14-byte master salt).
+func newTestCtx(key []byte) (*SRTPContext, error) {
+	if len(key) != testKeyLen {
+		return nil, fmt.Errorf("bad key length %d", len(key))
 	}
-	for _, name := range []string{"AES_256_CM_HMAC_SHA1_80", "", "aes_cm_128_hmac_sha1_80"} {
-		if _, ok := ParseCryptoSuite(name); ok {
-			t.Errorf("ParseCryptoSuite(%q) accepted an unsupported suite", name)
-		}
-	}
+	return newSRTPContextFromKeys(srtp.ProtectionProfileAes128CmHmacSha1_80, key[:16], key[16:])
 }

@@ -30,17 +30,11 @@ import (
 // no SIP dialog or media session. app converts the planes' own records
 // into these.
 type Call struct {
-	ID            string // admin call ID: what KillCall takes
+	ID            string // admin call ID: admin call ID
 	CallID        string // A-leg SIP Call-ID, for correlating with traces
 	FromPeer      string
 	ToPeer        string
 	StartUnixNano int64
-}
-
-// PeerStatus is one peer's operator-visible status.
-type PeerStatus struct {
-	Name, Address, Transport, SRTP string
-	Register, Registered           bool
 }
 
 // ShieldStats mirrors the shield's activity snapshot for the API/metrics.
@@ -52,11 +46,9 @@ type ShieldStats struct {
 // for concurrent use (they read already-synchronized structures).
 type Deps struct {
 	Calls       func() []Call
-	Peers       func() []PeerStatus
 	Ports       func() (inUse, total int)
 	Shield      func() ShieldStats
 	ActiveCalls func() int
-	KillCall    func(id string) bool
 	Version     string
 	// Listeners lists the SIP listeners the running planes bound, as
 	// transport://host:port. They are restart-only, so this comes from the
@@ -133,8 +125,6 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("/api/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
-	mux.HandleFunc("DELETE /api/calls/{id}", s.requireAuth(s.handleKickCall))
-	mux.HandleFunc("/api/peers", s.requireAuth(s.handlePeers))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
 	mux.HandleFunc("/", s.requireAuth(s.handleUI)) // SPA catch-all (behind auth)
@@ -568,18 +558,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-// handleKickCall tears down a live call by id (URL-decoded by PathValue).
-// 204 if the call was found and killed, 404 otherwise.
-func (s *Server) handleKickCall(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if s.deps.KillCall != nil && s.deps.KillCall(id) {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	http.Error(w, "no such active call", http.StatusNotFound)
-}
-
-// handleStatus, handleCalls, handlePeers, handleConfig, and handleConfigGet
+// handleStatus, handleCalls, handleConfig, and handleConfigGet
 // are implemented in api.go. handleConfigRaw and handleConfigWrite are
 // implemented in config_write.go. handleMetrics is implemented in
 // metrics.go. handleUI is implemented in webui.go.

@@ -153,10 +153,10 @@ func FuzzAuditDemux(f *testing.F) {
 // transform the relay applies to inbound packets, for both suites.
 func FuzzAuditSRTPUnprotect(f *testing.F) {
 	auditSeedPackets(f)
-	key := bytes.Repeat([]byte{0x5a}, SDESKeyLen)
+	key := bytes.Repeat([]byte{0x5a}, testKeyLen)
 	f.Fuzz(func(t *testing.T, b []byte) {
-		for _, suite := range []CryptoSuite{SuiteAES128CM80, SuiteAES128CM32} {
-			c, err := NewSRTPContext(suite, key)
+		for range 1 {
+			c, err := newTestCtx(key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -177,11 +177,11 @@ func FuzzAuditSRTPUnprotect(f *testing.F) {
 // bytes under the same key. See P3-MED-001.
 func FuzzAuditSRTPRoundTrip(f *testing.F) {
 	auditSeedPackets(f)
-	key := bytes.Repeat([]byte{0x5a}, SDESKeyLen)
+	key := bytes.Repeat([]byte{0x5a}, testKeyLen)
 	f.Fuzz(func(t *testing.T, b []byte) {
-		for _, suite := range []CryptoSuite{SuiteAES128CM80, SuiteAES128CM32} {
-			c, _ := NewSRTPContext(suite, key)
-			r, _ := NewSRTPContext(suite, key)
+		for range 1 {
+			c, _ := newTestCtx(key)
+			r, _ := newTestCtx(key)
 			if p, ok := c.protectRTP(append([]byte(nil), b...)); ok {
 				if got, ok := r.unprotectRTP(p); !ok || !bytes.Equal(got, b) {
 					t.Fatalf("SRTP round trip failed (P3-MED-001): ok=%v", ok)

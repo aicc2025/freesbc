@@ -9,7 +9,7 @@ import (
 func newLooseSession(t *testing.T, minPort, maxPort int, timeout time.Duration) *Session {
 	t.Helper()
 	p := testPool(minPort, maxPort)
-	s, err := p.Allocate(SessionConfig{
+	s, err := AllocateAcross(p, p, SessionConfig{
 		Latch:   [2]LatchMode{LatchLoose, LatchLoose},
 		Timeout: timeout,
 	})
@@ -51,90 +51,6 @@ func pump(t *testing.T, src, dst *net.UDPConn, payload string) {
 		if time.Now().After(deadline) {
 			t.Fatalf("packet %q never forwarded", payload)
 		}
-	}
-}
-
-// TestWatchdogNotRefreshedByGarbage is the T-22 (D5-4) red test: traffic
-// that passes the latch but fails SRTP authentication must not keep the
-// call alive — the silence watchdog may only see AUTHENTICATED media.
-// Pre-fix, lastRx refreshed on latch-accept alone, so a party who knows
-// the latched source address could renew rtp_timeout indefinitely with
-// junk and a dead call never tore down.
-func TestWatchdogNotRefreshedByGarbage(t *testing.T) {
-	s := newLooseSession(t, 23300, 23315, 500*time.Millisecond)
-	key := mustKey(t)
-	peerEnc, _ := NewSRTPContext(SuiteAES128CM80, key)
-	sbcInA, _ := NewSRTPContext(SuiteAES128CM80, key)
-	s.SetSRTP(SideA, sbcInA, nil)
-	s.SetSRTP(SideB, nil, nil)
-	s.Start()
-	ea := dialSide(t, s, SideA)
-
-	// One VALID packet: latches the session and arms the watchdog with a
-	// genuine refresh.
-	cipher, ok := peerEnc.protectRTP(append([]byte(nil), testRTPPacket()...))
-	if !ok {
-		t.Fatal("encrypt failed")
-	}
-	if _, err := ea.Write(cipher); err != nil {
-		t.Fatal(err)
-	}
-
-	// Hammer garbage that passes the loose latch but fails SRTP auth, well
-	// past the 500ms timeout — post-fix the watchdog must still fire.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		_, _ = ea.Write([]byte("garbage-not-srtp"))
-		time.Sleep(20 * time.Millisecond)
-	}
-	select {
-	case <-s.Done():
-		// Watchdog fired despite the garbage stream.
-	case <-time.After(2 * time.Second):
-		t.Fatal("garbage traffic kept the session alive past rtp_timeout")
-	}
-}
-
-// TestWatchdogRefreshedByValidSRTP is T-22's counterpart: AUTHENTICATED
-// media must keep renewing the watchdog — the fix gates the refresh, it
-// doesn't break legitimate keepalive.
-func TestWatchdogRefreshedByValidSRTP(t *testing.T) {
-	s := newLooseSession(t, 23320, 23335, 500*time.Millisecond)
-	key := mustKey(t)
-	peerEnc, _ := NewSRTPContext(SuiteAES128CM80, key)
-	sbcInA, _ := NewSRTPContext(SuiteAES128CM80, key)
-	s.SetSRTP(SideA, sbcInA, nil)
-	s.SetSRTP(SideB, nil, nil)
-	s.Start()
-	ea := dialSide(t, s, SideA)
-	// The watchdog watches each direction (P2-MED-004), so side B talks
-	// too; plaintext, as SideB has no SRTP.
-	eb := dialSide(t, s, SideB)
-
-	// Valid packets every 200ms (well under the 500ms timeout) keep the
-	// session alive for 1.2s — more than double the timeout.
-	deadline := time.Now().Add(1200 * time.Millisecond)
-	seq := byte(0)
-	for time.Now().Before(deadline) {
-		plain := testRTPPacket()
-		plain[2], plain[3] = 0, seq // distinct seq per packet (SRTP index)
-		seq++
-		cipher, ok := peerEnc.protectRTP(plain)
-		if !ok {
-			t.Fatal("encrypt failed")
-		}
-		if _, err := ea.Write(cipher); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := eb.Write(testRTPPacket()); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	select {
-	case <-s.Done():
-		t.Fatal("authenticated media must keep the session alive")
-	default:
 	}
 }
 
@@ -189,7 +105,7 @@ func TestRelayDropsHijackPackets(t *testing.T) {
 
 func TestRelaySilenceTimeoutReleasesPorts(t *testing.T) {
 	p := testPool(23200, 23203) // exactly one session's worth
-	s, err := p.Allocate(SessionConfig{
+	s, err := AllocateAcross(p, p, SessionConfig{
 		Latch:   [2]LatchMode{LatchLoose, LatchLoose},
 		Timeout: 150 * time.Millisecond,
 	})
@@ -202,7 +118,7 @@ func TestRelaySilenceTimeoutReleasesPorts(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("session did not tear down on RTP silence")
 	}
-	s2, err := p.Allocate(SessionConfig{Timeout: time.Minute})
+	s2, err := AllocateAcross(p, p, SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatalf("ports not released after silence teardown: %v", err)
 	}
@@ -234,7 +150,7 @@ func TestRelayActivityDefersTimeout(t *testing.T) {
 
 func TestRelayPanicRecoveryKillsSession(t *testing.T) {
 	p := testPool(23260, 23267)
-	s, err := p.Allocate(SessionConfig{Timeout: time.Minute})
+	s, err := AllocateAcross(p, p, SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}

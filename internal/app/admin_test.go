@@ -9,7 +9,6 @@ import (
 
 	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/edge"
-	"github.com/freesbc/freesbc/internal/trunk"
 )
 
 // edgeOnlyYAML is an edge-only config. edge.New binds nothing, so its
@@ -44,7 +43,7 @@ func TestAdminDepsReportRunningPlanes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := adminDeps(store, trunk.NewMediaPool(store), nil, edgeSrv, "test")
+	deps := adminDeps(edgeSrv, "test")
 
 	if inUse, total := deps.Ports(); inUse != 0 || total != 10 {
 		t.Errorf("Ports = %d/%d, want 0/10 (the edge pools' 5+5 pairs)", inUse, total)

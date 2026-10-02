@@ -58,7 +58,8 @@ type Server struct {
 	srv    *sipgo.Server
 	client *sipgo.Client
 
-	shield *shield.Shield
+	shield   *shield.Shield
+	shieldMu sync.RWMutex // guards the assignment in Run against ShieldStats
 
 	// marker stamps requests that reach a trusted socket (the private bind
 	// and the PSTN listener) and recognises the stamp again in guard. It is
@@ -114,10 +115,7 @@ var udpMTUOnce sync.Once
 // any legitimate SIP message and far below anything that could be used to
 // amplify traffic.
 //
-// This is a process-wide setting in sipgo with no per-user-agent override,
-// so it also applies to the trunk plane. That plane has the same limit and
-// the same failure mode, so raising it fixes both rather than trading one
-// for the other.
+// This is a process-wide setting in sipgo with no per-user-agent override.
 func raiseUDPSendLimit() {
 	udpMTUOnce.Do(func() {
 		if sip.UDPMTUSize < 8192 {
@@ -203,6 +201,18 @@ func (s *Server) PortStats() (inUse, total int) {
 	return pu + qu, pt + qt
 }
 
+// ShieldStats is the shield's drop counters for the admin API. It is the
+// zero value until Run has created the shield.
+func (s *Server) ShieldStats() shield.Stats {
+	s.shieldMu.RLock()
+	sh := s.shield
+	s.shieldMu.RUnlock()
+	if sh == nil {
+		return shield.Stats{DropsByReason: map[string]int64{}}
+	}
+	return sh.Stats()
+}
+
 // Listeners is the listener set Run binds, as transport://host:port, from
 // the startup snapshot (the set is restart-only).
 func (s *Server) Listeners() []string {
@@ -253,9 +263,11 @@ func (s *Server) Run(ctx context.Context) error {
 	defer client.Close()
 	s.client = client
 
-	sh := shield.NewNoKernel(s.store, s.log)
+	sh := shield.New(s.store, s.log)
 	defer sh.Close()
+	s.shieldMu.Lock()
 	s.shield = sh
+	s.shieldMu.Unlock()
 
 	srv.OnRegister(s.guard(s.onRegister))
 	srv.OnInvite(s.guard(s.onInvite))
@@ -466,8 +478,7 @@ func (l listener) Close() {
 
 // Serve drives the socket through sipgo's transport layer until it closes.
 //
-// This deliberately bypasses sipgo's ListenAndServe wrappers, for the same
-// reason package trunk does: as of v1.4.3 those close their internal
+// This deliberately bypasses sipgo's ListenAndServe wrappers, because as of v1.4.3 those close their internal
 // listener from an unsynchronised variable written by Serve and read by a
 // separate shutdown goroutine, which the race detector correctly flags on
 // every graceful shutdown. Owning the handle here gives a clean

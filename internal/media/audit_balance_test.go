@@ -54,7 +54,7 @@ func TestAuditMediaPortPoolAndGoroutineBalance(t *testing.T) {
 	}
 
 	t.Run("SessionCloseAfterStart", func(t *testing.T) {
-		s, err := pub.Allocate(SessionConfig{Timeout: time.Minute})
+		s, err := AllocateAcross(pub.PlanePool, pub.PlanePool, SessionConfig{Timeout: time.Minute})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -64,7 +64,7 @@ func TestAuditMediaPortPoolAndGoroutineBalance(t *testing.T) {
 		check(t)
 	})
 	t.Run("SessionCloseBeforeStart_StartAfterClose", func(t *testing.T) {
-		s, err := pub.Allocate(SessionConfig{Timeout: time.Minute})
+		s, err := AllocateAcross(pub.PlanePool, pub.PlanePool, SessionConfig{Timeout: time.Minute})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -86,7 +86,7 @@ func TestAuditMediaPortPoolAndGoroutineBalance(t *testing.T) {
 		check(t)
 	})
 	t.Run("SessionSilenceTimeout", func(t *testing.T) {
-		s, err := pub.Allocate(SessionConfig{Timeout: 100 * time.Millisecond})
+		s, err := AllocateAcross(pub.PlanePool, pub.PlanePool, SessionConfig{Timeout: 100 * time.Millisecond})
 		if err != nil {
 			t.Fatal(err)
 		}

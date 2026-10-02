@@ -34,8 +34,8 @@ func SourceAddrPort(req *sip.Request) (netip.AddrPort, bool) {
 	return netip.AddrPortFrom(ip.Unmap(), uint16(port)), true
 }
 
-// ParseHostPortAddr parses a transport-level "host:port" into its address.
-func ParseHostPortAddr(hostPort string) (netip.Addr, bool) {
+// parseHostPortAddr parses a transport-level "host:port" into its address.
+func parseHostPortAddr(hostPort string) (netip.Addr, bool) {
 	host, _, err := net.SplitHostPort(hostPort)
 	if err != nil {
 		return netip.Addr{}, false
@@ -47,12 +47,12 @@ func ParseHostPortAddr(hostPort string) (netip.Addr, bool) {
 	return addr.Unmap(), true
 }
 
-// AddrOf is ParseHostPortAddr for a net.Addr, tolerating a nil one.
+// AddrOf is parseHostPortAddr for a net.Addr, tolerating a nil one.
 func AddrOf(a net.Addr) (netip.Addr, bool) {
 	if a == nil {
 		return netip.Addr{}, false
 	}
-	return ParseHostPortAddr(a.String())
+	return parseHostPortAddr(a.String())
 }
 
 // SameListener reports whether a read that arrived on transport at local

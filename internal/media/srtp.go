@@ -1,7 +1,6 @@
 package media
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -11,59 +10,6 @@ import (
 	"github.com/pion/srtp/v3"
 	"github.com/pion/transport/v4/replaydetector"
 )
-
-// SDESKeyLen is the length of an SDES inline key value for the supported
-// AES_CM_128 suites: a 16-byte master key concatenated with a 14-byte
-// master salt. The signaling plane validates decoded keys against it.
-const SDESKeyLen = 30
-
-// CryptoSuite identifies an SDES/SRTP crypto suite. Only the two AES_CM_128
-// suites are supported (spec §1.3).
-type CryptoSuite int
-
-const (
-	SuiteAES128CM80 CryptoSuite = iota // AES_CM_128_HMAC_SHA1_80
-	SuiteAES128CM32                    // AES_CM_128_HMAC_SHA1_32
-)
-
-// ParseCryptoSuite maps an RFC 4568 suite name to a CryptoSuite. Anything
-// outside the two supported AES_CM_128 suites returns ok=false.
-func ParseCryptoSuite(name string) (CryptoSuite, bool) {
-	switch name {
-	case "AES_CM_128_HMAC_SHA1_80":
-		return SuiteAES128CM80, true
-	case "AES_CM_128_HMAC_SHA1_32":
-		return SuiteAES128CM32, true
-	default:
-		return 0, false
-	}
-}
-
-// String is the RFC 4568 name of the suite, as it appears in an a=crypto
-// line.
-func (s CryptoSuite) String() string {
-	if s == SuiteAES128CM32 {
-		return "AES_CM_128_HMAC_SHA1_32"
-	}
-	return "AES_CM_128_HMAC_SHA1_80"
-}
-
-// NewSDESKey generates a fresh SDES inline value (master key ‖ salt) from
-// the CSPRNG. crypto/rand.Read cannot fail on any supported platform — it
-// panics rather than returning a short read — so there is no error to
-// report and no partially-random key to guard against.
-func NewSDESKey() []byte {
-	k := make([]byte, SDESKeyLen)
-	rand.Read(k)
-	return k
-}
-
-func (s CryptoSuite) profile() srtp.ProtectionProfile {
-	if s == SuiteAES128CM32 {
-		return srtp.ProtectionProfileAes128CmHmacSha1_32
-	}
-	return srtp.ProtectionProfileAes128CmHmacSha1_80
-}
 
 // SRTPContext protects/unprotects the RTP and RTCP of ONE stream with one
 // SRTP master key. pion's *srtp.Context has no internal lock, and in the relay
@@ -141,23 +87,8 @@ func hasCryptexProfile(pkt []byte) bool {
 	return p == cryptexProfileOneByte || p == cryptexProfileTwoByte
 }
 
-// NewSRTPContext builds a context from a 30-byte SDES inline value
-// (16-byte master key followed by a 14-byte master salt), with replay
-// protection enabled (RFC 3711 §3.3.2/§3.4.2 MUST): a
-// replayed/too-old packet fails unprotect and is dropped by the relay's
-// existing fail-closed path — pion's default is no replay protection, which
-// would let a captured valid packet be re-injected indefinitely. The
-// windows are per-context (one context protects exactly one stream of one
-// direction), so they don't interact across legs or sides.
-func NewSRTPContext(suite CryptoSuite, keyValue []byte) (*SRTPContext, error) {
-	if len(keyValue) != SDESKeyLen {
-		return nil, fmt.Errorf("srtp key value must be %d bytes, got %d", SDESKeyLen, len(keyValue))
-	}
-	return newContext(suite.profile(), keyValue[:16], keyValue[16:30])
-}
-
-// newContext is the one place an *srtp.Context is built, for both the SDES
-// and the DTLS-SRTP constructors. Replay protection is enabled here and
+// newContext is the one place an *srtp.Context is built, for the DTLS-SRTP
+// constructor. Replay protection is enabled here and
 // nowhere else: pion's default is none, which would let a captured valid
 // packet be re-injected indefinitely.
 func newContext(profile srtp.ProtectionProfile, masterKey, masterSalt []byte) (*SRTPContext, error) {

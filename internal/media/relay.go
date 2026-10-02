@@ -59,41 +59,13 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 				continue // pre-latch source mismatch, or post-latch hijack
 			}
 			pkt := buf[:n]
-			// Decrypt what a secure sending leg gave us, then (re-)encrypt for
-			// a secure receiving leg. A failure at either step drops the packet
-			// (bad auth tag / replay) — fail-closed, call stays up.
-			// Both transforms run in place in buf, which has room for the
-			// SRTP overhead, so the relay allocates nothing per packet.
-			if ic := s.srtpIn[from].Load(); ic != nil {
-				var ok bool
-				if rtpKind {
-					pkt, ok = ic.unprotectRTPInto(pkt, pkt)
-				} else {
-					pkt, ok = ic.unprotectRTCPInto(pkt, pkt)
-				}
-				if !ok {
-					continue
-				}
-			}
-			// Only NOW is the packet proven genuine — plaintext
-			// path: the latch accepted it; secure path: SRTP auth passed.
+			// Only NOW is the packet proven genuine: the latch accepted it.
 			// Refresh the silence watchdog here, never on latch-accept alone:
 			// A party who knows the latched source address could
 			// feed garbage that failed auth yet renewed rtp_timeout
 			// indefinitely, keeping a dead call alive forever.
 			s.lastRx[from].Store(time.Now().UnixNano())
 			s.counters.recordRx(from, rtpKind, len(pkt))
-			if oc := s.srtpOut[to].Load(); oc != nil {
-				var ok bool
-				if rtpKind {
-					pkt, ok = oc.protectRTPInto(pkt, pkt)
-				} else {
-					pkt, ok = oc.protectRTCPInto(pkt, pkt)
-				}
-				if !ok {
-					continue
-				}
-			}
 			if dst := outLatch.target(); dst != nil {
 				if n, err := outSock.WriteToUDP(pkt, dst); err == nil {
 					s.counters.recordTx(to, rtpKind, n)

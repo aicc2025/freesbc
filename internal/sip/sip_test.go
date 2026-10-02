@@ -92,13 +92,13 @@ func TestSourceAddrPort(t *testing.T) {
 	}
 }
 
-func TestParseHostPortAddrAndAddrOf(t *testing.T) {
-	if got, ok := ParseHostPortAddr("[::ffff:192.0.2.7]:5060"); !ok || got != netip.MustParseAddr("192.0.2.7") {
-		t.Errorf("ParseHostPortAddr(4in6) = %v, %v; want 192.0.2.7, true", got, ok)
+func TestHostPortAddrAndAddrOf(t *testing.T) {
+	if got, ok := parseHostPortAddr("[::ffff:192.0.2.7]:5060"); !ok || got != netip.MustParseAddr("192.0.2.7") {
+		t.Errorf("parseHostPortAddr(4in6) = %v, %v; want 192.0.2.7, true", got, ok)
 	}
 	for _, bad := range []string{"192.0.2.7", "name.example:5060", ""} {
-		if _, ok := ParseHostPortAddr(bad); ok {
-			t.Errorf("ParseHostPortAddr(%q) ok = true, want false", bad)
+		if _, ok := parseHostPortAddr(bad); ok {
+			t.Errorf("parseHostPortAddr(%q) ok = true, want false", bad)
 		}
 	}
 	if _, ok := AddrOf(nil); ok {

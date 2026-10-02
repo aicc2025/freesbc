@@ -16,7 +16,6 @@ type collector struct {
 	activeCalls *prometheus.Desc
 	portsInUse  *prometheus.Desc
 	portsTotal  *prometheus.Desc
-	peerReg     *prometheus.Desc
 	dropsTotal  *prometheus.Desc
 	buildInfo   *prometheus.Desc
 
@@ -47,7 +46,6 @@ func newCollector(deps Deps) *collector {
 		activeCalls: prometheus.NewDesc("freesbc_active_calls", "Currently active bridged calls.", nil, nil),
 		portsInUse:  prometheus.NewDesc("freesbc_media_ports_in_use", "RTP port pairs in use.", nil, nil),
 		portsTotal:  prometheus.NewDesc("freesbc_media_ports_total", "RTP port pairs the range can hold.", nil, nil),
-		peerReg:     prometheus.NewDesc("freesbc_peer_registered", "1 if a register:true peer is currently registered.", []string{"peer"}, nil),
 		dropsTotal:  prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
 
@@ -77,7 +75,6 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.activeCalls
 	ch <- c.portsInUse
 	ch <- c.portsTotal
-	ch <- c.peerReg
 	ch <- c.dropsTotal
 	ch <- c.buildInfo
 	for _, d := range []*prometheus.Desc{
@@ -99,16 +96,6 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	inUse, total := c.deps.Ports()
 	g(c.portsInUse, float64(inUse))
 	g(c.portsTotal, float64(total))
-	for _, p := range c.deps.Peers() {
-		if !p.Register {
-			continue
-		}
-		v := 0.0
-		if p.Registered {
-			v = 1
-		}
-		g(c.peerReg, v, p.Name)
-	}
 	st := c.deps.Shield()
 	for reason, n := range st.DropsByReason {
 		ch <- prometheus.MustNewConstMetric(c.dropsTotal, prometheus.CounterValue, float64(n), reason)

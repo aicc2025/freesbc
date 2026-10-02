@@ -4,7 +4,6 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
-	"strings"
 	"testing"
 	"time"
 
@@ -42,46 +41,6 @@ routes:
     from: trunk
     to: [trunk]
 `
-
-func TestCheckConfiguredPeerExempt(t *testing.T) {
-	s := testShield(t, shieldCfg)
-	peer := netip.MustParseAddr("203.0.113.10")
-	// A scanner UA from a configured peer is exempt from the scanner/ban
-	// plane — the peer keeps its exemption semantics under the T-18 peer
-	// rate limit, which is a separate, looser ceiling (default 200/s per_ip;
-	// these 100 hits stay inside the burst).
-	for i := 0; i < 100; i++ {
-		if s.Check(peer, "friendly-scanner", "udp") != Allow {
-			t.Fatalf("configured peer must be exempt from scanner/ban (iter %d)", i)
-		}
-	}
-}
-
-// TestShieldCheckAppliesPeerRateLimit is the T-18 (F-19) red test: a
-// configured peer source is no longer rate-limit-free — past the (loose,
-// separately configured) peer limit, its traffic Drops like anyone else's.
-// Pre-fix, isConfiguredPeer returned Allow unconditionally, so a spoofed
-// peer source had no rate ceiling at all.
-func TestShieldCheckAppliesPeerRateLimit(t *testing.T) {
-	s := testShield(t, strings.Replace(shieldCfg,
-		"rate_limit: 2/s per_ip", "rate_limit: 2/s per_ip\n  peer_rate_limit: 3/s per_ip", 1))
-	peer := netip.MustParseAddr("203.0.113.10")
-	// Burst = rate = 3: three checks consume the bucket, the fourth must Drop.
-	for i := 0; i < 3; i++ {
-		if s.Check(peer, "", "udp") != Allow {
-			t.Fatalf("peer check %d: want Allow inside the peer rate budget", i+1)
-		}
-	}
-	if s.Check(peer, "", "udp") != Drop {
-		t.Fatal("peer past its rate budget must Drop")
-	}
-	// The peer limit is independent of the non-peer limiter: a NON-peer
-	// source's budget (2) is unaffected by the peer's exhaustion.
-	other := netip.MustParseAddr("198.51.100.7")
-	if s.Check(other, "", "udp") != Allow {
-		t.Fatal("non-peer source must have its own untouched budget")
-	}
-}
 
 func TestCheckScannerInstantBan(t *testing.T) {
 	s := testShield(t, shieldCfg)
@@ -239,31 +198,6 @@ func TestSocketBanFloodLeavesIPTableFree(t *testing.T) {
 	s.CheckFrom(real, "sipvicious", "tcp")
 	if !s.bans.banned(real.Addr()) {
 		t.Error("a real TCP scanner could not be banned after a UDP flood")
-	}
-}
-
-// audit: P2-SHD-005
-// Trunk peers are exempt only on the trunk plane. On the edge shield a
-// source inside a trunk peer's allowed_ips is an ordinary public client:
-// a scanner verdict bans it.
-func TestEdgeShieldDoesNotExemptTrunkPeers(t *testing.T) {
-	cfg, err := config.Parse([]byte(shieldCfg))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	edge := NewNoKernel(config.NewStore(cfg), discard())
-	t.Cleanup(func() { edge.Close() })
-	peer := netip.MustParseAddr("203.0.113.10") // shieldCfg's trunk peer
-	if edge.Check(peer, "friendly-scanner", "tcp") != Drop {
-		t.Fatal("scanner UA must be dropped")
-	}
-	if edge.Check(peer, "Yealink", "tcp") != Drop {
-		t.Error("the edge shield exempted a trunk peer from its scanner ban")
-	}
-
-	trunk := testShield(t, shieldCfg)
-	if trunk.Check(peer, "friendly-scanner", "tcp") != Allow {
-		t.Error("the trunk shield must still exempt its peers from the scanner check")
 	}
 }
 
