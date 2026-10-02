@@ -49,11 +49,13 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 		s.rejectMedia(req, tx, err)
 		return
 	}
-	out, err := s.prepareForward(req, from, to, dest, false)
+	hide, resp := s.carrierLeg(req, d, from, to)
+	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
 	}
+	s.noteOutbound(req, d, hide)
 	s.retargetInDialog(req, out, to, d)
 	fsip.SetContact(out, to.uri())
 	fsip.SetSDPBody(out, reOffer)
@@ -122,7 +124,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 				continue
 			}
 			is2xx := res.StatusCode/100 == 2
-			err := s.relayResponse(req, tx, res, func(relayed *sip.Response) error {
+			err := s.relayResponseHide(req, tx, res, resp, func(relayed *sip.Response) error {
 				fsip.SetContact(relayed, from.uri())
 				if len(res.Body()) > 0 && answer == nil {
 					reAnswer, parsedAnswer, err := s.rebuildInDialogAnswer(d, parsed, res.Body(), from.plane)
@@ -220,11 +222,16 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	if !ok {
 		return // nothing to forward it to; an ACK gets no response
 	}
-	out, err := s.prepareForward(req, from, to, dest, false)
+	hide, _ := s.carrierLeg(req, d, from, to)
+	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		return
 	}
+	s.noteOutbound(req, d, hide)
 	s.retargetInDialog(req, out, to, d)
+	if d == nil && !in.private() {
+		s.restoreCarrierRURI(req, out)
+	}
 	if !in.private() {
 		s.stampCarrier(out, req, d)
 	}
@@ -308,12 +315,17 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 	if d != nil {
 		d.noteCSeq(req)
 	}
-	out, err := s.prepareForward(req, from, to, dest, false)
+	hide, resp := s.carrierLeg(req, d, from, to)
+	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
 	}
+	s.noteOutbound(req, d, hide)
 	s.retargetInDialog(req, out, to, d)
+	if d == nil && !in.private() {
+		s.restoreCarrierRURI(req, out)
+	}
 	fsip.SetContact(out, to.uri())
 	if !in.private() {
 		s.stampCarrier(out, req, d)
@@ -321,7 +333,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
-	final, err := s.forwardAndRelay(ctx, req, tx, out)
+	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, nil)
 	if err != nil {
 		s.log.Warn("forward in-dialog request failed", "err", err,
 			"method", req.Method.String(), "sip_call_id", fsip.CallID(req))
@@ -578,6 +590,11 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 	req.AppendHeader(toward.via(fsip.NewBranch()))
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
+	if b.carrier && toward.plane == planePublic {
+		// Identity toward a carrier never names the switch (hide.go).
+		s.maskURI(&b.fromURI, toward.advIP)
+		s.maskURI(&b.toURI, toward.advIP)
+	}
 	from := &sip.FromHeader{Address: b.fromURI, Params: sip.NewParams()}
 	from.Params.Add("tag", b.fromTag)
 	req.AppendHeader(from)

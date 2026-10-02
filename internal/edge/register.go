@@ -34,7 +34,7 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived 
 		// it is classified by its Request-URI like everything else the
 		// switch originates.
 		if kind, name := s.classifySwitchRequest(req); kind == targetCarrier {
-			s.carrierNotImplemented(req, tx, name)
+			s.registerToCarrier(req, tx, arrived, name)
 			return
 		}
 		s.reject(req, tx, 404, "Not Found")

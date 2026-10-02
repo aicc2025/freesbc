@@ -167,7 +167,10 @@ func noBuild(*sipgo.Client, *sip.Request) error { return nil }
 // it.
 //
 // ok=false means the response must not be forwarded.
-func (s *Server) popOwnVia(res *sip.Response) (ok bool) {
+//
+// allowEmpty is for a response about to get the requester's own Vias back
+// (respToSwitch, hide.go): nothing needs to be left to route by.
+func (s *Server) popOwnVia(res *sip.Response, allowEmpty bool) (ok bool) {
 	top := res.Via()
 	if top == nil {
 		return false
@@ -178,7 +181,7 @@ func (s *Server) popOwnVia(res *sip.Response) (ok bool) {
 	}
 	res.RemoveHeader("Via")
 	// After popping ours there must be a Via left to route by.
-	return res.Via() != nil
+	return allowEmpty || res.Via() != nil
 }
 
 // errResponseDropped reports a response that cannot be routed back: its
@@ -207,15 +210,24 @@ var errResponseDropped = errors.New("proxy: response cannot be routed back")
 // retransmission, and there is nothing a relay loop can do about it.
 func (s *Server) relayResponse(orig *sip.Request, tx sip.ServerTransaction, res *sip.Response,
 	adapt func(out *sip.Response) error) error {
+	return s.relayResponseHide(orig, tx, res, respPlain, adapt)
+}
+
+// relayResponseHide is relayResponse for a response on a carrier leg: mode
+// says which topology-hiding rewrite (hide.go) the response gets after our
+// Via is popped and before adapt runs.
+func (s *Server) relayResponseHide(orig *sip.Request, tx sip.ServerTransaction, res *sip.Response,
+	mode respHide, adapt func(out *sip.Response) error) error {
 
 	out := res.Clone()
-	if !s.popOwnVia(out) {
+	if !s.popOwnVia(out, mode == respToSwitch) {
 		s.log.Debug("dropping response that cannot be routed back",
 			"code", out.StatusCode, "sip_call_id", fsip.CallID(out))
 		return errResponseDropped
 	}
 	sanitizeExtensions(out)
 	stripInternalHeaders(out) // only FreeSBC adds X-FreeSBC-*, and never to a response
+	s.hideResponse(out, orig, mode)
 	if adapt != nil {
 		if err := adapt(out); err != nil {
 			return err
@@ -237,7 +249,12 @@ func (s *Server) relayResponse(orig *sip.Request, tx sip.ServerTransaction, res 
 // cancelled — which is correct for a handler goroutine: sipgo runs each
 // request on its own goroutine, and the transaction layer, not this loop,
 // owns retransmission.
-func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, out *sip.Request) (*sip.Response, error) {
+//
+// mode and adapt are for a carrier leg or a request whose final response
+// needs rewriting (the carrier REGISTER's Contact); plain callers pass
+// respPlain and nil.
+func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
+	mode respHide, adapt func(out *sip.Response) error) (*sip.Response, error) {
 	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: forward %s: %w", out.Method, err)
@@ -259,7 +276,7 @@ func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.S
 			if !fsip.Forwardable(res) {
 				continue // a 100 Trying is hop-by-hop; ours already went out
 			}
-			_ = s.relayResponse(req, tx, res, nil)
+			_ = s.relayResponseHide(req, tx, res, mode, adapt)
 			if res.StatusCode >= 200 {
 				return res, nil
 			}

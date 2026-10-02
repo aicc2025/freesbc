@@ -776,6 +776,10 @@ func (f *fakeSwitch) onRegister(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+	granted := "120"
+	if d, ok := requestedExpires(req); ok && d == 0 {
+		granted = "0"
+	}
 	if hs := req.GetHeaders("Contact"); len(hs) > 0 {
 		c, _ := hs[0].(*sip.ContactHeader)
 		f.mu.Lock()
@@ -783,11 +787,12 @@ func (f *fakeSwitch) onRegister(req *sip.Request, tx sip.ServerTransaction) {
 		f.mu.Unlock()
 		echo := &sip.ContactHeader{Address: c.Address, Params: sip.NewParams()}
 		// Grant less than asked for, so the test proves FreeSBC honours
-		// the registrar's expiry rather than the client's request.
-		echo.Params.Add("expires", "120")
+		// the registrar's expiry rather than the client's request. An
+		// un-REGISTER is granted 0, as a registrar answers it.
+		echo.Params.Add("expires", granted)
 		res.AppendHeader(echo)
 	}
-	res.AppendHeader(sip.NewHeader("Expires", "120"))
+	res.AppendHeader(sip.NewHeader("Expires", granted))
 	_ = tx.Respond(res)
 }
 

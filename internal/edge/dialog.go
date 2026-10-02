@@ -395,6 +395,10 @@ func (t *dialogTable) calls() []CallRecord {
 			if d.carrier != "" {
 				// A carrier-originated call: name both ends.
 				from, to = "carrier:"+d.carrier, "switch:"+d.route.privateRemote
+				if d.callerPlane == planePrivate {
+					// A switch-originated call: the switch is the caller.
+					from, to = "switch:"+d.route.privateRemote, "carrier:"+d.carrier
+				}
 			}
 			out = append(out, CallRecord{
 				ID: "edge:" + d.callID + ";" + d.callerTag, CallID: d.callID,
@@ -747,6 +751,7 @@ type byeInfo struct {
 	remote    string
 	contact   sip.Uri
 	transport string
+	carrier   bool // the dialog is a carrier's: masking applies toward the public side
 }
 
 // byes describes the two BYEs that end this dialog from the middle: one to
@@ -767,10 +772,10 @@ func (d *dialog) byes() [2]byeInfo {
 	return [2]byeInfo{
 		{callID: d.callID, toward: d.callerPlane,
 			fromURI: d.calleeURI, fromTag: d.calleeTag, toURI: d.callerURI, toTag: d.callerTag,
-			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport},
+			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport, carrier: d.carrier != ""},
 		{callID: d.callID, toward: calleePlane,
 			fromURI: d.callerURI, fromTag: d.callerTag, toURI: d.calleeURI, toTag: d.calleeTag,
-			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport},
+			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport, carrier: d.carrier != ""},
 	}
 }
 

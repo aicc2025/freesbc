@@ -191,6 +191,17 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 
 	cooldown := switchCooldown
 
+	// A carrier's call to a registration's Contact names the registering
+	// node and carries the switch's own Contact back: it goes to that node
+	// only, with that Contact as the Request-URI (carrierreg.go).
+	var pinned carrierBinding
+	isPinned := false
+	resp := respPlain
+	if carrier != "" {
+		pinned, isPinned = s.carrierRURI(req, carrier)
+		resp = respToCarrier
+	}
+
 	// The caller's hash order, cooled nodes at the tail: everything this
 	// user does starts on the same switch, and a switch that just failed is
 	// only dialed once its alternatives have been tried.
@@ -198,7 +209,11 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	if carrier != "" {
 		hashUser = carrierHashUser(req)
 	}
-	for attempt, name := range s.upstreamOrder(hashUser) {
+	order := s.upstreamOrder(hashUser)
+	if isPinned {
+		order = []string{pinned.node}
+	}
+	for attempt, name := range order {
 		if ctx.Err() != nil {
 			break // the caller is gone (or the backstop fired) mid-series
 		}
@@ -220,6 +235,9 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		}
 		if carrier != "" {
 			out.AppendHeader(sip.NewHeader(carrierHeader, carrier))
+		}
+		if isPinned {
+			out.Recipient = pinned.contact
 		}
 		// The client's Contact must not reach FreeSWITCH: it names the
 		// client's own address (or, for a browser, an unreachable .invalid
@@ -270,7 +288,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		// what their Request-URI names.
 		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
 			near: from, far: s.topo.private, callee: calleeUpstream,
-			calleeRemote: dest, transport: from.transport}
+			calleeRemote: dest, transport: from.transport, resp: resp}
 		r := s.pumpInvite(ctx, l)
 
 		if r.final != nil {

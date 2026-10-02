@@ -94,6 +94,16 @@ func TestCarrierInviteDeliveredToCarrierPort(t *testing.T) {
 	if names := internalHeaderNames(res); len(names) != 0 {
 		t.Errorf("the carrier saw internal headers %v on the response", names)
 	}
+	// Nothing private goes back to the carrier: its route set is FreeSBC's
+	// public Record-Route alone, and no header or body names the private
+	// socket or a switch port.
+	rrs := res.GetHeaders("Record-Route")
+	if len(rrs) != 1 || rrs[0].(*sip.RecordRouteHeader).Address.Port != portOf(rig.publicUDP) {
+		t.Errorf("response Record-Route = %v, want only FreeSBC's public entry", rrs)
+	}
+	if a := portLeak(res.String(), rig.privateSIP, rig.fs.addr, rig.cs.addr); a != "" {
+		t.Errorf("%s leaked in the response to the carrier:\n%s", a, res.String())
+	}
 
 	if got := rig.fs.received(sip.INVITE); len(got) != 0 {
 		t.Fatalf("the switch's CLIENT port saw %d carrier INVITEs, want 0", len(got))
@@ -376,14 +386,22 @@ func switchRequest(t *testing.T, f *fakeSwitch, method sip.RequestMethod, ruri s
 }
 
 // What the switch originates is classified by Request-URI alone: a carrier
-// entry → carrier path (501 until it is built), a client token → client
-// path, FreeSBC itself → OPTIONS answered, anything else → 404; a method a
-// carrier does not accept → 405.
+// entry → carrier path (an offerless INVITE is 488, a carrier with no
+// resolved address 503; carrier_outbound_test.go has the proxying), a client
+// token → client path, FreeSBC itself → OPTIONS answered, anything else →
+// 404; a method a carrier does not accept → 405.
 func TestCarrierPrivateClassification(t *testing.T) {
-	rig := startCarrierRig(t, "alpha: 127.0.0.1:5090, dns: Carrier.Example.com:5070", "", func(s *Server) {
+	rig := startCarrierRig(t, "alpha: 127.0.0.1:5090, dns: Carrier.Example.com:5070, nores: nores.example.com:5071", "", func(s *Server) {
 		s.carriers.lookupSRV = (&dnsStub{}).lookupSRV
 		s.carriers.lookupIP = (&dnsStub{ips: map[string][]string{"carrier.example.com": {"198.51.100.9"}}}).lookupIP
 	})
+	deadline := time.Now().Add(3 * time.Second)
+	for len(rig.srv.carriers.snapshot().addrs["dns"]) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the dns carrier was never resolved")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	fs, priv := rig.fs, rig.privateSIP
 	privPort := portOf(priv)
 	bogus := sip.NewParams()
@@ -395,14 +413,14 @@ func TestCarrierPrivateClassification(t *testing.T) {
 		ruri   sip.Uri
 		want   int
 	}{
-		{"INVITE to a carrier", sip.INVITE, sip.Uri{User: "+1555", Host: "127.0.0.1", Port: 5090}, 501},
-		{"INVITE, host case and trailing dot", sip.INVITE, sip.Uri{User: "+1555", Host: "CARRIER.example.COM.", Port: 5070}, 501},
+		{"INVITE to a carrier", sip.INVITE, sip.Uri{User: "+1555", Host: "127.0.0.1", Port: 5090}, 488},
+		{"INVITE, host case and trailing dot", sip.INVITE, sip.Uri{User: "+1555", Host: "CARRIER.example.COM.", Port: 5070}, 488},
 		{"INVITE, wrong port", sip.INVITE, sip.Uri{User: "+1555", Host: "carrier.example.com"}, 404},
 		{"INVITE to a stranger", sip.INVITE, sip.Uri{User: "+1555", Host: "203.0.113.50"}, 404},
 		{"INVITE to an expired token", sip.INVITE, sip.Uri{User: "1001", Host: "127.0.0.1", Port: 1234, UriParams: bogus}, 404},
-		{"REGISTER to a carrier", sip.REGISTER, sip.Uri{Host: "127.0.0.1", Port: 5090}, 501},
+		{"REGISTER to an unresolved carrier", sip.REGISTER, sip.Uri{Host: "nores.example.com", Port: 5071}, 503},
 		{"REGISTER to a stranger", sip.REGISTER, sip.Uri{Host: "203.0.113.50"}, 404},
-		{"OPTIONS to a carrier", sip.OPTIONS, sip.Uri{Host: "127.0.0.1", Port: 5090}, 501},
+		{"OPTIONS to an unresolved carrier", sip.OPTIONS, sip.Uri{Host: "nores.example.com", Port: 5071}, 503},
 		{"OPTIONS to FreeSBC", sip.OPTIONS, sip.Uri{Host: "127.0.0.1", Port: privPort}, 200},
 		{"OPTIONS to a stranger", sip.OPTIONS, sip.Uri{Host: "203.0.113.50"}, 404},
 		{"NOTIFY to a carrier", sip.NOTIFY, sip.Uri{User: "x", Host: "127.0.0.1", Port: 5090}, 405},

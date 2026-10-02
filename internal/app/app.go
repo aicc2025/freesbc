@@ -145,6 +145,7 @@ func adminDeps(edgeSrv *edge.Server, version string) admin.Deps {
 				HandlerPanics:          s.HandlerPanics,
 				AdmissionDrops:         s.AdmissionDrops,
 				CarrierRequests:        s.CarrierRequests,
+				CarrierRegistrations:   s.CarrierRegistrations,
 			}
 		},
 	}

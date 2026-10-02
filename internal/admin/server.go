@@ -95,6 +95,10 @@ type ProxyStats struct {
 	// CarrierRequests counts carrier-path requests, keyed
 	// "carrier/direction/method" (direction: inbound or outbound).
 	CarrierRequests map[string]uint64 `json:"carrier_requests_total"`
+
+	// CarrierRegistrations is the live switch-to-carrier registration
+	// count per carrier name.
+	CarrierRegistrations map[string]int64 `json:"carrier_registrations"`
 }
 
 // Server is the admin HTTP server.

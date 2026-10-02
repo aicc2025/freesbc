@@ -39,6 +39,7 @@ type collector struct {
 	proxyPanics     *prometheus.Desc
 	proxyAdmission  *prometheus.Desc
 	proxyCarrierReq *prometheus.Desc
+	proxyCarrierReg *prometheus.Desc
 }
 
 func newCollector(deps Deps) *collector {
@@ -72,6 +73,7 @@ func newCollector(deps Deps) *collector {
 		// carrier is a configured name or "unknown"; direction and method
 		// are bounded sets.
 		proxyCarrierReq: prometheus.NewDesc("freesbc_edge_carrier_requests_total", "SIP requests of the carrier path, by carrier, direction (inbound: carrier to switch, outbound: switch to carrier) and method.", []string{"carrier", "direction", "method"}, nil),
+		proxyCarrierReg: prometheus.NewDesc("freesbc_edge_carrier_registrations", "Live carrier registrations (switch to carrier) the edge holds, by carrier.", []string{"carrier"}, nil),
 	}
 }
 
@@ -86,7 +88,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
-		c.proxyAdmission, c.proxyCarrierReq,
+		c.proxyAdmission, c.proxyCarrierReq, c.proxyCarrierReg,
 	} {
 		ch <- d
 	}
@@ -136,6 +138,9 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.proxyPanics, float64(p.HandlerPanics))
 	for reason, v := range p.AdmissionDrops {
 		counter(c.proxyAdmission, float64(v), reason)
+	}
+	for name, n := range p.CarrierRegistrations {
+		g(c.proxyCarrierReg, float64(n), name)
 	}
 	for k, v := range p.CarrierRequests {
 		parts := strings.SplitN(k, "/", 3)

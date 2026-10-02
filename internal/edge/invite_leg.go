@@ -27,6 +27,9 @@ const (
 	calleeUpstream calleeKind = iota
 	// calleeClient: a registered client answers FreeSWITCH's call.
 	calleeClient
+	// calleeCarrier: a carrier answers the switch's call. Its legs are the
+	// plain RTP relay, like a client's that was not offered WebRTC.
+	calleeCarrier
 )
 
 // calleePlane is the plane the callee's answers come from, and so the
@@ -59,6 +62,11 @@ type inviteLeg struct {
 	calleeRemote string
 	transport    string
 	fromPrivate  bool
+
+	// resp is the topology-hiding rewrite the caller's responses get
+	// (hide.go): respToSwitch for a call to a carrier, respToCarrier for a
+	// carrier's call to the switch, respPlain otherwise.
+	resp respHide
 }
 
 func (l *inviteLeg) dialog() *dialog { return l.offer.dialog }
@@ -139,8 +147,11 @@ var errDialogGone = errors.New("proxy: dialog already ended")
 // for the caller's final to be decided by the pump.
 func (s *Server) relayInviteResponse(l *inviteLeg, res *sip.Response) error {
 	is2xx := res.StatusCode/100 == 2
-	err := s.relayResponse(l.req, l.tx, res, func(out *sip.Response) error {
+	err := s.relayResponseHide(l.req, l.tx, res, l.resp, func(out *sip.Response) error {
 		fsip.SetContact(out, l.near.uri())
+		if l.resp == respToSwitch && res.StatusCode < 300 {
+			s.addPrivateRecordRoute(out)
+		}
 		if len(res.Body()) > 0 || is2xx {
 			body, err := s.forkAnswer(l, res)
 			if err != nil {

@@ -49,6 +49,10 @@ type Server struct {
 	carriers    *carrierDirectory
 	carrierURIs map[string]string
 
+	// carrierRegs holds the switch's live registrations at carriers
+	// (carrierreg.go), by token. Separate from loc, the client table.
+	carrierRegs *carrierRegTable
+
 	pubPool  *media.PlanePool
 	privPool *media.PlanePool
 	identity *media.DTLSIdentity
@@ -187,6 +191,7 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		topo:             topo,
 		carriers:         newCarrierDirectory(cfg, log.With("component", "carriers")),
 		carrierURIs:      carrierURIsOf(cfg),
+		carrierRegs:      newCarrierRegTable(),
 		loc:              NewLocation(),
 		metrics:          NewMetrics(),
 		upstreamCooldown: newCooldownTable(),
@@ -439,6 +444,10 @@ func (s *Server) Run(ctx context.Context) error {
 				if n := s.loc.Prune(); n > 0 {
 					s.log.Debug("pruned expired registration bindings", "count", n)
 				}
+				if n := s.carrierRegs.prune(); n > 0 {
+					s.log.Debug("pruned expired carrier registrations", "count", n)
+				}
+				s.publishCarrierRegistrations()
 			}
 		}
 	}()
@@ -825,13 +834,13 @@ type handler func(*sip.Request, sip.ServerTransaction, inbound)
 // From the switch an OPTIONS is classified by its Request-URI like every
 // other out-of-dialog request (classifySwitchRequest): addressed to
 // FreeSBC itself or to a registered client's token it is answered here; to
-// a carrier it is a carrier probe (not proxied yet); to anything else, 404.
+// a carrier it is proxied to it (optionsToCarrier); to anything else, 404.
 // A public OPTIONS, a carrier's keepalive included, is answered here.
 func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	if in.private() && fsip.ToTag(req) == "" {
 		switch kind, name := s.classifySwitchRequest(req); kind {
 		case targetCarrier:
-			s.carrierNotImplemented(req, tx, name)
+			s.optionsToCarrier(req, tx, name)
 			return
 		case targetNotFound:
 			s.reject(req, tx, 404, "Not Found")

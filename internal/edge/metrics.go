@@ -50,6 +50,12 @@ type Metrics struct {
 	// folded like requestsIn, so the set is bounded.
 	carrierReqs sync.Map // string → *atomic.Uint64
 
+	// carrierRegs is the live carrier registration count per carrier name
+	// (a configured name, so the set is bounded), replaced whole by
+	// SetCarrierRegistrations.
+	carrierRegsMu sync.Mutex
+	carrierRegs   map[string]int64
+
 	// Media byte/packet totals, accumulated at call teardown from each
 	// session's own counters. Sampling live sessions instead would need a
 	// registry walk on every scrape.
@@ -135,6 +141,18 @@ func (m *Metrics) CarrierRequest(carrier, direction, method string) {
 	bump(&m.carrierReqs, carrier+"/"+direction+"/"+label)
 }
 
+// SetCarrierRegistrations publishes the live carrier registration counts
+// per carrier name.
+func (m *Metrics) SetCarrierRegistrations(counts map[string]int) {
+	next := make(map[string]int64, len(counts))
+	for k, v := range counts {
+		next[k] = int64(v)
+	}
+	m.carrierRegsMu.Lock()
+	m.carrierRegs = next
+	m.carrierRegsMu.Unlock()
+}
+
 // HandlerPanicked counts a SIP handler panic the guard recovered.
 func (m *Metrics) HandlerPanicked() { m.handlerPanics.Add(1) }
 
@@ -210,6 +228,9 @@ type Snapshot struct {
 
 	// CarrierRequests is keyed "carrier/direction/method".
 	CarrierRequests map[string]uint64
+
+	// CarrierRegistrations is the live registration count per carrier.
+	CarrierRegistrations map[string]int64
 }
 
 func (m *Metrics) Snapshot() Snapshot {
@@ -233,7 +254,13 @@ func (m *Metrics) Snapshot() Snapshot {
 		WebRTCDTLSFailures:          m.dtlsFailures.Load(),
 		AdmissionDrops:              map[string]uint64{},
 		CarrierRequests:             map[string]uint64{},
+		CarrierRegistrations:        map[string]int64{},
 	}
+	m.carrierRegsMu.Lock()
+	for k, v := range m.carrierRegs {
+		s.CarrierRegistrations[k] = v
+	}
+	m.carrierRegsMu.Unlock()
 	m.carrierReqs.Range(func(k, v any) bool {
 		s.CarrierRequests[k.(string)] = v.(*atomic.Uint64).Load()
 		return true
