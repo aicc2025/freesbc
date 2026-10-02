@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,6 +236,57 @@ func TestAdmissionRegisterEnumerationLimit(t *testing.T) {
 	if n := admissionDrops(h, dropRegisterEnumeration); n == 0 {
 		t.Error("register_enumeration drops = 0")
 	}
+}
+
+// TestAdmissionRegisterEnumerationRecordedBeforeRelay pins the order of the
+// 403 and the limiter (#93). The limiter's clock is read once by blocked()
+// and once by rejected(); the test gates the second read, which is the
+// 10th rejection being recorded. The client must not see that 403 while the
+// recording is still pending: with the old order (relay, then record) the
+// 403 arrives during the gate and expectSilence fails.
+func TestAdmissionRegisterEnumerationRecordedBeforeRelay(t *testing.T) {
+	h := startHarnessStrict(t, false, false)
+	scanner := newUDPClient(t)
+	src := netip.MustParseAddr("127.0.0.1")
+
+	for i := 0; i < enumMaxAORs-1; i++ {
+		h.srv.enumLimit.rejected(src, fmt.Sprintf("seed%d@example.com", i))
+	}
+	h.fs.mu.Lock()
+	h.fs.registerStatus = 403
+	h.fs.mu.Unlock()
+
+	reached, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	l := h.srv.enumLimit
+	l.mu.Lock() // the network gives the race detector no edge to the handler
+	real := l.now
+	l.now = func() time.Time {
+		if calls.Add(1) == 2 { // blocked() was call 1; this is rejected()
+			close(reached)
+			<-release
+		}
+		return real()
+	}
+	l.mu.Unlock()
+
+	// The 403 is held back while the rejection is unrecorded.
+	expectSilence(t, scanner, scanner.buildRegister("tenth", "example.com", 600, ""), h.publicUDP)
+	select {
+	case <-reached:
+	default:
+		t.Fatal("rejected() was never reached")
+	}
+	close(release)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !h.srv.enumLimit.blocked(src) {
+		if time.Now().After(deadline) {
+			t.Fatal("the 10th rejection was never recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	expectSilence(t, scanner, scanner.buildRegister("u-next", "example.com", 600, ""), h.publicUDP)
 }
 
 func TestEnumLimiterCountsDistinctAORsPerWindow(t *testing.T) {
