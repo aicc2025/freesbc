@@ -492,7 +492,7 @@ The carrier source set (`carrierSnapshot.isSource`, `internal/edge/carrierdns.go
 - FreeSBC appends `X-FreeSBC-Carrier: <name>` after `prepareForward` (`invite.go:236-238`); `unknown` for a carrier-source address that matches no entry. The same stamp is added to ACK and in-dialog requests from a carrier (`stampCarrier`, `carrier.go:152`), which also counts them in the metric.
 - The Contact toward the switch is FreeSBC's private address, the Record-Route is the usual RFC 5658 double pair, and the SDP is built from scratch with a private anchor port (the standard upstream offer, `buildUpstreamOffer`). Responses go back through `respToCarrier` (§6.5).
 - Carriers are exempt from the per-source early-call cap `maxEarlyPerSource` (`invite.go:31`, `invite.go:125-136`). `shield.carrier_rate_limit` bounds them instead, and the shield never scanner-bans a carrier source (`internal/shield/shield.go:111-118`). The predicate is the live directory snapshot (`edge.go:356`).
-- A request from a carrier source that matches no dialog record and is not an INVITE (an ACK or BYE for a call whose record is gone) takes the in-dialog fallback: hashed by the DID to a node's carrier address, with the same Request-URI restoration and stamp (`directionFor`, `indialog.go:498-507`; `restoreCarrierRURI`, `hide.go:311`). `carrierFallback` (`carrier.go:140`) is the test: a carrier source that is not an exact live registration address.
+- A request from a carrier source that matches no dialog record and is not an INVITE (an ACK or BYE for a call whose record is gone) takes the in-dialog fallback: hashed by the DID to a node's carrier address, with the same Request-URI restoration and stamp (`directionFor`, `indialog.go:498-507`; `restoreCarrierRURI`, `hide.go:314`). `carrierFallback` (`carrier.go:140`) is the test: a carrier source that is not an exact live registration address.
 
 A public OPTIONS, including a carrier's keepalive, is answered locally and never reaches the switch (`onOptions`, `edge.go:839`).
 
@@ -547,33 +547,33 @@ Every other out-of-dialog method gets 405 (table in §6.1). The send address of 
 
 ### 6.6 Topology hiding
 
-On a client call FreeSBC keeps every Via below its own and adds the double Record-Route, because both sides are its own to show (§7.8). On a carrier leg that would leak the switch, so `hide.go` applies a separate set of rules. A request toward a carrier is built by `prepareForwardHidden` (`hide.go:81`): `prepareForward` first, then `hideToCarrier` (`hide.go:161`).
+On a client call FreeSBC keeps every Via below its own and adds the double Record-Route, because both sides are its own to show (§7.8). On a carrier leg that would leak the switch, so `hide.go` applies a separate set of rules. A request toward a carrier is built by `prepareForwardHidden` (`hide.go:82`): `prepareForward` first, then `hideToCarrier` (`hide.go:164`).
 
 **Request toward a carrier** (out-of-dialog REGISTER, INVITE, OPTIONS, and every in-dialog request of a carrier dialog that leaves on the public side):
 
 | Header | Rule |
 |---|---|
-| Via | Every Via the switch added is removed; the only one is FreeSBC's public Via (`hide.go:162-165`). |
-| Record-Route | All removed; only FreeSBC's public entry is added, and only when the request opens a dialog (`recordRoute` true: INVITE, `hide.go:166-169`). |
-| Route | FreeSBC's own entries were stripped by `prepareForward`. On an out-of-dialog request every remaining Route is removed, since switch-preloaded routes may be private. On an in-dialog request the remaining Routes are the route set learned from the carrier's own Record-Routes and are kept (`hide.go:170-172`). |
-| Contact | FreeSBC's public address when present (`hide.go:174-177`); the INVITE's is built in `inviteToCarrier`; REGISTER carries the rewritten binding (§6.8). |
-| From, To | The URI host is rewritten to `public.ip` (port dropped) when it is `private.ip` or the IP of an `edge.switch` node (`maskIdentity`, `hide.go:123-155`; `isSwitchHost`, `hide.go:97`). User, parameters and tags are kept. A carrier domain or any other host is left alone. |
-| P-Asserted-Identity, P-Preferred-Identity, Remote-Party-ID, Diversion | The same host rewrite, applied to every `sip:`/`sips:` URI in the value by regexp (`hide.go:91-93`, `hide.go:130-154`). |
+| Via | Every Via the switch added is removed; the only one is FreeSBC's public Via (`hide.go:165-168`). |
+| Record-Route | All removed; only FreeSBC's public entry is added, and only when the request opens a dialog (`recordRoute` true: INVITE, `hide.go:169-172`). |
+| Route | FreeSBC's own entries were stripped by `prepareForward`. On an out-of-dialog request every remaining Route is removed, since switch-preloaded routes may be private. On an in-dialog request the remaining Routes are the route set learned from the carrier's own Record-Routes and are kept (`hide.go:173-175`). |
+| Contact | FreeSBC's public address when present (`hide.go:177-180`); the INVITE's is built in `inviteToCarrier`; REGISTER carries the rewritten binding (§6.8). |
+| From, To | The URI host is rewritten to `public.ip` (port dropped) when it is `private.ip` or the IP of an `edge.switch` node (`maskIdentity`, `hide.go:126-158`; `isSwitchHost`, `hide.go:100`). User, parameters and tags are kept. A carrier domain or any other host is left alone. |
+| P-Asserted-Identity, P-Preferred-Identity, Remote-Party-ID, Diversion, Call-Info, Alert-Info | The same host rewrite, applied to every `sip:`/`sips:` URI in the value by regexp (`hide.go:94-96`, `hide.go:133-157`). |
 | X-FreeSBC-* | Removed (§6.3). |
 | Call-ID | Untouched: the switch's Call-ID reaches the carrier. |
 | Body | Rebuilt from scratch; no body carries a foreign address. |
 
 Max-Forwards is decremented as on any proxied request; a zero Max-Forwards is 483.
 
-**Response to the switch** (`respToSwitch`, `hideResponse`, `hide.go:183-199`): FreeSBC's public Via is popped (an empty Via list is allowed here, `popOwnVia`, `forward.go:173`); then the switch's original Vias are restored so its transaction matches; From and To addresses are restored to the originals (tags stay as answered), undoing the identity masking. The Contact is FreeSBC's private address (`invite_leg.go:151`). For an INVITE's 1xx/2xx, FreeSBC's private Record-Route is inserted right after the public one the carrier echoed, or at the end of the list if the carrier dropped it (`addPrivateRecordRoute`, `hide.go:226`; call site `invite_leg.go:152-154`). The switch, as UAC, reverses the list, so its route set starts at `private.ip:5060` and its in-dialog requests reach the private socket.
+**Response to the switch** (`respToSwitch`, `hideResponse`, `hide.go:186-202`): FreeSBC's public Via is popped (an empty Via list is allowed here, `popOwnVia`, `forward.go:173`); then the switch's original Vias are restored so its transaction matches; From and To addresses are restored to the originals (tags stay as answered), undoing the identity masking. The Contact is FreeSBC's private address (`invite_leg.go:151`). For an INVITE's 1xx/2xx, FreeSBC's private Record-Route is inserted right after the public one the carrier echoed, or at the end of the list if the carrier dropped it (`addPrivateRecordRoute`, `hide.go:229`; call site `invite_leg.go:152-154`). The switch, as UAC, reverses the list, so its route set starts at `private.ip:5060` and its in-dialog requests reach the private socket.
 
-**Carrier-originated request that goes to the switch** keeps the normal double Record-Route toward the switch (it is a private-side message; nothing is hidden from the switch). **The response to the carrier** (`respToCarrier`, `hide.go:200-217`) has any Record-Route naming the private socket removed and its Contact, if present, replaced by the public address, so no private address leaves in a response either.
+**Carrier-originated request that goes to the switch** keeps the normal double Record-Route toward the switch (it is a private-side message; nothing is hidden from the switch). **The response to the carrier** (`respToCarrier`, `hide.go:203-220`) has any Record-Route naming the private socket removed and its Contact, if present, replaced by the public address, so no private address leaves in a response either.
 
-`carrierLeg` (`hide.go:283`) selects the mode per request: a request whose dialog (or, with no record, whose source) is a carrier's, going to the public side, gets hiding and `respToSwitch`; coming from the public side, `respToCarrier`; every client request gets none.
+`carrierLeg` (`hide.go:286`) selects the mode per request: a request whose dialog (or, with no record, whose source) is a carrier's, going to the public side, gets hiding and `respToSwitch`; coming from the public side, `respToCarrier`; every client request gets none.
 
 ### 6.7 In-dialog requests on a carrier dialog
 
-A dialog is matched on Call-ID plus both tags (§7.7). `dialog.carrier` is set for both directions (`inviteToCarrier`, `inviteToUpstream`). ACK, CANCEL, BYE, re-INVITE, UPDATE, INFO and NOTIFY in a carrier dialog take the same hiding rules because they leave through `prepareForwardFor` (`hide.go:73`) and `relayResponseHide`: `onAck` (`indialog.go:220`), `onInDialog` (`indialog.go:287`), `onReInvite` (`indialog.go:52-60`). The Request-URI of a forwarded in-dialog request is the far end's own Contact (`retargetInDialog`, `indialog.go:531`). The metric `freesbc_edge_carrier_requests_total` counts requests toward the carrier (`noteOutbound`, `hide.go:302`) and toward the switch (`stampCarrier`).
+A dialog is matched on Call-ID plus both tags (§7.7). `dialog.carrier` is set for both directions (`inviteToCarrier`, `inviteToUpstream`). ACK, CANCEL, BYE, re-INVITE, UPDATE, INFO and NOTIFY in a carrier dialog take the same hiding rules because they leave through `prepareForwardFor` (`hide.go:74`) and `relayResponseHide`: `onAck` (`indialog.go:220`), `onInDialog` (`indialog.go:287`), `onReInvite` (`indialog.go:52-60`). The Request-URI of a forwarded in-dialog request is the far end's own Contact (`retargetInDialog`, `indialog.go:531`). The metric `freesbc_edge_carrier_requests_total` counts requests toward the carrier (`noteOutbound`, `hide.go:305`) and toward the switch (`stampCarrier`).
 
 The media-ended BYE FreeSBC sends on its own behalf (`sendMiddleBye`, `indialog.go:567`) masks the From and To hosts the same way when its target is a carrier (`indialog.go:593-597`).
 
@@ -1086,7 +1086,7 @@ jumps caused by bodies built for the other leg. A call that involves a
 carrier also records the carrier's name (`carrier`, set once right after the
 record is created by `setCarrier`, `dialog.go:504`): it is what routes the
 dialog's later requests through the carrier rules of §6 (`carrierLeg`,
-`hide.go:283`) and what the admin call list shows (`calls`,
+`hide.go:286`) and what the admin call list shows (`calls`,
 `dialog.go:382`: `carrier:<name>` and `switch:<ip:port>` as the two ends of a
 carrier call). **Every mutable field of the `dialog` record is guarded by the
 table's mutex**; the attached `mediaSession` guards its own `codecs` and
@@ -1211,11 +1211,11 @@ Record-Route is added on the initial INVITE in every call direction
 REGISTER, ACK, BYE/INFO/NOTIFY or re-INVITE.
 
 **Carrier legs.** A request that goes to a carrier takes the same steps and
-then `hideToCarrier` (`prepareForwardHidden`, `hide.go:81`): the switch's Vias,
+then `hideToCarrier` (`prepareForwardHidden`, `hide.go:82`): the switch's Vias,
 Record-Routes, foreign Routes, private identity hosts and `X-FreeSBC-*`
-headers do not leave. `prepareForwardFor` (`hide.go:73`) picks between the
-two, `carrierLeg` (`hide.go:283`) decides per request from the dialog's
-carrier, and the matching response rewrite is `respHide` (`hide.go:63`). The
+headers do not leave. `prepareForwardFor` (`hide.go:74`) picks between the
+two, `carrierLeg` (`hide.go:286`) decides per request from the dialog's
+carrier, and the matching response rewrite is `respHide` (`hide.go:64`). The
 rules are in §6; they apply to every in-dialog request of a carrier call
 (ACK, BYE, re-INVITE, INFO, NOTIFY) because those handlers all go through
 `prepareForwardFor` / `relayResponseHide`.
@@ -1403,7 +1403,7 @@ fallback below), and the no-To-tag rule above is unchanged.
   `carrier.go:140`), the request is hashed by the Request-URI user (the DID,
   as its INVITE was) to a switch node and sent to that node's **carrier**
   port (`carrierAddr`); `stampCarrier` (`carrier.go:152`) names the carrier
-  and `restoreCarrierRURI` (`hide.go:311`) puts back the Contact the node
+  and `restoreCarrierRURI` (`hide.go:314`) puts back the Contact the node
   registered when the Request-URI carries a registration token (§6).
   Otherwise it is a client's request and is hashed by `hashUserFor` to a
   switch node's client port. **This fallback deliberately never 481s**; the
@@ -1511,13 +1511,13 @@ described in §6. What belongs to the dialog and forwarding machinery:
   resolved address, or no public UDP side, is **503**.
 - A carrier's responses to an INVITE going to the switch's side take the
   `relayInviteResponse` path (`invite_leg.go:148`): for `respToSwitch` and a
-  1xx/2xx, `addPrivateRecordRoute` (`hide.go:226`) puts FreeSBC's private
+  1xx/2xx, `addPrivateRecordRoute` (`hide.go:229`) puts FreeSBC's private
   Record-Route in the list the switch will use.
 - A dialog's carrier name drives every later message of the dialog:
   `carrierLeg` picks hide/response modes for ACK, BYE, re-INVITE, INFO and
   NOTIFY (`indialog.go`), and the carrier request counter
   (`CarrierRequest`, direction `inbound` or `outbound`) is incremented per
-  request (`noteOutbound`, `hide.go:302`; `stampCarrier`, `carrier.go:152`).
+  request (`noteOutbound`, `hide.go:305`; `stampCarrier`, `carrier.go:152`).
 
 ### 7.11 Edge attempt outcome classification
 
@@ -3042,8 +3042,8 @@ emitted with no attributes and no connection line. Toward carriers it is
 enforced on every carrier leg (`hide.go`, §6): the carrier sees only
 FreeSBC's public Via, Record-Route and Contact; every Via the switch added,
 every foreign Route and every `X-FreeSBC-*` header is removed; the host of
-From, To, P-Asserted-Identity, P-Preferred-Identity, Remote-Party-ID and
-Diversion is rewritten to `public.ip` when it names `private.ip` or a switch
+From, To, P-Asserted-Identity, P-Preferred-Identity, Remote-Party-ID,
+Diversion, Call-Info and Alert-Info is rewritten to `public.ip` when it names `private.ip` or a switch
 node; and the carrier's responses to the switch get the switch's own Vias and
 URIs back. Call-ID passes through unchanged on every path.
 
