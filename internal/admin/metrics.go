@@ -19,8 +19,8 @@ type collector struct {
 	dropsTotal  *prometheus.Desc
 	buildInfo   *prometheus.Desc
 
-	// Edge-proxy plane (nil-safe: Deps.Proxy is nil in a trunk-only
-	// deployment, and Collect skips the whole block then).
+	// Edge-proxy plane (nil-safe: Deps.Proxy is nil when no stats
+	// source is wired, and Collect skips the whole block then).
 	proxyRegs       *prometheus.Desc
 	proxyDialogs    *prometheus.Desc
 	proxyMedia      *prometheus.Desc
@@ -103,7 +103,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	g(c.buildInfo, 1, c.deps.Version)
 
 	if c.deps.Proxy == nil {
-		return // trunk-only deployment: the edge proxy is not running
+		return // no edge stats wired
 	}
 	p := c.deps.Proxy()
 	counter := func(d *prometheus.Desc, v float64, lv ...string) {

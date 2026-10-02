@@ -25,7 +25,6 @@ import (
 	"github.com/pion/srtp/v3"
 	"github.com/pion/transport/v4/packetio"
 
-	"github.com/freesbc/freesbc/internal/config"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
@@ -799,7 +798,7 @@ func fsUacReInvite(t *testing.T, f *fakeSwitch, res *sip.Response, body string) 
 // BYE, and every port is released.
 func TestInboundBrowserCallWatchdog(t *testing.T) {
 	h := startHarness(t, true)
-	auditReplaceConfig(h, func(c *config.Config) { c.Listen.Media.RTPTimeout = config.Duration(time.Second) })
+	h.srv.setRTPTimeout(time.Second)
 	c, _, call, _ := placeBrowserCall(t, h, "ws", "active", "127.0.0.1")
 	waitForDialog(t, h, fsip.CallID(call.res))
 
@@ -875,27 +874,6 @@ func TestInboundBrowserCallPlainAnswerRefused(t *testing.T) {
 	}
 	waitForRelease(t, h)
 	waitWebRTCSessions(t, h, 0)
-}
-
-// TestInboundCallToBrowserWithoutWebRTC: with webrtc.enabled false there is
-// no DTLS-SRTP offer to make, so a call to a ws/wss client is refused 488
-// before anything is allocated or sent to the browser — instead of
-// offering plain RTP the browser would fail with an opaque 480.
-func TestInboundCallToBrowserWithoutWebRTC(t *testing.T) {
-	h := startHarness(t, false)
-	c := newWSClient(t)
-	ruri := registerOver(t, h, c, h.publicWS, "1001")
-	drain(c.inbound)
-	res := h.fs.call(t, ruri, h.privateSIP, phoneOfferSDP(h.fs.rtpPort))
-	if res.StatusCode != 488 {
-		t.Fatalf("got %d, want 488", res.StatusCode)
-	}
-	select {
-	case r := <-c.inbound:
-		t.Fatalf("the browser received a %s", r.Method)
-	case <-time.After(300 * time.Millisecond):
-	}
-	waitForRelease(t, h)
 }
 
 // TestInboundCallToUDPPhoneStaysPlainWithWebRTCOn is the regression guard:

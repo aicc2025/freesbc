@@ -8,7 +8,7 @@ import (
 )
 
 // banCap is the hard ceiling on distinct banned sources: a
-// unique-source flood within one auto_ban.duration window (default 1h) must
+// unique-source flood within one shield.ban window (default 1h) must
 // not grow the table without bound. 64k entries is far beyond any realistic
 // deployment's distinct-source count while bounding memory to ~a few MiB.
 const banCap = 65536

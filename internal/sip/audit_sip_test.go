@@ -122,7 +122,6 @@ func FuzzAuditSIPMessageHelpers(f *testing.F) {
 			t.Fatalf("ReadFilter returned (%v, %v) for an in-cap read", out == nil, err)
 		}
 		_ = sameAddr(string(data), "0.0.0.0:5060")
-		_, _ = ParseBindIP(string(data))
 		msg, err := sip.NewParser().ParseSIP(data)
 		if err != nil {
 			return

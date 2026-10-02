@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -32,7 +31,7 @@ func startWatch(t *testing.T, path string, store *Store) {
 }
 
 func TestWatchReloadsValidConfig(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sbc.yaml")
+	path := filepath.Join(t.TempDir(), "freesbc.yaml")
 	if err := os.WriteFile(path, []byte(minimalYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -43,17 +42,17 @@ func TestWatchReloadsValidConfig(t *testing.T) {
 	store := NewStore(initial)
 	startWatch(t, path, store)
 
-	updated := strings.Replace(minimalYAML, "10.0.0.10:5060", "10.0.0.99:5060", 1)
+	updated := minimalYAML + "shield: { ban: 99m }\n"
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 3*time.Second, func() bool {
-		return store.Current().Peers["pbx"].Address == "10.0.0.99:5060"
+		return store.Current().Shield.Ban.Std() == 99*time.Minute
 	})
 }
 
 func TestWatchKeepsOldConfigOnBadReload(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sbc.yaml")
+	path := filepath.Join(t.TempDir(), "freesbc.yaml")
 	if err := os.WriteFile(path, []byte(minimalYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +63,7 @@ func TestWatchKeepsOldConfigOnBadReload(t *testing.T) {
 	store := NewStore(initial)
 	startWatch(t, path, store)
 
-	if err := os.WriteFile(path, []byte("listen: ["), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("public: ["), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// Give the watcher time to (wrongly) swap; then assert it did not.
@@ -74,18 +73,18 @@ func TestWatchKeepsOldConfigOnBadReload(t *testing.T) {
 	}
 
 	// And a subsequent good write still lands.
-	updated := strings.Replace(minimalYAML, "10.0.0.10:5060", "10.0.0.42:5060", 1)
+	updated := minimalYAML + "shield: { ban: 42m }\n"
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 3*time.Second, func() bool {
-		return store.Current().Peers["pbx"].Address == "10.0.0.42:5060"
+		return store.Current().Shield.Ban.Std() == 42*time.Minute
 	})
 }
 
 func TestWatchSurvivesAtomicRename(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "sbc.yaml")
+	path := filepath.Join(dir, "freesbc.yaml")
 	if err := os.WriteFile(path, []byte(minimalYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -97,8 +96,8 @@ func TestWatchSurvivesAtomicRename(t *testing.T) {
 	startWatch(t, path, store)
 
 	// Editors and `mv` replace the file via rename; the watcher must survive.
-	tmp := filepath.Join(dir, ".sbc.yaml.tmp")
-	updated := strings.Replace(minimalYAML, "10.0.0.10:5060", "10.0.0.77:5060", 1)
+	tmp := filepath.Join(dir, ".freesbc.yaml.tmp")
+	updated := minimalYAML + "shield: { ban: 77m }\n"
 	if err := os.WriteFile(tmp, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -106,16 +105,16 @@ func TestWatchSurvivesAtomicRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 3*time.Second, func() bool {
-		return store.Current().Peers["pbx"].Address == "10.0.0.77:5060"
+		return store.Current().Shield.Ban.Std() == 77*time.Minute
 	})
 }
 
 // audit: P2-CFG-011
-// A Kubernetes ConfigMap volume exposes sbc.yaml as a symlink to
-// ..data/sbc.yaml, and ..data as a symlink to a timestamped directory. An
+// A Kubernetes ConfigMap volume exposes freesbc.yaml as a symlink to
+// ..data/freesbc.yaml, and ..data as a symlink to a timestamped directory. An
 // update writes a new directory and renames a new ..data link over the old
 // one: the only event in the watched directory is for "..data", never for
-// sbc.yaml itself. The reload must still happen.
+// freesbc.yaml itself. The reload must still happen.
 func TestWatchFollowsConfigMapSymlinkSwap(t *testing.T) {
 	dir := t.TempDir()
 	writeVersion := func(name, body string) {
@@ -123,7 +122,7 @@ func TestWatchFollowsConfigMapSymlinkSwap(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(dir, name), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, name, "sbc.yaml"), []byte(body), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name, "freesbc.yaml"), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -131,8 +130,8 @@ func TestWatchFollowsConfigMapSymlinkSwap(t *testing.T) {
 	if err := os.Symlink("..2026_09_25_v1", filepath.Join(dir, "..data")); err != nil {
 		t.Skipf("symlink: %v", err)
 	}
-	path := filepath.Join(dir, "sbc.yaml")
-	if err := os.Symlink(filepath.Join("..data", "sbc.yaml"), path); err != nil {
+	path := filepath.Join(dir, "freesbc.yaml")
+	if err := os.Symlink(filepath.Join("..data", "freesbc.yaml"), path); err != nil {
 		t.Fatal(err)
 	}
 	initial, err := Load(path)
@@ -144,7 +143,7 @@ func TestWatchFollowsConfigMapSymlinkSwap(t *testing.T) {
 
 	// The kubelet's atomic update: new directory, new ..data_tmp link,
 	// rename it over ..data, drop the old directory.
-	writeVersion("..2026_09_25_v2", strings.Replace(minimalYAML, "10.0.0.10:5060", "10.0.0.99:5060", 1))
+	writeVersion("..2026_09_25_v2", minimalYAML+"shield: { ban: 99m }\n")
 	tmp := filepath.Join(dir, "..data_tmp")
 	if err := os.Symlink("..2026_09_25_v2", tmp); err != nil {
 		t.Fatal(err)
@@ -156,7 +155,7 @@ func TestWatchFollowsConfigMapSymlinkSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 3*time.Second, func() bool {
-		return store.Current().Peers["pbx"].Address == "10.0.0.99:5060"
+		return store.Current().Shield.Ban.Std() == 99*time.Minute
 	})
 }
 
@@ -169,7 +168,7 @@ func TestWatchFollowsSymlinkTargetInOtherDir(t *testing.T) {
 	if err := os.WriteFile(target, []byte(minimalYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(linkDir, "sbc.yaml")
+	path := filepath.Join(linkDir, "freesbc.yaml")
 	if err := os.Symlink(target, path); err != nil {
 		t.Skipf("symlink: %v", err)
 	}
@@ -180,11 +179,11 @@ func TestWatchFollowsSymlinkTargetInOtherDir(t *testing.T) {
 	store := NewStore(initial)
 	startWatch(t, path, store)
 
-	updated := strings.Replace(minimalYAML, "10.0.0.10:5060", "10.0.0.99:5060", 1)
+	updated := minimalYAML + "shield: { ban: 99m }\n"
 	if err := os.WriteFile(target, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 3*time.Second, func() bool {
-		return store.Current().Peers["pbx"].Address == "10.0.0.99:5060"
+		return store.Current().Shield.Ban.Std() == 99*time.Minute
 	})
 }

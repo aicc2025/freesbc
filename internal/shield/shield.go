@@ -22,12 +22,13 @@ const (
 
 // Shield is FreeSBC's front-door security plane. It is consulted on every
 // inbound request on the public edge listeners; every denial is a silent
-// Drop. Params (rate limit, auto_ban) hot-reload from the config store per
+// Drop. Params (rate limits, ban) hot-reload from the config store per
 // call. Bans live in process memory only.
 type Shield struct {
 	store      *config.Store
 	log        *slog.Logger
-	limiter    *rateLimiter             // per-source limit (shield.rate_limit)
+	isCarrier  func(netip.Addr) bool    // carrier-source predicate; never nil
+	limiter    *rateLimiter             // per-source limit (rate_limit / carrier_rate_limit)
 	bans       *banList[netip.Addr]     // source IPs (connection-oriented verdicts)
 	socketBans *banList[netip.AddrPort] // UDP source sockets (see CheckFrom)
 
@@ -38,23 +39,31 @@ type Shield struct {
 	dropsScanner atomic.Int64
 	dropsRate    atomic.Int64
 
-	// cached parse of the rate_limit string (re-parsed only when it changes).
-	rlMu   sync.Mutex
-	rlStr  string
-	rlOpts config.RateLimit
+	// cached parses of the rate limit strings (re-parsed only when they change).
+	rlMu    sync.Mutex
+	rlStr   string
+	rlOpts  config.RateLimit
+	carStr  string
+	carOpts config.RateLimit
 
 	stop context.CancelFunc
 	done chan struct{}
 }
 
-// New builds the Shield over store and starts a background prune loop. No
-// source is exempt (the edge's trusted private plane bypasses the shield
-// before calling it).
-func New(store *config.Store, log *slog.Logger) *Shield {
+// New builds the Shield over store and starts a background prune loop.
+// isCarrier reports whether an address is a carrier source: such sources
+// are limited by shield.carrier_rate_limit instead of shield.rate_limit
+// and are exempt from the scanner ban. nil means no carriers. (The edge's
+// trusted private plane bypasses the shield before calling it.)
+func New(store *config.Store, log *slog.Logger, isCarrier func(netip.Addr) bool) *Shield {
+	if isCarrier == nil {
+		isCarrier = func(netip.Addr) bool { return false }
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Shield{
 		store:      store,
 		log:        log,
+		isCarrier:  isCarrier,
 		limiter:    newRateLimiter(),
 		bans:       newBanList(),
 		socketBans: newBanTable[netip.AddrPort](),
@@ -99,25 +108,26 @@ func (s *Shield) CheckFrom(srcAP netip.AddrPort, userAgent string, transport str
 		s.dropsBanned.Add(1)
 		return Drop
 	}
-	rl := s.rateLimit(cfg)
+	carrier := s.isCarrier(src)
+	rl := s.rateLimit(cfg, carrier)
 	if !s.limiter.allow(src, rl.Rate, rl.Interval, rl.PerIP) {
 		s.log.Debug("shield rate-limited", "source", src)
 		s.dropsRate.Add(1)
 		return Drop
 	}
-	if isScanner(userAgent) {
+	if !carrier && isScanner(userAgent) {
 		s.dropsScanner.Add(1)
 		if !bannableTransport(transport) {
 			// A datagram's source address is forgeable: an IP ban would let
 			// one spoofed packet lock a third party out, and a spoofed flood
 			// fill the IP table. Ban the socket instead, briefly.
 			if isUDP(transport) && srcAP.Port() != 0 {
-				s.socketBans.ban(srcAP, min(cfg.Shield.AutoBan.Duration.Std(), socketBanMax))
+				s.socketBans.ban(srcAP, min(cfg.Shield.Ban.Std(), socketBanMax))
 			}
 			s.log.Debug("shield dropped scanner datagram", "source", srcAP, "ua", userAgent)
 			return Drop
 		}
-		if !s.bans.ban(src, cfg.Shield.AutoBan.Duration.Std()) {
+		if !s.bans.ban(src, cfg.Shield.Ban.Std()) {
 			s.log.Debug("shield ban table at hard cap; scanner ban refused", "source", src, "ua", userAgent)
 		} else {
 			s.log.Warn("shield banned scanner", "source", src, "ua", userAgent)
@@ -180,16 +190,20 @@ func (s *Shield) Close() error {
 	return nil
 }
 
-func (s *Shield) rateLimit(cfg *config.Config) config.RateLimit {
+func (s *Shield) rateLimit(cfg *config.Config, carrier bool) config.RateLimit {
 	s.rlMu.Lock()
 	defer s.rlMu.Unlock()
-	if cfg.Shield.RateLimit != s.rlStr {
-		if rl, err := config.ParseRateLimit(cfg.Shield.RateLimit); err == nil {
-			s.rlOpts = rl
-			s.rlStr = cfg.Shield.RateLimit
+	str, cached, opts := cfg.Shield.RateLimit, &s.rlStr, &s.rlOpts
+	if carrier {
+		str, cached, opts = cfg.Shield.CarrierRateLimit, &s.carStr, &s.carOpts
+	}
+	if str != *cached {
+		if rl, err := config.ParseRateLimit(str); err == nil {
+			*opts = rl
+			*cached = str
 		}
 	}
-	return s.rlOpts
+	return *opts
 }
 
 func (s *Shield) pruneLoop(ctx context.Context) {

@@ -137,13 +137,11 @@ func TestMaxForwardsZeroGets483(t *testing.T) {
 // carry original-1, not original-2.
 func TestMaxForwardsSurvivesUpstreamFailover(t *testing.T) {
 	addrB := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h, switches := startHarnessUpstreams(t, "", "30s", map[string]string{
-		"fs-a": "192.0.2.1:5060", // unreachable: the send fails at once
-		"fs-b": addrB,
-	})
-	fsB := switches["fs-b"]
-	if h.srv.topo.upstreamNames[0] != "fs-a" {
-		t.Fatalf("pool %v: fs-a must sort first for this test", h.srv.topo.upstreamNames)
+	const deadA = "10.255.255.1:5060" // unreachable: the send fails at once
+	h, switches := startHarnessSwitches(t, []string{deadA, addrB})
+	fsB := switches[addrB]
+	if h.srv.topo.upstreamNames[0] != deadA {
+		t.Fatalf("pool %v: %s must sort first for this test", h.srv.topo.upstreamNames, deadA)
 	}
 	user := userForNode(t, h.srv.topo, 0)
 
@@ -151,11 +149,11 @@ func TestMaxForwardsSurvivesUpstreamFailover(t *testing.T) {
 	req := withMaxForwards(phone.buildRegister(user, "example.com", 600, ""), 5)
 	res := phone.do(t, req, h.publicUDP)
 	if res.StatusCode != 401 {
-		t.Fatalf("REGISTER via failover: got %d, want the 401 from fs-b", res.StatusCode)
+		t.Fatalf("REGISTER via failover: got %d, want the 401 from the live node", res.StatusCode)
 	}
 	regs := fsB.waitFor(sip.REGISTER, 1, 3*time.Second)
 	if len(regs) != 1 {
-		t.Fatalf("fs-b saw %d REGISTERs, want 1", len(regs))
+		t.Fatalf("the live node saw %d REGISTERs, want 1", len(regs))
 	}
 	if got := maxForwardsOf(regs[0]); got != 4 {
 		t.Errorf("Max-Forwards after failover = %d, want 4 (5 minus one hop)", got)

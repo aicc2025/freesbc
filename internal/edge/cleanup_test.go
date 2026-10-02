@@ -151,7 +151,7 @@ func TestMediaPoolExhaustionRejectsCleanly(t *testing.T) {
 
 // A hostile or malformed offer must be refused, never panic the process.
 func TestMalformedOffersRejected(t *testing.T) {
-	h := startHarness(t, false)
+	h := startHarness(t, false) // no ws/wss listener: WebRTC is off
 	phone := newUDPClient(t)
 
 	bodies := map[string]string{
@@ -178,6 +178,7 @@ func TestMalformedOffersRejected(t *testing.T) {
 	// sipgo rather than FreeSBC. The body is sized to clear the SDP layer's 16 KiB
 	// limit while staying under sipgo's 32 KiB read buffer, so what
 	// rejects it is FreeSBC's own bound and not a transport artifact.
+	h = startHarness(t, true)
 	browser := newWSClient(t)
 	huge := "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\n" +
 		strings.Repeat("a=x:yyyyyyyyyyyyyyyyyyyy\r\n", 800)

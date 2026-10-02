@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/emiago/sipgo/sip"
@@ -103,52 +102,35 @@ func (s side) via(branch string) *sip.ViaHeader {
 	return v
 }
 
-// endpoint is one resolved SIP peer FreeSBC dials — an upstream
-// FreeSWITCH. addr is the parsed signaling
-// address; host is the host:port exactly as configured, which is what the
-// forwarder puts in Destination and what the call table records as a
-// remote.
+// endpoint is one switch node FreeSBC dials. addr is the signaling
+// address (edge.switch entry), host the same as "IP:port", which is what
+// the forwarder puts in Destination and what the call table records as a
+// remote. carrierPort is the port carrier-originated traffic is delivered
+// to on this node (edge.switch_carrier_port, else addr's port).
 type endpoint struct {
-	addr netip.AddrPort
-	host string
+	addr        netip.AddrPort
+	host        string
+	carrierPort uint16
 }
 
-// parseEndpoint resolves one configured host:port. It performs no DNS: a
-// name would make routing and failover depend on a resolver at call time —
-// the opposite of the startup snapshot the rest of the topology is — and a
-// poisoned resolver could redirect the private leg.
-func parseEndpoint(label, address string) (endpoint, error) {
-	host, portStr, err := net.SplitHostPort(address)
-	if err != nil {
-		return endpoint{}, err
-	}
-	ip, err := netip.ParseAddr(host)
-	if err != nil {
-		return endpoint{}, &configError{label + " must be a literal IP:port, got " + host}
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return endpoint{}, err
-	}
-	return endpoint{addr: netip.AddrPortFrom(ip, uint16(port)), host: address}, nil
+// carrierAddr is where carrier traffic for this node goes.
+func (e endpoint) carrierAddr() netip.AddrPort {
+	return netip.AddrPortFrom(e.addr.Addr(), e.carrierPort)
 }
 
 // topology is the resolved network model the proxy runs with: an
 // IMMUTABLE snapshot, built once at startup from the config and never
 // written again. Listener addresses cannot be changed under a running
 // socket, so nothing is re-read per request, and nothing needs a lock —
-// the snapshot Run installs (topology.pinned, after the sockets are bound)
-// is fully constructed before the first goroutine that can read it exists.
+// it is fully constructed in New, before any goroutine that can read it exists.
 type topology struct {
 	// public holds one side per enabled public transport.
 	public map[string]side
 	// private is the single FreeSWITCH-facing side.
 	private side
 
-	// upstreams is the FreeSWITCH upstream set, keyed by the names the
-	// cooldown table and the logs use. The v1 alias (sip.upstream.address)
-	// synthesises node "default" at build time, so both config shapes are
-	// one runtime model and the request path never knows which produced it.
+	// upstreams is the switch node set, keyed by the node's "IP:port",
+	// which is also the name the cooldown table and the logs use.
 	// upstreamNames is the same set's names, sorted once here: hashing and
 	// failover order must be deterministic, and Go map iteration is not.
 	upstreams     map[string]endpoint
@@ -156,8 +138,8 @@ type topology struct {
 
 	// carrierSources are the public source prefixes an out-of-dialog
 	// INVITE is admitted from without a registration (admission.go):
-	// sip.public.carrier_sources. A startup snapshot like the rest of the
-	// topology (sip.public is restart-only).
+	// edge.carrier_sources plus the literal-IP edge.carriers. A startup
+	// snapshot like the rest of the topology (restart-only).
 	carrierSources []netip.Prefix
 
 	// media advertised addresses.
@@ -165,41 +147,18 @@ type topology struct {
 	privateMediaIP netip.Addr
 }
 
-// buildTopology resolves the config into the runtime model. It performs
-// no DNS: every upstream node must be a literal address, so a poisoned
-// resolver can never redirect the private leg and failover never waits on
-// a lookup.
-func buildTopology(cfg *config.Config) (*topology, error) {
-	// The upstream pool converges the two config shapes here, the v1 alias is synthesised — in buildTopology, NOT in
-	// the config defaults — into the multi model as the single node
-	// "default", so a v1 config and an equivalent one-node pool behave
-	// identically by construction (and the hash degenerates trivially: one
-	// node is always index 0). The store keeps what the operator wrote.
+// buildTopology resolves the config into the runtime model. priv is the
+// private socket (private.ip:5060 unless a test overrides it). It performs
+// no DNS: every switch node is a literal address, so a poisoned resolver
+// can never redirect the private leg.
+func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 	upstreams := map[string]endpoint{}
-	resolveUpstream := func(name, label, address string) error {
-		e, err := parseEndpoint(label, address)
-		if err != nil {
-			return err
+	for _, ap := range cfg.Switches() {
+		cp := uint16(cfg.Edge.SwitchCarrierPort)
+		if cp == 0 {
+			cp = ap.Port()
 		}
-		upstreams[name] = e
-		return nil
-	}
-	if cfg.SIP.Upstream.Address != "" {
-		if err := resolveUpstream("default", "sip.upstream.address", cfg.SIP.Upstream.Address); err != nil {
-			return nil, err
-		}
-	} else {
-		for name, n := range cfg.SIP.Upstreams.Nodes {
-			// A node entry missing its address cannot survive validation,
-			// but a nil map entry (an empty `fs-1:` block) would panic below
-			// — treat it as the address error it is.
-			if n == nil || n.Address == "" {
-				return nil, &configError{"sip.upstreams.nodes." + name + " must be a literal IP:port, got \"\""}
-			}
-			if err := resolveUpstream(name, "sip.upstreams.nodes."+name, n.Address); err != nil {
-				return nil, err
-			}
-		}
+		upstreams[ap.String()] = endpoint{addr: ap, host: ap.String(), carrierPort: cp}
 	}
 	// Sorted once, here: the hash pool and the failover order are read from
 	// this slice on the request path, where map iteration order must never
@@ -210,86 +169,48 @@ func buildTopology(cfg *config.Config) (*topology, error) {
 	}
 	sort.Strings(upstreamNames)
 
-	privIP := cfg.PrivateAdvertisedIP()
 	t := &topology{
-		public:        map[string]side{},
-		upstreams:     upstreams,
-		upstreamNames: upstreamNames,
-		// validate compiled sip.public.carrier_sources (CarrierNets).
-		carrierSources: carrierSourcesFrom(cfg.SIP.Public.CarrierNets()),
+		public:         map[string]side{},
+		upstreams:      upstreams,
+		upstreamNames:  upstreamNames,
+		carrierSources: carrierSourcesFrom(cfg.CarrierNets()),
 		private: side{
 			plane:     planePrivate,
 			transport: "udp",
-			advIP:     privIP,
-			advPort:   cfg.PrivateSIPAdvertisedPort(),
-			laddr: sip.Addr{
-				IP:   net.ParseIP(cfg.SIP.Private.Bind.Host),
-				Port: cfg.SIP.Private.Bind.Port,
-			},
+			advIP:     priv.Addr(),
+			advPort:   int(priv.Port()),
+			laddr:     sipAddr(priv.Addr(), int(priv.Port())),
 		},
-		publicMediaIP:  cfg.PublicRTPAdvertisedIP(),
-		privateMediaIP: cfg.PrivateRTPAdvertisedIP(),
+		publicMediaIP:  cfg.PublicIP(),
+		privateMediaIP: priv.Addr(),
 	}
-	pubIP := cfg.PublicAdvertisedIP()
-	for _, l := range cfg.PublicSIPListeners() {
-		s := side{
-			plane:     planePublic,
-			transport: l.Transport,
-			advIP:     pubIP,
-			// Public listeners advertise the port they bind. A port
-			// translation in front of FreeSBC would need its own config
-			// field; there is deliberately none yet rather than a guess.
-			advPort: l.Bind.Port,
-		}
-		if l.Transport == "udp" {
-			s.laddr = sip.Addr{IP: net.ParseIP(l.Bind.Host), Port: l.Bind.Port}
-		}
-		t.public[l.Transport] = s
-	}
-	return t, nil
-}
-
-// pinned returns the topology to run with once the sockets are open: a
-// copy whose UDP sides name each listener's REAL local address.
-//
-// The pins are built from the config in buildTopology; where the config
-// names a wildcard (0.0.0.0), the address a pin must name to hit sipgo's
-// connection pool is the socket's actual local address — see Run for why
-// the two can differ. UDP only: the ws/wss sides never pin (their outbound
-// path is the client's own inbound connection).
-//
-// A copy rather than a mutation, so the snapshot handlers read is never
-// written to.
-func (t *topology) pinned(opened []listener) *topology {
-	next := *t
-	next.public = make(map[string]side, len(t.public))
-	for transport, s := range t.public {
-		next.public[transport] = s
-	}
-	for _, ln := range opened {
-		if ln.packet == nil {
+	pubIP, bind := cfg.PublicIP(), cfg.PublicBind()
+	for _, l := range []struct {
+		transport string
+		port      int
+	}{{"udp", cfg.Edge.Listen.UDP}, {"ws", cfg.Edge.Listen.WS}, {"wss", cfg.Edge.Listen.WSS}} {
+		if l.port == 0 {
 			continue
 		}
-		ua, ok := ln.packet.LocalAddr().(*net.UDPAddr)
-		if !ok || ua.IP == nil {
-			continue
+		// Public listeners advertise the port they bind. A port
+		// translation in front of FreeSBC would need its own config field;
+		// there is deliberately none rather than a guess.
+		s := side{plane: planePublic, transport: l.transport, advIP: pubIP, advPort: l.port}
+		if l.transport == "udp" {
+			s.laddr = sipAddr(bind, l.port)
 		}
-		laddr := sip.Addr{IP: ua.IP, Port: ua.Port, Zone: ua.Zone}
-		switch ln.transport {
-		case "udp":
-			pub := next.public["udp"]
-			pub.laddr = laddr
-			next.public["udp"] = pub
-		case "udp-private":
-			next.private.laddr = laddr
-		}
+		t.public[l.transport] = s
 	}
-	return &next
+	return t
 }
 
-type configError struct{ msg string }
-
-func (e *configError) Error() string { return "proxy: " + e.msg }
+// sipAddr is the sipgo local-address pin for a bound UDP socket. Every bind
+// is a specific address (no wildcards), so the configured address is the
+// socket's real local address, which is the key sipgo's connection pool
+// uses.
+func sipAddr(ip netip.Addr, port int) sip.Addr {
+	return sip.Addr{IP: net.IP(ip.AsSlice()), Port: port}
+}
 
 // publicSide returns the side for a client transport, falling back to the
 // UDP side when the exact transport is not configured.

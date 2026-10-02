@@ -8,14 +8,12 @@ package edge
 
 import (
 	"context"
-	"net"
 	"runtime"
 	"testing"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
 
-	"github.com/freesbc/freesbc/internal/config"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
@@ -231,7 +229,7 @@ func TestAuditBalanceCancelRaces200(t *testing.T) {
 // reloaded before the calls). The watchdog must release everything.
 func TestAuditBalanceMediaTimeout(t *testing.T) {
 	h := startHarness(t, false)
-	auditReplaceConfig(h, func(c *config.Config) { c.Listen.Media.RTPTimeout = config.Duration(time.Second) })
+	h.srv.setRTPTimeout(time.Second)
 	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
 	settle()
 	baseOwned, _ := auditOwnedGoroutines()
@@ -242,61 +240,4 @@ func TestAuditBalanceMediaTimeout(t *testing.T) {
 	}
 	auditWaitBalanced(t, h, "media timeout", 8*time.Second)
 	auditWaitOwnedGoroutines(t, "media timeout", baseOwned, 5*time.Second)
-}
-
-// audit: P2-MED-011
-// Hot reload mid-call that moves the public RTP range away from the ports
-// live calls hold. After the calls end, every port must be back and the
-// pool's own accounting must be consistent (inUse <= total).
-func TestAuditBalanceReloadMidCall(t *testing.T) {
-	h := startHarness(t, false)
-	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
-	settle()
-	baseOwned, _ := auditOwnedGoroutines()
-
-	type live struct {
-		phone  *client
-		invite *sip.Request
-		res    *sip.Response
-	}
-	var calls []live
-	for i := 0; i < 3; i++ {
-		phone := newUDPClient(t)
-		invite, res, _ := auditPhoneCall(t, h, phone)
-		waitForDialog(t, h, fsip.CallID(invite))
-		calls = append(calls, live{phone, invite, res})
-	}
-	oldMin := h.store.Current().RTP.Public.PortMin
-	auditReplaceConfig(h, func(c *config.Config) {
-		c.RTP.Public.PortMin = oldMin + 100
-		c.RTP.Public.PortMax = oldMin + 199
-	})
-	inUse, total := h.srv.pubPool.Stats()
-	t.Logf("after reload with 3 live calls: public pool inUse=%d total=%d", inUse, total)
-	if inUse > total {
-		t.Errorf("P2-MED-011 confirmed: public pool reports inUse=%d > total=%d after a range-shrinking reload", inUse, total)
-	}
-	// A call placed after the reload lands in the new range.
-	phone := newUDPClient(t)
-	invite, res, _ := auditPhoneCall(t, h, phone)
-	waitForDialog(t, h, fsip.CallID(invite))
-	calls = append(calls, live{phone, invite, res})
-
-	for i, c := range calls {
-		if r := c.phone.do(t, buildBye(c.phone, c.invite, c.res), h.publicUDP); r.StatusCode != 200 {
-			t.Errorf("call %d BYE: %d", i, r.StatusCode)
-		}
-	}
-	auditWaitBalanced(t, h, "reload mid-call", 5*time.Second)
-	auditWaitOwnedGoroutines(t, "reload mid-call", baseOwned, 5*time.Second)
-
-	// The released out-of-range ports must be bindable again (not leaked).
-	for p := oldMin; p < oldMin+8; p++ {
-		c, err := net.ListenUDP("udp", auditLocalAddr(p))
-		if err != nil {
-			t.Errorf("port %d from the pre-reload range is still bound after its call ended: %v", p, err)
-			continue
-		}
-		_ = c.Close()
-	}
 }

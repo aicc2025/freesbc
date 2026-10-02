@@ -7,43 +7,47 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/freesbc/freesbc/internal/edge"
 )
 
-// edgeRunYAML is an edge-only config for Run tests: the public UDP listener
-// and the private bind take kernel-assigned ports. The upstream is never
-// contacted before a call arrives. RTP ranges sit in this package's slice
-// of the test port map (CLAUDE.md, "Test ports").
-func edgeRunYAML(pubPort, privPort, upPort int) string {
+// edgeRunYAML is a v2 config for Run tests: public UDP on pubPort at
+// 127.0.0.1, the switch at 127.0.0.1:upPort (never contacted before a call
+// arrives). private.ip is a non-local placeholder: tests override the fixed
+// private socket with edge.WithPrivateAddr (see setPrivate). The RTP range
+// sits in this package's slice of the test port map (CLAUDE.md, "Test
+// ports").
+func edgeRunYAML(pubPort, upPort int) string {
 	return fmt.Sprintf(`
-network:
-  public:  { bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1 }
-  private: { bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1 }
-sip:
-  public:
-    udp: { enabled: true, bind: "127.0.0.1:%d" }
-  private:
-    bind: "127.0.0.1:%d"
-  upstream:
-    address: 127.0.0.1:%d
-rtp:
-  public:  { port_min: 10010, port_max: 10019 }
-  private: { port_min: 10020, port_max: 10029 }
-`, pubPort, privPort, upPort)
+public: { ip: 127.0.0.1 }
+private: { ip: 192.0.2.250 }
+rtp: 10010-10029
+edge:
+  switch: [127.0.0.1:%d]
+  listen: { udp: %d }
+`, upPort, pubPort)
+}
+
+// setPrivate points the edge's private socket at 127.0.0.1:port for the
+// rest of the test.
+func setPrivate(t *testing.T, port int) {
+	t.Helper()
+	testHookEdgeOptions = []edge.Option{edge.WithPrivateAddr(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", port)))}
+	t.Cleanup(func() { testHookEdgeOptions = nil })
 }
 
 // TestCheckExamples is the guard on the shipped example: it must keep
 // loading and validating exactly as `freesbc check` runs it.
 func TestCheckExamples(t *testing.T) {
-	for _, name := range []string{"edge.example.yaml"} {
-		if err := Check(filepath.Join("..", "..", name)); err != nil {
-			t.Errorf("Check(%s): %v", name, err)
-		}
+	if err := Check(filepath.Join("..", "..", "freesbc.example.yaml")); err != nil {
+		t.Errorf("Check(freesbc.example.yaml): %v", err)
 	}
 	if err := Check(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
 		t.Error("Check on a missing file must fail")
@@ -66,7 +70,8 @@ func TestRunStartsAndStopsOnCancel(t *testing.T) {
 	// ports rather than flake.
 	for attempt := 1; ; attempt++ {
 		sipPort, privPort, upPort := freeUDPPort(t), freeUDPPort(t), freeUDPPort(t)
-		done, cancel := startRun(t, sipPort, privPort, upPort)
+		setPrivate(t, privPort)
+		done, cancel := startRun(t, sipPort, upPort)
 		err := waitServing(sipPort, done)
 		if err != nil {
 			cancel()
@@ -99,9 +104,9 @@ func TestRunStartsAndStopsOnCancel(t *testing.T) {
 
 // startRun runs the process with an edge-only config on sipPort.
 // Run's result arrives on done; the returned cancel stops it.
-func startRun(t *testing.T, sipPort, privPort, upPort int) (<-chan error, context.CancelFunc) {
+func startRun(t *testing.T, sipPort, upPort int) (<-chan error, context.CancelFunc) {
 	t.Helper()
-	path := writeConfig(t, edgeRunYAML(sipPort, privPort, upPort))
+	path := writeConfig(t, edgeRunYAML(sipPort, upPort))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -168,7 +173,7 @@ func isAddrInUse(err error) bool {
 
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "sbc.yaml")
+	path := filepath.Join(t.TempDir(), "freesbc.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -332,23 +332,6 @@ func TestGrantedExpires(t *testing.T) {
 	}
 }
 
-// audit: P2-SIP-008
-// An unset bind address is every interface; an unparseable one is an
-// error, never every interface.
-func TestParseBindIP(t *testing.T) {
-	if got, err := ParseBindIP(""); got.IsValid() || err != nil {
-		t.Errorf("ParseBindIP(\"\") = %v, %v; want the zero Addr, nil", got, err)
-	}
-	if got, err := ParseBindIP("10.1.2.3"); got != netip.MustParseAddr("10.1.2.3") || err != nil {
-		t.Errorf("ParseBindIP(10.1.2.3) = %v, %v", got, err)
-	}
-	for _, bad := range []string{"10.1.2", "eth0", "10.1.2.3:5060", " 10.1.2.3"} {
-		if got, err := ParseBindIP(bad); err == nil || got.IsValid() {
-			t.Errorf("ParseBindIP(%q) = %v, %v; want an error and no address", bad, got, err)
-		}
-	}
-}
-
 func TestForwardable(t *testing.T) {
 	for code, want := range map[int]bool{100: false, 180: true, 183: true, 200: true, 486: true} {
 		if got := Forwardable(&sip.Response{StatusCode: code}); got != want {

@@ -16,25 +16,15 @@ import (
 // literal.
 var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
-// numericGroupRef matches ${123} — a regexp replacement group reference,
-// not an env variable (a digit-led name can never be a valid env var). Such
-// spans are left verbatim so route transforms can use ${N} next to literal
-// digits (e.g. "${1}000"); they are neither expanded nor flagged malformed.
-var numericGroupRef = regexp.MustCompile(`\$\{[0-9]+\}`)
-
 // expandEnv walks a freshly unmarshalled Config and expands ${VAR}
 // references in every exported string field — including slices, maps, and
 // nested structs/pointers — so fields added in later milestones are covered
 // automatically without touching this file again.
 //
 // Only fields whose Go type is string are expanded. Typed scalars (Duration,
-// PortRange, SIPListen, HostPort) and ints/bools are decoded by the strict
-// YAML step, before expansion runs, so `ring_timeout: ${RT}` is a parse error
-// ("invalid duration"), not an expanded value.
-//
-// A field tagged `env:"-"` is never expanded: routes[].transform.to is a
-// regexp replacement template, where ${name} names a capture group, not an
-// environment variable.
+// PortRange) and ints/bools are decoded by the strict YAML step, before
+// expansion runs, so `rtp: ${R}` is a parse error ("invalid port range"),
+// not an expanded value.
 //
 // Every substitution is recorded on c so validation errors can be redacted
 // (see envRedaction): a validation message must never echo an expanded
@@ -176,9 +166,6 @@ func (e *envExpander) walk(v reflect.Value, path string) {
 			if sf.PkgPath != "" {
 				continue // unexported: not settable, and not user-facing data
 			}
-			if sf.Tag.Get("env") == "-" {
-				continue // opted out, e.g. a regexp replacement template
-			}
 			e.walk(v.Field(i), path+"."+fieldLabel(sf))
 		}
 
@@ -283,7 +270,6 @@ func fieldLabel(sf reflect.StructField) string {
 // "malformed".
 func malformedRef(s string) (string, bool) {
 	stripped := envRef.ReplaceAllString(s, "")
-	stripped = numericGroupRef.ReplaceAllString(stripped, "")
 	if !strings.Contains(stripped, "${") {
 		return "", false
 	}

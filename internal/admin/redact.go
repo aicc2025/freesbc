@@ -2,39 +2,38 @@ package admin
 
 import "github.com/freesbc/freesbc/internal/config"
 
-// redactConfig returns a JSON-marshalable view of cfg with secrets replaced
-// by "***": admin.auth.password_hash and every peers.<name>.auth.password.
-// It builds a bespoke map rather than marshaling cfg (which carries yaml:
-// tags, not json:, and holds the live secret values) — it never mutates cfg.
+// redactConfig returns a JSON-marshalable view of cfg with the one secret,
+// admin.password_hash, replaced by "***". The view is the config's own
+// shape with JSON-friendly keys: it builds a bespoke map rather than
+// marshaling cfg (which carries yaml: tags, not json:, and holds the live
+// secret) and never mutates cfg.
 func redactConfig(cfg *config.Config) any {
-	peers := map[string]any{}
-	for name, p := range cfg.Peers {
-		pv := map[string]any{
-			"address":   p.Address,
-			"transport": p.Transport,
-			"srtp":      p.SRTP,
-			"register":  p.Register,
-		}
-		if p.Auth != nil {
-			auth := map[string]any{"username": p.Auth.Username}
-			if p.Auth.Password != "" {
-				auth["password"] = "***"
-			}
-			pv["auth"] = auth
-		}
-		peers[name] = pv
+	view := map[string]any{
+		"public":  map[string]any{"ip": cfg.Public.IP, "bind": cfg.Public.Bind},
+		"private": map[string]any{"ip": cfg.Private.IP},
+		"rtp":     map[string]any{"min": cfg.RTP.Min, "max": cfg.RTP.Max},
+		"edge": map[string]any{
+			"switch":              cfg.Edge.Switch,
+			"switch_carrier_port": cfg.Edge.SwitchCarrierPort,
+			"listen":              map[string]any{"udp": cfg.Edge.Listen.UDP, "ws": cfg.Edge.Listen.WS, "wss": cfg.Edge.Listen.WSS},
+			"carriers":            cfg.Edge.Carriers,
+			"carrier_sources":     cfg.Edge.CarrierSources,
+		},
+		"shield": map[string]any{
+			"rate_limit":         cfg.Shield.RateLimit,
+			"carrier_rate_limit": cfg.Shield.CarrierRateLimit,
+			"ban":                cfg.Shield.Ban.Std().String(),
+		},
 	}
-	view := map[string]any{"peers": peers}
+	if cfg.TLS != nil {
+		view["tls"] = map[string]any{"cert": cfg.TLS.Cert, "key": cfg.TLS.Key}
+	}
 	if cfg.Admin != nil {
-		adminView := map[string]any{"listen": cfg.Admin.Listen}
-		a := map[string]any{"username": cfg.Admin.Auth.Username}
-		if cfg.Admin.Auth.PasswordHash != "" {
+		a := map[string]any{"listen": cfg.Admin.Listen, "allow_remote": cfg.Admin.AllowRemote}
+		if cfg.Admin.PasswordHash != "" {
 			a["password_hash"] = "***"
 		}
-		adminView["auth"] = a
-		view["admin"] = adminView
+		view["admin"] = a
 	}
-	// Routes carry no secrets, so the parsed values are exposed as-is.
-	view["routes"] = cfg.Routes
 	return view
 }

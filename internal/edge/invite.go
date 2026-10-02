@@ -165,10 +165,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	}
 	defer d.untrack()
 
-	// The failure budget is re-read from the store on EVERY call, so a
-	// reload changes it for the next call without a restart; the node set is
-	// a startup snapshot like the rest of the topology (see budgets.go).
-	cooldown := s.upstreamPenalty()
+	cooldown := switchCooldown
 
 	// The caller's hash order, cooled nodes at the tail: everything this
 	// user does starts on the same switch, and a switch that just failed is

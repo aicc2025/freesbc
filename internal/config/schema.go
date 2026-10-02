@@ -2,330 +2,185 @@ package config
 
 import (
 	"net/netip"
-	"regexp"
 	"time"
 )
 
-// Config is the root of sbc.yaml.
+// PrivateSIPPort is the port of the one fixed private SIP socket,
+// private.ip:5060. It is not configurable.
+const PrivateSIPPort = 5060
+
+// DefaultCarrierPort is the port assumed for an edge.carriers entry that
+// names none.
+const DefaultCarrierPort = 5060
+
+// Config is the root of freesbc.yaml (schema v2).
 //
-// Lifecycle: Parse (the only supported entry point) unmarshals the file,
-// expands ${ENV_VAR} references, applies defaults, and validates — then the
-// resulting *Config is published via a Store. Snapshots are immutable once
-// published: never mutate a *Config after handing it to a Store. Compiled
-// fields (Peer.allowedNets, Route.matchTo) are populated by validate and are
-// only valid on a *Config that has been through Parse.
+// Lifecycle: Parse (the only supported entry point) unmarshals the file
+// strictly, expands ${ENV_VAR} references, applies defaults, and validates
+// — then the resulting *Config is published via a Store. Snapshots are
+// immutable once published: never mutate a *Config after handing it to a
+// Store. Compiled fields (Edge.switches, Edge.carrierNets, ...) are
+// populated by validate and are only valid on a *Config that has been
+// through Parse. Address fields stay strings so they can carry ${VAR}.
 type Config struct {
-	Listen          ListenConfig     `yaml:"listen"`
-	Peers           map[string]*Peer `yaml:"peers"`
-	Routes          []*Route         `yaml:"routes"`
-	Shield          ShieldConfig     `yaml:"shield"`
-	Admin           *AdminConfig     `yaml:"admin"`
-	RingTimeout     Duration         `yaml:"ring_timeout"`     // cancel a ringing target after this long, then failover
-	RegisterExpires Duration         `yaml:"register_expires"` // requested REGISTER lifetime (carrier may grant less)
-	SessionExpires  Duration         `yaml:"session_expires"`  // RFC 4028 Session-Expires we advertise/accept
-	MinSE           Duration         `yaml:"min_se"`           // minimum session interval accepted (else 422)
-	PeerCooldown    Duration         `yaml:"peer_cooldown"`    // skip a peer endpoint this long after a connect failure
-	SRVCacheTTL     Duration         `yaml:"srv_cache_ttl"`    // cache DNS SRV/endpoint resolutions this long (stdlib exposes no record TTL)
-	// MaxConcurrentCalls caps total in-flight bridged calls across every
-	// peer (0 = unlimited, the default). Enforced by bridge.onInvite's
-	// quota gate; a per-peer cap lives on Peer.
-	MaxConcurrentCalls int `yaml:"max_concurrent_calls"`
-
-	// SIP and RTP configure the bind/advertised address topology for NAT/VPN
-	// deployments: the SBC sits behind a NAT/VPN with a private bind address
-	// and a public advertised one, and the two must stay independent.
-	//
-	// When sip.bind_ip is set, the sip section REPLACES listen.sip
-	// (validation rejects configuring both): the SBC binds exactly one
-	// listener at sip.bind_ip:sip.bind_port and advertises
-	// sip.advertised_ip:sip.advertised_port in Contact/From/REGISTER. When
-	// unset, the legacy listen.sip + listen.media.public_ip resolution
-	// applies (see Server.sigIP). The rtp section likewise overrides just
-	// the media plane: every RTP/RTCP socket binds to rtp.bind_ip (empty =
-	// every interface, see trunk.NewMediaPool), and SDP c=/o= advertises
-	// rtp.advertised_ip (empty = legacy resolution, see Server.mediaIP).
-	SIP SIPNetConfig `yaml:"sip"`
-	RTP RTPNetConfig `yaml:"rtp"`
-
-	// Network and WebRTC belong to the edge-proxy plane (see
-	// config/proxy.go): the public/private topology the SIP/RTP/WebRTC
-	// proxy straddles. They are inert unless an upstream is set —
-	// sip.upstream.address or sip.upstreams.nodes (Config.ProxyEnabled) —
-	// the trunk B2BUA plane above is unaffected.
-	Network NetworkConfig `yaml:"network"`
-	WebRTC  WebRTCConfig  `yaml:"webrtc"`
+	Public  PublicConfig  `yaml:"public"`
+	Private PrivateConfig `yaml:"private"`
+	RTP     PortRange     `yaml:"rtp"`
+	TLS     *TLSConfig    `yaml:"tls"`
+	Edge    EdgeConfig    `yaml:"edge"`
+	Shield  ShieldConfig  `yaml:"shield"`
+	Admin   *AdminConfig  `yaml:"admin"`
 
 	// envRedact is set by expandEnv: what ${VAR} expansion substituted, so
 	// validate can keep expanded values out of its error messages.
 	envRedact envRedaction
 }
 
-type ListenConfig struct {
-	SIP   []SIPListen `yaml:"sip"`
-	Media MediaConfig `yaml:"media"`
-	// TLSCert/TLSKey are the inbound TLS identity for tls:// SIP listeners:
-	// with them set, listeners present this certificate and
-	// verification is possible against a real trust anchor — instead of the
-	// default fresh self-signed certificate (kept when unset, with a
-	// startup warning). TLSClientCA turns inbound TLS into mutual TLS:
-	// clients must present a certificate chaining to this CA.
-	TLSCert     string `yaml:"tls_cert"`
-	TLSKey      string `yaml:"tls_key"`
-	TLSClientCA string `yaml:"tls_client_ca"`
+// PublicConfig is the side facing phones, browsers and carriers.
+type PublicConfig struct {
+	// IP is advertised in Contact/Via/Record-Route/SDP.
+	IP string `yaml:"ip"`
+	// Bind is the local address every public socket binds. Empty means IP;
+	// it differs only behind 1:1 NAT, where IP is not a local address.
+	Bind string `yaml:"bind"`
 }
 
-type MediaConfig struct {
-	PortRange  PortRange `yaml:"port_range"`
-	PublicIP   string    `yaml:"public_ip"`   // "auto" (STUN-detected) or a literal IP
-	RTPTimeout Duration  `yaml:"rtp_timeout"` // tear down a call after this much RTP silence
+// PrivateConfig is the side facing the switch.
+type PrivateConfig struct {
+	// IP is both the bind and the advertised address.
+	IP string `yaml:"ip"`
 }
 
-// SIPNetConfig is the signaling-plane bind/advertised pair (see Config.SIP).
-type SIPNetConfig struct {
-	// BindIP/BindPort are where the SIP listener actually binds. When
-	// BindIP is set the section replaces listen.sip (see Config.Listeners).
-	BindIP   string `yaml:"bind_ip"`
-	BindPort int    `yaml:"bind_port"`
-	// Transport of the listener: udp (default), tcp, or tls.
-	Transport string `yaml:"transport"`
-	// AdvertisedIP/AdvertisedPort are what externally visible signaling
-	// (Contact, From, REGISTER Contact) claims; the far side must be able
-	// to route to it. Default to the bind values when unset.
-	AdvertisedIP   string `yaml:"advertised_ip"`
-	AdvertisedPort int    `yaml:"advertised_port"`
-
-	// Public/Private/Upstream/Upstreams are the edge-proxy plane's
-	// listeners and upstream target(s) (see config/proxy.go). They nest
-	// under the same `sip:` key as the flat trunk fields above but are
-	// independent of them: a config may enable the trunk plane, the proxy
-	// plane, or both. Upstream (the v1 alias) and Upstreams (the
-	// multi-switch pool) are mutually exclusive.
-	Public    ProxySIPConfig  `yaml:"public"`
-	Private   ProxyPrivateSIP `yaml:"private"`
-	Upstream  UpstreamConfig  `yaml:"upstream"`
-	Upstreams UpstreamsConfig `yaml:"upstreams"`
+// TLSConfig is the PEM identity used by edge.listen.wss and a remote admin.
+type TLSConfig struct {
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
 }
 
-// RTPNetConfig is the media-plane bind/advertised pair plus the explicit
-// port range (see Config.RTP).
-type RTPNetConfig struct {
-	// BindIP is the local address every RTP/RTCP socket binds to; empty
-	// (the default) binds every interface.
-	BindIP string `yaml:"bind_ip"`
-	// AdvertisedIP is the address written into SDP c=/o=; empty falls back
-	// to the legacy listen.media.public_ip resolution.
-	AdvertisedIP string `yaml:"advertised_ip"`
-	// PortMin/PortMax bound the RTP/RTCP port range when set (both or
-	// neither). They REPLACE listen.media.port_range (validation rejects
-	// configuring both) — see Config.RTPPortRange.
-	PortMin int `yaml:"port_min"`
-	PortMax int `yaml:"port_max"`
-
-	// Public/Private are the edge-proxy plane's two media pools (see
-	// config/proxy.go). Independent of the flat fields above, which serve
-	// the trunk B2BUA plane; validation rejects overlapping ranges between
-	// any two pools that could hand out the same port.
-	Public  RTPPlaneConfig `yaml:"public"`
-	Private RTPPlaneConfig `yaml:"private"`
+// ListenPorts are the edge's public ports on public.bind; 0 = not enabled.
+type ListenPorts struct {
+	UDP int `yaml:"udp"`
+	WS  int `yaml:"ws"`
+	WSS int `yaml:"wss"`
 }
 
-// Listeners returns the effective SIP listener set: the sip.bind_ip
-// topology when configured, else listen.sip. Only meaningful on a
-// validated Config (validate rejects configuring both).
-func (c *Config) Listeners() []SIPListen {
-	if c.SIP.BindIP != "" {
-		return []SIPListen{{Transport: c.SIP.Transport, Host: c.SIP.BindIP, Port: c.SIP.BindPort}}
-	}
-	return c.Listen.SIP
+// EdgeConfig is the SIP/RTP/WebRTC edge proxy.
+type EdgeConfig struct {
+	// Switch lists the switch nodes as literal "IP:port" (UDP). One entry
+	// is a single upstream; more is a hash-user pool.
+	Switch []string `yaml:"switch"`
+	// SwitchCarrierPort is the port on each switch node that receives
+	// carrier traffic; 0 (the default) means the node's own switch port.
+	SwitchCarrierPort int         `yaml:"switch_carrier_port"`
+	Listen            ListenPorts `yaml:"listen"`
+	// Carriers maps a carrier name to its "host[:port]" destination.
+	Carriers map[string]string `yaml:"carriers"`
+	// CarrierSources are extra inbound carrier IPs/CIDRs.
+	CarrierSources []string `yaml:"carrier_sources"`
+
+	// Compiled by validate.
+	switches    []netip.AddrPort
+	carrierNets []netip.Prefix // carrier_sources only
+	carriers    []Carrier      // sorted by name
 }
 
-// RTPPortRange returns the configured RTP port range: rtp.port_min/port_max
-// when set, else listen.media.port_range. Only meaningful on a validated
-// Config (validate rejects configuring both).
-func (c *Config) RTPPortRange() PortRange {
-	if c.RTP.PortMin != 0 {
-		return PortRange{Min: uint16(c.RTP.PortMin), Max: uint16(c.RTP.PortMax)}
-	}
-	return c.Listen.Media.PortRange
+// Carrier is one validated edge.carriers entry.
+type Carrier struct {
+	Name string
+	// Host is the lower-cased host as written: a DNS name (no trailing
+	// dot) or the canonical literal IP.
+	Host string
+	Port int
+	// Addr is the literal IP when Host is one, else the zero Addr.
+	Addr netip.Addr
 }
 
-// Peer is a SIP trunk counterpart (carrier or PBX).
-type Peer struct {
-	Address    string    `yaml:"address"`
-	Transport  string    `yaml:"transport"` // udp (default), tcp, tls
-	Auth       *PeerAuth `yaml:"auth"`
-	Register   bool      `yaml:"register"` // outbound REGISTER to this peer
-	AllowedIPs []string  `yaml:"allowed_ips"`
-	// MediaLatch controls first-packet latching for this peer's media:
-	// "strict" (default) requires the first RTP packet's source IP to match
-	// the SDP-signaled address; "loose" accepts any source (hard NAT).
-	MediaLatch string `yaml:"media_latch"`
-	// SRTP is this peer's media-encryption policy: "disabled" (default,
-	// plaintext RTP), "optional" (SRTP if offered/accepted, else RTP), or
-	// "required" (RTP/SAVP + a=crypto mandatory, else the leg fails).
-	SRTP string `yaml:"srtp"`
-	// RegisterExpires overrides the global register_expires for this peer
-	// (0 = use the global default). Only meaningful with register: true.
-	RegisterExpires Duration `yaml:"register_expires"`
-	// MaxConcurrentCalls caps how many bridged calls this peer may have in
-	// flight at once (0 = unlimited, the default). Enforced by
-	// bridge.onInvite's quota gate.
-	MaxConcurrentCalls int `yaml:"max_concurrent_calls"`
-	// TLSCA is the outbound trust anchor for dialing this peer over tls:
-	// a PEM CA bundle that REPLACES the system roots for this peer only,
-	// so a carrier with a private/self-signed CA is reachable without
-	// disabling verification and no other peer is anchored by it.
-	// TLSClientCert/TLSClientKey present OUR client certificate to this
-	// peer only, when it requires mutual TLS (both-or-neither). Two tls
-	// peers may not share an address host. Changes take effect on restart
-	// (no hot rotation).
-	TLSCA         string `yaml:"tls_ca"`
-	TLSClientCert string `yaml:"tls_client_cert"`
-	TLSClientKey  string `yaml:"tls_client_key"`
-
-	allowedNets []netip.Prefix // compiled by Validate
-}
-
-// AllowsIP reports whether addr matches one of the peer's allowed_ips
-// prefixes. Only valid after Validate has run.
-func (p *Peer) AllowsIP(addr netip.Addr) bool {
-	for _, n := range p.allowedNets {
-		if n.Contains(addr) {
-			return true
-		}
-	}
-	return false
-}
-
-type PeerAuth struct {
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	// Realm pins the digest realm we will answer a challenge FOR:
-	// when set, a 401/407 whose WWW-/Proxy-Authenticate
-	// names any other realm is treated as an auth failure — the SBC never
-	// computes a digest of its credentials for it, so a rogue or
-	// compromised server can't harvest responses for offline cracking.
-	// Empty = accept whatever realm the far end names.
-	Realm string `yaml:"realm"`
-}
-
-// Route is one routing rule; first match wins, list order is failover order.
-type Route struct {
-	Name      string          `yaml:"name"`
-	From      string          `yaml:"from"`
-	Match     *RouteMatch     `yaml:"match"`
-	Transform *RouteTransform `yaml:"transform"`
-	To        []string        `yaml:"to"`
-
-	matchTo *regexp.Regexp // compiled by Validate
-}
-
-// CompiledMatch returns the compiled match.to regex, or nil when the route
-// has no match clause. Only valid after Validate has run.
-func (r *Route) CompiledMatch() *regexp.Regexp { return r.matchTo }
-
-type RouteMatch struct {
-	To string `yaml:"to"`
-}
-
-type RouteTransform struct {
-	// To is a regexp replacement template ($1, ${1}, ${name}). It is never
-	// ${ENV}-expanded: ${name} there names a capture group of match.to.
-	To string `yaml:"to" env:"-"`
-}
+// Literal reports whether the carrier host is an IP literal.
+func (c Carrier) Literal() bool { return c.Addr.IsValid() }
 
 type ShieldConfig struct {
-	RateLimit string  `yaml:"rate_limit"`
-	AutoBan   AutoBan `yaml:"auto_ban"`
-}
-
-// AutoBan holds the scanner ban's lifetime: a source the edge shield
-// fingerprints as a scanner is banned in memory for Duration.
-type AutoBan struct {
-	Duration Duration `yaml:"duration"`
+	// RateLimit applies to every public source that is not a carrier.
+	RateLimit string `yaml:"rate_limit"`
+	// CarrierRateLimit applies to carrier sources.
+	CarrierRateLimit string `yaml:"carrier_rate_limit"`
+	// Ban is how long a source fingerprinted as a scanner stays banned
+	// (in memory only).
+	Ban Duration `yaml:"ban"`
 }
 
 type AdminConfig struct {
-	Listen string    `yaml:"listen"`
-	Auth   AdminAuth `yaml:"auth"`
-	// AllowRemote permits a NON-loopback listen address. By
-	// default the admin API — plaintext Basic auth in front of the FULL
-	// config including every peer credential — must stay loopback-only;
-	// binding it wider is a conscious, flagged decision, not a typo.
-	// Prefer TLS (tls_cert/tls_key) or a reverse proxy when doing so.
+	Listen string `yaml:"listen"`
+	// PasswordHash is a bcrypt hash (cost >= 10); the user is always "admin".
+	PasswordHash string `yaml:"password_hash"`
+	// AllowRemote permits a non-loopback listen address, served over HTTPS
+	// with the top-level tls identity.
 	AllowRemote bool `yaml:"allow_remote"`
-	// TLSCert/TLSKey: when both are set,
-	// the admin listener serves HTTPS with this certificate (TLS >= 1.2),
-	// so a non-loopback (LAN) deployment doesn't send Basic credentials in
-	// the clear. Both-or-neither; a change takes effect on restart (no hot
-	// rotation).
-	TLSCert string `yaml:"tls_cert"`
-	TLSKey  string `yaml:"tls_key"`
 }
 
-type AdminAuth struct {
-	Username     string `yaml:"username"`
-	PasswordHash string `yaml:"password_hash"`
-}
+// AdminUser is the only admin user name.
+const AdminUser = "admin"
+
+// DefaultRTP is the RTP range used when rtp is unset.
+var DefaultRTP = PortRange{Min: 20000, Max: 29999}
 
 // withDefaults fills spec-defined defaults on a freshly parsed Config.
 func withDefaults(c *Config) {
-	// The default range only applies when NEITHER range source is set: with
-	// rtp.port_min/port_max configured, the legacy range must stay zero so
-	// validate's mutual-exclusion check (and RTPPortRange) can tell the two
-	// sources apart.
-	if c.Listen.Media.PortRange == (PortRange{}) && c.RTP.PortMin == 0 && c.RTP.PortMax == 0 {
-		c.Listen.Media.PortRange = PortRange{Min: 16384, Max: 32768}
+	if c.Public.Bind == "" {
+		c.Public.Bind = c.Public.IP
 	}
-	if c.Listen.Media.PublicIP == "" {
-		c.Listen.Media.PublicIP = "auto"
+	if c.RTP == (PortRange{}) {
+		c.RTP = DefaultRTP
 	}
-	if c.Listen.Media.RTPTimeout == 0 {
-		c.Listen.Media.RTPTimeout = Duration(5 * time.Minute)
-	}
-	if c.SIP.Transport == "" {
-		c.SIP.Transport = "udp"
-	}
-	if c.SIP.BindIP != "" && c.SIP.AdvertisedIP == "" {
-		c.SIP.AdvertisedIP = c.SIP.BindIP
-	}
-	if c.SIP.BindPort != 0 && c.SIP.AdvertisedPort == 0 {
-		c.SIP.AdvertisedPort = c.SIP.BindPort
-	}
-	for _, p := range c.Peers {
-		if p.Transport == "" {
-			p.Transport = "udp"
-		}
-		if p.MediaLatch == "" {
-			p.MediaLatch = "strict"
-		}
-		if p.SRTP == "" {
-			p.SRTP = "disabled"
-		}
-	}
-	proxyWithDefaults(c)
 	if c.Shield.RateLimit == "" {
 		c.Shield.RateLimit = "20/s per_ip"
 	}
-	if c.Shield.AutoBan.Duration == 0 {
-		c.Shield.AutoBan.Duration = Duration(time.Hour)
+	if c.Shield.CarrierRateLimit == "" {
+		c.Shield.CarrierRateLimit = "200/s per_ip"
 	}
-	if c.RingTimeout == 0 {
-		c.RingTimeout = Duration(60 * time.Second)
+	if c.Shield.Ban == 0 {
+		c.Shield.Ban = Duration(time.Hour)
 	}
-	if c.RegisterExpires == 0 {
-		c.RegisterExpires = Duration(3600 * time.Second)
+}
+
+// PublicIP is the address advertised to public peers. Only meaningful on a
+// validated Config.
+func (c *Config) PublicIP() netip.Addr { return mustAddr(c.Public.IP) }
+
+// PublicBind is the local address every public socket binds.
+func (c *Config) PublicBind() netip.Addr { return mustAddr(c.Public.Bind) }
+
+// PrivateIP is the private bind and advertised address.
+func (c *Config) PrivateIP() netip.Addr { return mustAddr(c.Private.IP) }
+
+// PrivateAddr is the fixed private SIP socket, private.ip:5060.
+func (c *Config) PrivateAddr() netip.AddrPort {
+	return netip.AddrPortFrom(c.PrivateIP(), PrivateSIPPort)
+}
+
+// Switches returns the edge.switch nodes in file order.
+func (c *Config) Switches() []netip.AddrPort { return c.Edge.switches }
+
+// CarrierNets returns every address range that is an inbound carrier
+// source known without DNS: edge.carrier_sources plus the literal-IP
+// carriers as host prefixes.
+func (c *Config) CarrierNets() []netip.Prefix {
+	out := append([]netip.Prefix(nil), c.Edge.carrierNets...)
+	for _, k := range c.Edge.carriers {
+		if k.Literal() {
+			out = append(out, netip.PrefixFrom(k.Addr, k.Addr.BitLen()))
+		}
 	}
-	if c.SessionExpires == 0 {
-		c.SessionExpires = Duration(1800 * time.Second)
-	}
-	if c.MinSE == 0 {
-		c.MinSE = Duration(90 * time.Second)
-	}
-	if c.PeerCooldown == 0 {
-		c.PeerCooldown = Duration(30 * time.Second)
-	}
-	if c.SRVCacheTTL == 0 {
-		c.SRVCacheTTL = Duration(300 * time.Second)
-	}
+	return out
+}
+
+// CarrierList returns the edge.carriers entries sorted by name.
+func (c *Config) CarrierList() []Carrier { return c.Edge.carriers }
+
+// WebRTC reports whether the edge serves WebSocket clients (any of
+// edge.listen.ws/wss is set), which enables WebRTC.
+func (c *Config) WebRTC() bool { return c.Edge.Listen.WS != 0 || c.Edge.Listen.WSS != 0 }
+
+func mustAddr(s string) netip.Addr {
+	a, _ := netip.ParseAddr(s)
+	return a.Unmap()
 }

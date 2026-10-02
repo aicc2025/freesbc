@@ -1,5 +1,5 @@
 # Fast checks on every push to main and every pull request: formatting,
-# module tidiness, vet, build, the example configs, the full test suite
+# module tidiness, vet, build, the example config, the full test suite
 # under the race detector, and known-vulnerability scanning. The long
 # checks (repeated runs, fuzzing) live in soak.yml.
 name: CI
@@ -47,8 +47,8 @@ jobs:
       - name: build
         run: go build -o freesbc -ldflags "-X main.version=${GITHUB_SHA::12}" ./cmd/freesbc
 
-      - name: check example configs
-        run: ./freesbc check -c edge.example.yaml
+      - name: check example config
+        run: ./freesbc check -c freesbc.example.yaml
 
   test:
     name: go test -race

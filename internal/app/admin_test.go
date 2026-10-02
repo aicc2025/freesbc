@@ -3,6 +3,7 @@ package app
 import (
 	"io"
 	"log/slog"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -12,41 +13,35 @@ import (
 )
 
 // edgeOnlyYAML is an edge-only config. edge.New binds nothing, so its
-// ports are never opened; they sit in this package's band anyway.
+// ports are never opened; they sit in this package's band anyway. The
+// private socket is moved to loopback by edge.WithPrivateAddr.
 const edgeOnlyYAML = `
-network:
-  public:  { bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1 }
-  private: { bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1 }
-sip:
-  public:
-    udp: { enabled: true, bind: "127.0.0.1:10050" }
-  private:
-    bind: "127.0.0.1:10051"
-  upstream:
-    address: 127.0.0.1:10052
-rtp:
-  public:  { port_min: 10010, port_max: 10019 }
-  private: { port_min: 10020, port_max: 10029 }
+public: { ip: 127.0.0.1 }
+private: { ip: 192.0.2.250 }
+rtp: 10010-10019
+edge:
+  switch: [127.0.0.1:10052]
+  listen: { udp: 10050 }
 `
 
 // audit: P2-APP-005
 // In an edge-only process the admin view reports the edge plane: its media
-// pools (not the idle trunk pool, which would report the default range),
-// and the listeners it bound, which a reload does not move.
+// pools and the listeners it bound, which a reload does not move.
 func TestAdminDepsReportRunningPlanes(t *testing.T) {
 	cfg, err := config.Parse([]byte(edgeOnlyYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := config.NewStore(cfg)
-	edgeSrv, err := edge.New(store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	edgeSrv, err := edge.New(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		edge.WithPrivateAddr(netip.MustParseAddrPort("127.0.0.1:10051")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	deps := adminDeps(edgeSrv, "test")
 
 	if inUse, total := deps.Ports(); inUse != 0 || total != 10 {
-		t.Errorf("Ports = %d/%d, want 0/10 (the edge pools' 5+5 pairs)", inUse, total)
+		t.Errorf("Ports = %d/%d, want 0/10 (the public and private pools' 5 pairs each)", inUse, total)
 	}
 	if n, calls := deps.ActiveCalls(), deps.Calls(); n != 0 || len(calls) != 0 {
 		t.Errorf("ActiveCalls = %d, Calls = %v; want 0 and none", n, calls)

@@ -1,0 +1,57 @@
+# FreeSBC example configuration.
+#
+#   cp freesbc.example.yaml freesbc.yaml
+#   freesbc check -c freesbc.yaml
+#   freesbc run   -c freesbc.yaml
+#
+#   Phones / browsers / carriers        Private LAN / VPN
+#            │                                  │
+#        public.ip ──── FreeSBC ──── private.ip ─┴── switch (FreeSWITCH / Asterisk)
+#
+# ${ENV_VAR} is expanded in string values at load time and never written back.
+# See docs/config.md for every key, default, and validation rule.
+
+# --- Topology: each address is written once --------------------------------
+
+public:
+  ip: 203.0.113.7            # advertised to phones, browsers, carriers
+  # bind: 172.31.5.10        # only behind 1:1 NAT (cloud VM); default = ip
+
+private:
+  ip: 10.77.0.2              # faces the switch; bind = advertised
+
+rtp: 20000-29999             # one range, allocated independently per bind IP
+
+# tls:                       # identity for wss:// and a remote admin;
+#   cert: /etc/freesbc/cert.pem  # required only by edge.listen.wss or
+#   key:  /etc/freesbc/key.pem   # admin.allow_remote
+
+# --- Edge -------------------------------------------------------------------
+#
+# One fixed private socket, not configurable: private.ip:5060.
+# The switch sends everything there:
+#   - proxied REGISTER / calls to clients   (Request-URI carries ;fsbc=<token>)
+#   - carrier REGISTER / INVITE / OPTIONS   (outbound proxy; Request-URI host
+#                                            is a carrier below)
+# Carrier accounts, line selection and failover live on the switch.
+
+edge:
+  switch: [10.77.0.10:5060]  # literal IP:port; more than one = hash-user pool
+  switch_carrier_port: 5080  # carriers (FreeSWITCH: external profile port);
+                             #   default = the switch port above
+  listen:                    # ports on public.bind; present = enabled
+    udp: 5060
+    # wss: 443               # enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux); needs tls
+    # ws: 8080               # plaintext WebSocket, development only
+
+  carriers:                  # where the switch may send requests (allowlist);
+    carrier-a: sip.carrier-a.com      # must equal the switch gateway's host[:port]
+    mobile:    223.76.90.4:16060      # name is stamped as X-FreeSBC-Carrier
+    fixed:     223.76.90.5:16060      #   on inbound calls from that carrier
+  # carrier_sources: [198.51.100.20, 203.0.113.0/28]   # extra inbound carrier IPs
+
+# --- Operator API, /metrics, WebUI ------------------------------------------
+
+# admin:
+#   listen: 127.0.0.1:8080
+#   password_hash: "REPLACE-WITH-BCRYPT-HASH"   # htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'

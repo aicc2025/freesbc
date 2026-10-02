@@ -16,7 +16,7 @@ func testShield(t *testing.T, yaml string) *Shield {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	s := New(config.NewStore(cfg), discard())
+	s := New(config.NewStore(cfg), discard(), nil)
 	t.Cleanup(func() { s.Close() })
 	return s
 }
@@ -24,22 +24,15 @@ func testShield(t *testing.T, yaml string) *Shield {
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 const shieldCfg = `
-listen:
-  sip: [udp://127.0.0.1:5060]
-  media:
-    port_range: 16384-32768
-    public_ip: 127.0.0.1
+public: { ip: 203.0.113.7 }
+private: { ip: 10.77.0.2 }
+edge:
+  switch: [10.77.0.10:5060]
+  listen: { udp: 5060 }
 shield:
   rate_limit: 2/s per_ip
-  auto_ban: { duration: 1h }
-peers:
-  trunk:
-    address: 203.0.113.10:5060
-    allowed_ips: [203.0.113.10/32]
-routes:
-  - name: r
-    from: trunk
-    to: [trunk]
+  carrier_rate_limit: 5/s per_ip
+  ban: 1h
 `
 
 func TestCheckScannerInstantBan(t *testing.T) {
@@ -211,5 +204,41 @@ func TestBannedUnmaps4in6(t *testing.T) {
 	mapped := netip.MustParseAddr("::ffff:198.51.100.70")
 	if !s.Banned(mapped) || !s.BannedFrom(netip.AddrPortFrom(mapped, 5060), "tcp") {
 		t.Error("the 4in6 form of a banned IPv4 address was not seen as banned")
+	}
+}
+
+// Carrier sources are exempt from the scanner ban and use carrier_rate_limit.
+func TestCarrierSourceExemptFromScannerBanAndUsesCarrierLimit(t *testing.T) {
+	cfg, err := config.Parse([]byte(shieldCfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	carrier := netip.MustParseAddr("198.51.100.9")
+	s := New(config.NewStore(cfg), discard(), func(a netip.Addr) bool { return a == carrier })
+	t.Cleanup(func() { s.Close() })
+	if s.Check(carrier, "friendly-scanner", "tcp") != Allow {
+		t.Error("carrier source with a scanner UA must not be dropped or banned")
+	}
+	if s.BannedFrom(netip.AddrPortFrom(carrier, 0), "tcp") {
+		t.Error("carrier source was banned")
+	}
+	allowed := 0
+	for i := 0; i < 20; i++ {
+		if s.Check(carrier, "x", "udp") == Allow {
+			allowed++
+		}
+	}
+	if allowed < 4 || allowed > 6 {
+		t.Errorf("carrier burst = %d, want about 5 (carrier_rate_limit)", allowed)
+	}
+	other := netip.MustParseAddr("198.51.100.10")
+	n := 0
+	for i := 0; i < 20; i++ {
+		if s.Check(other, "x", "udp") == Allow {
+			n++
+		}
+	}
+	if n < 1 || n > 3 {
+		t.Errorf("non-carrier burst = %d, want about 2 (rate_limit)", n)
 	}
 }

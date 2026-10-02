@@ -2,8 +2,8 @@
 /freesbc
 /dist/
 
-# Local runtime config (copy edge.example.yaml to edge.yaml)
-/edge.yaml
+# Local runtime config (copy freesbc.example.yaml to freesbc.yaml)
+/freesbc.yaml
 
 # Test and coverage output
 *.out

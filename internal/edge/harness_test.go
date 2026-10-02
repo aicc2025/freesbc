@@ -2,11 +2,19 @@ package edge
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
+	"net/netip"
 	"os"
-	"sort"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -46,8 +54,9 @@ var (
 	mediaPorts = &portBand{min: 28000, max: 32399}
 )
 
-// mediaWindow is how many ports each harness gets: 200 for the public RTP
-// range and 200 for the private one.
+// mediaWindow is how many ports each harness gets: one RTP range shared by
+// the public and the private pool (both bind 127.0.0.1 in the harness, so
+// they split it by whichever binds first).
 const mediaWindow = 400
 
 // portBand hands out runs of free ports from [min, max], wrapping around.
@@ -141,155 +150,209 @@ type harness struct {
 
 	fs *fakeSwitch
 
-	// upstreams holds the fake switches of a multi-switch sip.upstreams
-	// harness (startHarnessUpstreams), keyed by the node NAME the config and
-	// the cooldown table use. Nodes deliberately left unreachable (a
-	// documentation address, to force a transport error) have no entry.
-	// Stopped with the rest of the harness.
+	// upstreams holds the fake switches of a multi-switch edge.switch
+	// harness (startHarnessSwitches), keyed by the node name ("IP:port").
+	// Nodes deliberately left unreachable (a non-loopback address, to force
+	// a transport error) have no entry. Stopped with the rest of the
+	// harness.
 	upstreams map[string]*fakeSwitch
 
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-// startHarness brings up the proxy and a fake FreeSWITCH.
+// harnessPrivatePlaceholder is private.ip in the harness config: a
+// non-local address, because the real private socket is overridden to a
+// loopback port by WithPrivateAddr (the test seam), while validation still
+// wants private.ip distinct from public.bind.
+const harnessPrivatePlaceholder = "192.0.2.250"
+
+// harnessCarrierSources is the carrier_sources of the shared fixtures (see
+// startHarnessWith).
+const harnessCarrierSources = "127.0.0.1"
+
+// startHarness brings up the proxy and a fake FreeSWITCH. webrtc adds the
+// ws listener (WebRTC is enabled iff ws or wss is configured).
 func startHarness(t *testing.T, webrtc bool) *harness {
-	return startHarnessOn(t, webrtc, "127.0.0.1")
-}
-
-// startHarnessOn is startHarness with the public UDP listener's bind host
-// chosen by the caller. The wildcard host is how production binds the
-// public plane (0.0.0.0) while the private plane sits on a specific
-// address — a shape some transport-pool behaviour only distinguishes by
-// the socket's local address, so the suite needs both forms.
-func startHarnessOn(t *testing.T, webrtc bool, pubBindIP string) *harness {
 	t.Helper()
-	return startHarnessWith(t, webrtc, pubBindIP, false)
+	return startHarnessWith(t, webrtc, false)
 }
 
-// startHarnessWSS is startHarness with a wss listener as well, serving
-// the self-signed certificate the proxy falls back to without cert_file
-// (newWSSClient skips verification).
+// startHarnessWSS is startHarness with a wss listener as well, serving a
+// freshly generated self-signed certificate written to t.TempDir() as the
+// top-level tls pair (newWSSClient skips verification).
 func startHarnessWSS(t *testing.T, webrtc bool) *harness {
 	t.Helper()
-	return startHarnessWith(t, webrtc, "127.0.0.1", true)
+	return startHarnessWith(t, webrtc, true)
 }
 
-// startHarnessWith builds every harness variant. The fake FreeSWITCH, like
-// every other test endpoint, lives on 127.0.0.1, so the suite needs no
-// loopback alias (macOS configures only 127.0.0.1).
+// startHarnessWith builds every single-switch harness variant. The fake
+// FreeSWITCH, like every other test endpoint, lives on 127.0.0.1, so the
+// suite needs no loopback alias (macOS configures only 127.0.0.1).
 //
 // Every client shares 127.0.0.1, so the shared fixture lists it in
-// sip.public.carrier_sources (harnessCarrierSources): the INVITE admission
-// check (admission.go) then admits every test client's out-of-dialog
-// INVITE, as it admits a carrier's, and the call-flow tests stay about call
-// flow. The admission tests use startHarnessStrict, which leaves the list
-// out.
-func startHarnessWith(t *testing.T, webrtc bool, pubBindIP string, wss bool) *harness {
+// edge.carrier_sources (harnessCarrierSources): the INVITE admission check
+// (admission.go) then admits every test client's out-of-dialog INVITE, as
+// it admits a carrier's, and the call-flow tests stay about call flow. The
+// admission tests use startHarnessStrict, which leaves the list out.
+func startHarnessWith(t *testing.T, webrtc, wss bool) *harness {
 	t.Helper()
-	return startHarnessFull(t, webrtc, pubBindIP, wss, harnessCarrierSources)
+	return startHarnessFull(t, webrtc, wss, harnessCarrierSources)
 }
-
-// harnessCarrierSources is the sip.public.carrier_sources line of the shared
-// fixtures (see startHarnessWith).
-const harnessCarrierSources = "    carrier_sources: [127.0.0.1]\n"
 
 // startHarnessStrict is startHarness (plus a wss listener when wss is set)
-// WITHOUT sip.public.carrier_sources, so the INVITE admission check is live
-// for 127.0.0.1 clients: only a registered transport address may place a
-// call.
+// WITHOUT edge.carrier_sources, so the INVITE admission check is live for
+// 127.0.0.1 clients: only a registered transport address may place a call.
 func startHarnessStrict(t *testing.T, webrtc, wss bool) *harness {
 	t.Helper()
-	return startHarnessFull(t, webrtc, "127.0.0.1", wss, "")
+	return startHarnessFull(t, webrtc, wss, "")
 }
 
-// startHarnessFull is startHarnessWith with the sip.public.carrier_sources
-// YAML line (four-space indent, newline-terminated) chosen
-// by the caller; "" configures none.
-func startHarnessFull(t *testing.T, webrtc bool, pubBindIP string, wss bool, carrierLine string) *harness {
+// writeTestTLS writes a freshly generated self-signed ECDSA certificate for
+// 127.0.0.1 and its key into dir and returns the two paths.
+func writeTestTLS(t *testing.T, dir string) (certPath, keyPath string) {
 	t.Helper()
-	pubUDP := freePort(t)
-	pubWS := freeTCPPort(t)
-	wssBlock, publicWSS := "", ""
-	if wss {
-		publicWSS = fmt.Sprintf("127.0.0.1:%d", freeTCPPort(t))
-		wssBlock = fmt.Sprintf("    wss: {enabled: true, bind: \"%s\"}\n", publicWSS)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	priv := freePort(t)
-	up := freePort(t)
-	// Media ranges are per-harness so no two tests contend for a port.
-	mediaBase := nextMediaBase(t)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "freesbc-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath
+}
 
-	yaml := fmt.Sprintf(`
-network:
-  public:
-    bind_ip: 127.0.0.1
-    advertised_ip: 127.0.0.1
-  private:
-    bind_ip: 127.0.0.1
-    advertised_ip: 127.0.0.1
-sip:
-  public:
-    udp: {enabled: true, bind: "%s:%d"}
-    ws:  {enabled: true, bind: "127.0.0.1:%d"}
-%s%s  private:
-    bind: "127.0.0.1:%d"
-  upstream:
-    address: 127.0.0.1:%d
-rtp:
-  public:  {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
-  private: {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
-webrtc:
-  enabled: %v
-listen:
-  media:
-    rtp_timeout: 60s
-shield:
-  # Every test client shares 127.0.0.1, so the production default of
-  # 20/s per_ip would throttle the harness itself rather than the code
-  # under test. The rate limiter has its own tests in package shield.
+// harnessYAML renders the v2 config every harness shares: public on
+// 127.0.0.1, a placeholder private.ip (the private socket is overridden by
+// WithPrivateAddr), the given switch nodes, one RTP range for both pools
+// and a shield limit high enough that the harness itself is never throttled
+// (the rate limiter has its own tests in package shield).
+func harnessYAML(t *testing.T, switches []string, pubUDP, pubWS, pubWSS, mediaBase int, carrierSources string) string {
+	t.Helper()
+	var listen []string
+	listen = append(listen, fmt.Sprintf("udp: %d", pubUDP))
+	if pubWS != 0 {
+		listen = append(listen, fmt.Sprintf("ws: %d", pubWS))
+	}
+	tlsBlock := ""
+	if pubWSS != 0 {
+		listen = append(listen, fmt.Sprintf("wss: %d", pubWSS))
+		cert, key := writeTestTLS(t, t.TempDir())
+		tlsBlock = fmt.Sprintf("tls: {cert: %q, key: %q}\n", cert, key)
+	}
+	carriers := ""
+	if carrierSources != "" {
+		carriers = fmt.Sprintf("  carrier_sources: [%s]\n", carrierSources)
+	}
+	return fmt.Sprintf(`
+public: {ip: 127.0.0.1}
+private: {ip: %s}
+rtp: "%d-%d"
+%sedge:
+  switch: [%s]
+  listen: {%s}
+%sshield:
   rate_limit: "5000/s per_ip"
-`, pubBindIP, pubUDP, pubWS, wssBlock, carrierLine, priv, up, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
+  carrier_rate_limit: "5000/s per_ip"
+`, harnessPrivatePlaceholder, mediaBase, mediaBase+mediaWindow-1, tlsBlock,
+		strings.Join(switches, ", "), strings.Join(listen, ", "), carriers)
+}
 
+// newHarness parses the config, builds the proxy with the private socket on
+// 127.0.0.1:priv and starts it; the caller attaches the fake switches.
+func newHarness(t *testing.T, yaml string, priv int) *harness {
+	t.Helper()
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatalf("harness config: %v", err)
 	}
 	store := config.NewStore(cfg)
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	srv, err := New(store, log)
+	srv, err := New(store, log, WithPrivateAddr(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", priv))))
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	l := cfg.Edge.Listen
 	h := &harness{
 		t: t, srv: srv, store: store,
-		publicUDP:  fmt.Sprintf("127.0.0.1:%d", pubUDP),
-		publicWS:   fmt.Sprintf("127.0.0.1:%d", pubWS),
-		publicWSS:  publicWSS,
+		publicUDP:  fmt.Sprintf("127.0.0.1:%d", l.UDP),
 		privateSIP: fmt.Sprintf("127.0.0.1:%d", priv),
-		upstream:   fmt.Sprintf("127.0.0.1:%d", up),
+		upstreams:  map[string]*fakeSwitch{},
 		done:       make(chan struct{}),
 	}
-	h.fs = startFakeSwitch(t, h.upstream)
+	if l.WS != 0 {
+		h.publicWS = fmt.Sprintf("127.0.0.1:%d", l.WS)
+	}
+	if l.WSS != 0 {
+		h.publicWSS = fmt.Sprintf("127.0.0.1:%d", l.WSS)
+	}
+	return h
+}
 
+// run starts the proxy and waits until it serves.
+func (h *harness) run() {
+	t := h.t
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	go func() {
 		defer close(h.done)
-		if err := srv.Run(ctx); err != nil && ctx.Err() == nil {
+		if err := h.srv.Run(ctx); err != nil && ctx.Err() == nil {
 			t.Errorf("proxy Run: %v", err)
 		}
 	}()
 	select {
-	case <-srv.ready:
+	case <-h.srv.ready:
 	case <-h.done:
 		t.Fatal("proxy exited before it was ready")
 	case <-time.After(10 * time.Second):
 		t.Fatal("proxy never became ready")
 	}
 	t.Cleanup(h.stop)
-	assertProxyServing(t, srv)
+	assertProxyServing(t, h.srv)
+}
+
+// startHarnessFull builds the single-switch harness with the given
+// edge.carrier_sources list body ("" configures none).
+func startHarnessFull(t *testing.T, webrtc, wss bool, carrierSources string) *harness {
+	t.Helper()
+	pubUDP := freePort(t)
+	pubWS, pubWSS := 0, 0
+	if webrtc {
+		pubWS = freeTCPPort(t)
+	}
+	if wss {
+		pubWSS = freeTCPPort(t)
+	}
+	priv := freePort(t)
+	up := freePort(t)
+	// The media range is per-harness so no two tests contend for a port.
+	mediaBase := nextMediaBase(t)
+
+	h := newHarness(t, harnessYAML(t, []string{fmt.Sprintf("127.0.0.1:%d", up)}, pubUDP, pubWS, pubWSS, mediaBase, carrierSources), priv)
+	h.upstream = fmt.Sprintf("127.0.0.1:%d", up)
+	h.fs = startFakeSwitch(t, h.upstream)
+	h.run()
 	return h
 }
 
@@ -359,133 +422,44 @@ func (f *fakeSwitch) callAsync(t *testing.T, ruri sip.Uri, dest, body string) (*
 	return req, final
 }
 
-// startHarnessUpstreams is startHarness with a configured MULTI-switch
-// sip.upstreams pool. nodes maps the node NAME — the name the cooldown
-// table, the logs and the tests use — to its "host:port" address.
-//
-// The YAML template is a deliberate COPY of startHarnessCfg's rather than a
-// call into it: the existing single-upstream harness must stay
-// byte-for-byte unchanged (D9), and startHarnessFull's shape — one
-// `upstream:` stanza — cannot express a pool anyway. The copy also has no
-// `fs:` field to fill, so h.fs stays nil and stop() guards it.
+// startHarnessSwitches is startHarness with a MULTI-switch edge.switch
+// pool. nodes are the "IP:port" entries, in file order; a node's name in
+// the topology, the cooldown table and the logs is that string.
 //
 // A fake switch is started for every node on a LOOPBACK address. A node on
-// any other address (the documentation range, e.g. 192.0.2.1:5060)
-// deliberately gets none: the proxy's private socket binds loopback, and a
-// UDP socket bound to loopback cannot send to a documentation address at
-// all — the send fails immediately with EINVAL. That deterministic
-// transport error is exactly what the failover tests need; a closed socket
-// would instead swallow the datagram silently, and a silent node is
-// indistinguishable from a slow one (D5).
-func startHarnessUpstreams(t *testing.T, algorithm, cooldown string, nodes map[string]string) (*harness, map[string]*fakeSwitch) {
+// any other address (e.g. 10.255.255.1:5060) deliberately gets none: the
+// proxy's private socket binds loopback, and a UDP socket bound to
+// loopback cannot send to a non-loopback address at all — the send fails
+// immediately. That deterministic transport error is exactly what the
+// failover tests need; a closed socket would instead swallow the datagram
+// silently, and a silent node is indistinguishable from a slow one. The
+// dead node's address starts with "10." so it sorts before the loopback
+// nodes, which the failover tests rely on.
+func startHarnessSwitches(t *testing.T, nodes []string) (*harness, map[string]*fakeSwitch) {
 	t.Helper()
 	if len(nodes) == 0 {
-		t.Fatal("startHarnessUpstreams needs at least one node")
+		t.Fatal("startHarnessSwitches needs at least one node")
 	}
 	pubUDP := freePort(t)
 	pubWS := freeTCPPort(t)
 	priv := freePort(t)
-	// Media ranges are per-harness so no two tests contend for a port.
 	mediaBase := nextMediaBase(t)
 
-	// Deterministic config: sort the names so neither the YAML nor the
-	// topology it produces ever depends on map iteration order.
-	names := make([]string, 0, len(nodes))
-	for name := range nodes {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	var opts, nodeLines strings.Builder
-	if algorithm != "" {
-		fmt.Fprintf(&opts, "    algorithm: %s\n", algorithm)
-	}
-	if cooldown != "" {
-		fmt.Fprintf(&opts, "    cooldown: %s\n", cooldown)
-	}
-	for _, name := range names {
-		fmt.Fprintf(&nodeLines, "      %s:\n        address: %s\n", name, nodes[name])
-	}
-
-	yaml := fmt.Sprintf(`
-network:
-  public:
-    bind_ip: 127.0.0.1
-    advertised_ip: 127.0.0.1
-  private:
-    bind_ip: 127.0.0.1
-    advertised_ip: 127.0.0.1
-sip:
-  public:
-    udp: {enabled: true, bind: "127.0.0.1:%d"}
-    ws:  {enabled: true, bind: "127.0.0.1:%d"}
-    carrier_sources: [127.0.0.1] # every client is 127.0.0.1; see startHarnessWith
-  private:
-    bind: "127.0.0.1:%d"
-  upstreams:
-%s    nodes:
-%s
-rtp:
-  public:  {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
-  private: {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
-webrtc:
-  enabled: false
-listen:
-  media:
-    rtp_timeout: 60s
-shield:
-  rate_limit: "5000/s per_ip"
-`, pubUDP, pubWS, priv, opts.String(), nodeLines.String(), mediaBase, mediaBase+199, mediaBase+200, mediaBase+399)
-
-	cfg, err := config.Parse([]byte(yaml))
-	if err != nil {
-		t.Fatalf("upstreams harness config: %v", err)
-	}
-	store := config.NewStore(cfg)
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	srv, err := New(store, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	h := &harness{
-		t: t, srv: srv, store: store,
-		publicUDP:  fmt.Sprintf("127.0.0.1:%d", pubUDP),
-		publicWS:   fmt.Sprintf("127.0.0.1:%d", pubWS),
-		privateSIP: fmt.Sprintf("127.0.0.1:%d", priv),
-		upstreams:  map[string]*fakeSwitch{},
-		done:       make(chan struct{}),
-	}
+	h := newHarness(t, harnessYAML(t, nodes, pubUDP, pubWS, 0, mediaBase, harnessCarrierSources), priv)
 	switches := map[string]*fakeSwitch{}
-	for _, name := range names {
-		host, _, err := net.SplitHostPort(nodes[name])
+	for _, node := range nodes {
+		host, _, err := net.SplitHostPort(node)
 		if err != nil {
-			t.Fatalf("node %s address %q: %v", name, nodes[name], err)
+			t.Fatalf("node %q: %v", node, err)
 		}
 		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
 			continue // deliberately unreachable; see the doc comment
 		}
-		fs := startFakeSwitch(t, nodes[name])
-		h.upstreams[name] = fs
-		switches[name] = fs
+		fs := startFakeSwitch(t, node)
+		h.upstreams[node] = fs
+		switches[node] = fs
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	h.cancel = cancel
-	go func() {
-		defer close(h.done)
-		if err := srv.Run(ctx); err != nil && ctx.Err() == nil {
-			t.Errorf("proxy Run: %v", err)
-		}
-	}()
-	select {
-	case <-srv.ready:
-	case <-h.done:
-		t.Fatal("proxy exited before it was ready")
-	case <-time.After(10 * time.Second):
-		t.Fatal("proxy never became ready")
-	}
-	t.Cleanup(h.stop)
-	assertProxyServing(t, srv)
+	h.run()
 	return h, switches
 }
 
@@ -496,7 +470,7 @@ func (h *harness) stop() {
 	case <-time.After(10 * time.Second):
 		h.t.Error("proxy did not shut down")
 	}
-	// h.fs is nil in a pool harness (startHarnessUpstreams): there is no
+	// h.fs is nil in a pool harness (startHarnessSwitches): there is no
 	// single upstream, and a nil fake must not panic the cleanup path.
 	if h.fs != nil {
 		h.fs.stop()

@@ -4,8 +4,6 @@ package config
 
 import (
 	"fmt"
-	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -72,40 +70,7 @@ func (p *PortRange) UnmarshalYAML(b []byte) error {
 	return nil
 }
 
-// SIPListen is one signaling listener, written as "udp://0.0.0.0:5060".
-type SIPListen struct {
-	Transport string // "udp", "tcp", or "tls"
-	Host      string
-	Port      int
-}
-
-func (s *SIPListen) UnmarshalYAML(b []byte) error {
-	raw, err := yamlScalarString(b)
-	if err != nil {
-		return fmt.Errorf("invalid listener %q: %w", string(b), err)
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("invalid listener %q: %w", raw, err)
-	}
-	switch u.Scheme {
-	case "udp", "tcp", "tls":
-	default:
-		return fmt.Errorf("invalid listener %q: transport must be udp, tcp, or tls", raw)
-	}
-	host, portStr, err := net.SplitHostPort(u.Host)
-	if err != nil {
-		return fmt.Errorf("invalid listener %q: %w", raw, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("invalid listener %q: bad port", raw)
-	}
-	s.Transport, s.Host, s.Port = u.Scheme, host, port
-	return nil
-}
-
-// RateLimit is the parsed form of shield.rate_limit, e.g. "20/s per_ip".
+// RateLimit is the parsed form of a shield rate limit, e.g. "20/s per_ip".
 type RateLimit struct {
 	Rate     int
 	Interval time.Duration

@@ -37,7 +37,7 @@ func (s *syncBuffer) String() string {
 // lost.
 func TestRecoverMWLogsStack(t *testing.T) {
 	var logs syncBuffer
-	s := New(&config.AdminConfig{Listen: "127.0.0.1:0"}, config.NewStore(mustCfg(t)), emptyDeps(),
+	s := New(&config.AdminConfig{Listen: "127.0.0.1:0"}, nil, config.NewStore(mustCfg(t)), emptyDeps(),
 		slog.New(slog.NewTextHandler(&logs, nil)), "")
 	h := s.recoverMW(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		auditPanickingHandler()

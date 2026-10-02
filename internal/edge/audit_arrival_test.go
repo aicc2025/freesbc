@@ -43,7 +43,7 @@ func warmPrivateSource(t *testing.T, h *harness) {
 // public listener is banned even though the same socket has been seen on
 // the private bind.
 func TestAuditPrivateSourceOnPublicListenerIsPublic(t *testing.T) {
-	h := startHarness(t, false)
+	h := startHarnessStrict(t, false, false)
 	conn := auditUDP(t)
 	port := auditUDPPort(conn)
 

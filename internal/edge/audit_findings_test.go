@@ -18,7 +18,6 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 
-	"github.com/freesbc/freesbc/internal/config"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
@@ -441,7 +440,7 @@ func TestAuditReInvite2xxUnanchorableIsACKed(t *testing.T) {
 // and its later BYE gets 481.
 func TestAuditMediaTimeoutSendsBye(t *testing.T) {
 	h := startHarness(t, false)
-	auditReplaceConfig(h, func(c *config.Config) { c.Listen.Media.RTPTimeout = config.Duration(time.Second) })
+	h.srv.setRTPTimeout(time.Second)
 	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
 	phone := newUDPClient(t)
 	invite, _, _ := auditPhoneCall(t, h, phone)

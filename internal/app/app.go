@@ -1,5 +1,5 @@
 // Package app owns construction and lifecycle: it turns a config file path
-// into a running set of components (config watcher, edge proxy plane,
+// into a running set of components (config watcher, edge,
 // admin HTTP surface) and runs them until the context is
 // cancelled or one of them fails. cmd/freesbc does argv parsing and exit
 // codes; everything else lives here.
@@ -53,16 +53,14 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	store := config.NewStore(cfg)
 
-	// The edge proxy plane: public SIP/UDP + WS/WSS toward phones and
-	// browsers, one upstream FreeSWITCH, media anchored through the SBC.
-	if !cfg.ProxyEnabled() {
-		return fmt.Errorf("nothing to run: configure sip.upstream.address (or sip.upstreams.nodes)")
-	}
-	edgeSrv, err := edge.New(store, log)
+	// The edge: public SIP/UDP + WS/WSS toward phones, browsers and
+	// carriers, the switch behind it, media anchored through the SBC.
+	edgeSrv, err := edge.New(store, log, testHookEdgeOptions...)
 	if err != nil {
-		return fmt.Errorf("edge proxy: %w", err)
+		return fmt.Errorf("edge: %w", err)
 	}
-	logMediaPlanes(log, cfg)
+	log.Info("media planes ready", "rtp", fmt.Sprintf("%d-%d", cfg.RTP.Min, cfg.RTP.Max),
+		"public_bind", cfg.PublicBind().String(), "private", cfg.PrivateIP().String())
 
 	// One errgroup for every long-running component: the first non-nil
 	// error cancels the shared context, which is how a fatal bind error in
@@ -90,7 +88,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	if adminCfg := cfg.Admin; adminCfg != nil {
 		deps := adminDeps(edgeSrv, opts.Version)
-		adminSrv := admin.New(adminCfg, store, deps, log, opts.ConfigPath)
+		adminSrv := admin.New(adminCfg, cfg.TLS, store, deps, log, opts.ConfigPath)
 		g.Go(func() error {
 			if err := adminSrv.Run(gctx); err != nil && gctx.Err() == nil {
 				log.Error("admin server exited", "err", err)
@@ -151,14 +149,10 @@ func adminDeps(edgeSrv *edge.Server, version string) admin.Deps {
 	}
 }
 
-// logMediaPlanes logs the RTP range of the edge's public and private pools.
-func logMediaPlanes(log *slog.Logger, cfg *config.Config) {
-	rng := func(lo, hi int) string { return fmt.Sprintf("%d-%d", lo, hi) }
-	log.Info("media plane ready", "plane", "edge",
-		"public_port_range", rng(cfg.RTP.Public.PortMin, cfg.RTP.Public.PortMax),
-		"private_port_range", rng(cfg.RTP.Private.PortMin, cfg.RTP.Private.PortMax),
-		"rtp_timeout", cfg.Listen.Media.RTPTimeout.Std())
-}
+// testHookEdgeOptions are extra options passed to edge.New. Only tests set
+// it, to override the fixed private socket (edge.WithPrivateAddr) with a
+// loopback port.
+var testHookEdgeOptions []edge.Option
 
 // testHookWatchStarted, when non-nil, runs right after Run starts the
 // config watcher, with the store the watcher replaces snapshots in. Only

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -73,30 +74,20 @@ func startFSHarness(t *testing.T, upstream, localIP string) *fsHarness {
 	privPort := nextPort(t)
 	mediaBase := nextMediaBase(t)
 
+	// The private socket's port is fixed at 5060 in production; the test
+	// seam WithPrivateAddr puts it on the host's LAN address and a free
+	// port, while private.ip is a placeholder that only has to differ from
+	// public.bind.
 	yaml := fmt.Sprintf(`
-network:
-  public:
-    bind_ip: %[3]s
-    advertised_ip: %[3]s
-  private:
-    bind_ip: %[3]s
-    advertised_ip: %[3]s
-sip:
-  public:
-    udp: {enabled: true, bind: "%[3]s:%[1]d"}
-  private:
-    bind: "%[3]s:%[2]d"
-  upstream:
-    address: %[4]s
-rtp:
-  public:  {bind_ip: %[3]s, advertised_ip: %[3]s, port_min: %[5]d, port_max: %[6]d}
-  private: {bind_ip: %[3]s, advertised_ip: %[3]s, port_min: %[7]d, port_max: %[8]d}
-listen:
-  media:
-    rtp_timeout: 60s
+public: {ip: %[2]s}
+private: {ip: %[3]s}
+rtp: "%[4]d-%[5]d"
+edge:
+  switch: [%[6]s]
+  listen: {udp: %[1]d}
 shield:
   rate_limit: "5000/s per_ip"
-`, pubPort, privPort, localIP, upstream, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399)
+`, pubPort, localIP, harnessPrivatePlaceholder, mediaBase, mediaBase+mediaWindow-1, upstream)
 
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
@@ -104,7 +95,7 @@ shield:
 	}
 	store := config.NewStore(cfg)
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	srv, err := New(store, log)
+	srv, err := New(store, log, WithPrivateAddr(netip.MustParseAddrPort(fmt.Sprintf("%s:%d", localIP, privPort))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,10 +321,10 @@ func TestFreeSWITCHInboundCallAndHangup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inbound offer unparseable: %v\n%s", err, inbound.Body())
 	}
-	pubRange := h.store.Current().RTP.Public
-	if offer.Audio.Port < pubRange.PortMin || offer.Audio.Port > pubRange.PortMax {
-		t.Errorf("the phone was offered media on %d, outside the SBC's public pool %d-%d — "+
-			"media would bypass the SBC", offer.Audio.Port, pubRange.PortMin, pubRange.PortMax)
+	rtpRange := h.store.Current().RTP
+	if offer.Audio.Port < int(rtpRange.Min) || offer.Audio.Port > int(rtpRange.Max) {
+		t.Errorf("the phone was offered media on %d, outside the SBC's rtp range %d-%d — "+
+			"media would bypass the SBC", offer.Audio.Port, rtpRange.Min, rtpRange.Max)
 	}
 
 	drain(phone.inbound)

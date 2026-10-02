@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -20,8 +19,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -29,16 +26,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// minimalConfigYAML is a minimal valid sbc.yaml: one SIP listener and one
-// peer, everything else left to withDefaults. The peer carries an
-// allowed_ips prefix: T-11 (F-16) rejects peers without one.
+// minimalConfigYAML is a minimal valid v2 freesbc.yaml.
 const minimalConfigYAML = `
-listen:
-  sip: [udp://127.0.0.1:45999]
-peers:
-  carrier:
-    address: 127.0.0.1:5060
-    allowed_ips: [203.0.113.0/24]
+public: { ip: 203.0.113.7 }
+private: { ip: 10.77.0.2 }
+edge:
+  switch: [10.77.0.10:5060]
+  listen: { udp: 5060 }
 `
 
 // mustCfg parses a minimal valid config for tests that need a *config.Config
@@ -68,11 +62,9 @@ func emptyDeps() Deps {
 func newTestServer(t *testing.T, deps Deps) *Server {
 	t.Helper()
 	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
-	cfg := &config.AdminConfig{Listen: "127.0.0.1:0"}
-	cfg.Auth.Username = "admin"
-	cfg.Auth.PasswordHash = string(hash)
+	cfg := &config.AdminConfig{Listen: "127.0.0.1:0", PasswordHash: string(hash)}
 	store := config.NewStore(mustCfg(t))
-	return New(cfg, store, deps, slog.New(slog.NewTextHandler(io.Discard, nil)), "")
+	return New(cfg, nil, store, deps, slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 }
 
 func testServer(t *testing.T) *Server { return newTestServer(t, emptyDeps()) }
@@ -86,21 +78,16 @@ func testServerWithCalls(t *testing.T, calls []Call) *Server {
 	return newTestServer(t, deps)
 }
 
-// testServerWithSecretConfig returns a test server backed by a config.Store
-// whose only peer ("carrier") carries the given password, for exercising
+// testServerWithSecretConfig returns a test server whose store carries an
+// admin section with the given placeholder password hash, for exercising
 // /api/config redaction.
-func testServerWithSecretConfig(t *testing.T, peerPassword string) *Server {
+func testServerWithSecretConfig(t *testing.T, adminHash string) *Server {
 	t.Helper()
 	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
-	cfg := &config.AdminConfig{Listen: "127.0.0.1:0"}
-	cfg.Auth.Username = "admin"
-	cfg.Auth.PasswordHash = string(hash)
-	// The store's admin section must carry the SAME credentials the tests
-	// authenticate with: requireAuth reads the store's current snapshot on
-	// every request (T-15), so a placeholder hash here would lock the tests
-	// out.
-	store := config.NewStore(mustCfgWithSecret(t, peerPassword, string(hash)))
-	return New(cfg, store, emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
+	cfg := &config.AdminConfig{Listen: "127.0.0.1:0", PasswordHash: string(hash)}
+	stored := mustCfg(t)
+	stored.Admin = &config.AdminConfig{Listen: "127.0.0.1:8080", PasswordHash: adminHash}
+	return New(cfg, nil, config.NewStore(stored), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 }
 
 // authGET performs an authenticated GET against s.handler(), fails the test
@@ -213,13 +200,13 @@ func TestSensitiveResponsesNoStore(t *testing.T) {
 	}
 }
 
-// TestAdminAuthFailureRateLimit (T-09/F-14 red test): the 11th wrong-password
+// TestAdminLoginFailureRateLimit (T-09/F-14 red test): the 11th wrong-password
 // request from the same RemoteAddr within a minute must be refused 429 —
 // bounding brute force — while the first 10 get the ordinary 401. While an
 // IP is over its budget even CORRECT credentials are refused: the limiter
 // gates before any credential work (that is what bounds the bcrypt CPU a
 // single address can demand).
-func TestAdminAuthFailureRateLimit(t *testing.T) {
+func TestAdminLoginFailureRateLimit(t *testing.T) {
 	s := testServer(t)
 	h := s.handler()
 	for i := 1; i <= 11; i++ {
@@ -257,10 +244,8 @@ func TestRequireAuthSkipsKDFOnMissingHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate hash: %v", err)
 	}
-	cfg := &config.AdminConfig{Listen: "127.0.0.1:0"}
-	cfg.Auth.Username = "admin"
-	cfg.Auth.PasswordHash = string(hash)
-	s := New(cfg, config.NewStore(mustCfg(t)), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
+	cfg := &config.AdminConfig{Listen: "127.0.0.1:0", PasswordHash: string(hash)}
+	s := New(cfg, nil, config.NewStore(mustCfg(t)), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 	h := s.handler()
 
 	var latencies []time.Duration
@@ -324,116 +309,38 @@ func TestAuthLimiterPrunesExpired(t *testing.T) {
 	}
 }
 
-// TestAdminAuthHotReloadRevokesOldPassword (T-15/F-15 red test): after
-// store.Replace swaps in a config whose admin.auth carries a NEW hash, the
-// old password must be refused 401 immediately — no restart, no grace
-// window — and the new one must pass. Pre-fix, requireAuth read the
-// construction-time cfg, so the old password kept working until restart
-// (the revocation gap F-15 describes).
-func TestAdminAuthHotReloadRevokesOldPassword(t *testing.T) {
+// Admin is restart-only: a reload that swaps the stored password_hash must
+// not change which password the running server accepts.
+func TestAdminIgnoresReloadedHash(t *testing.T) {
 	s := testServer(t)
 	h := s.handler()
-
-	// The construction-time password works before the reload.
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/api/status", nil)
-	req.SetBasicAuth("admin", "secret")
-	h.ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("old password before reload: got %d want 200", rr.Code)
-	}
-
-	// Hot reload: a new hash lands in the store.
 	newHash, err := bcrypt.GenerateFromPassword([]byte("newsecret"), bcrypt.MinCost)
 	if err != nil {
-		t.Fatalf("generate new hash: %v", err)
+		t.Fatal(err)
 	}
 	reloaded := mustCfg(t)
-	reloaded.Admin = &config.AdminConfig{Listen: "127.0.0.1:0", Auth: config.AdminAuth{
-		Username: "admin", PasswordHash: string(newHash),
-	}}
+	reloaded.Admin = &config.AdminConfig{Listen: "127.0.0.1:0", PasswordHash: string(newHash)}
 	s.store.Replace(reloaded)
+	for pass, want := range map[string]int{"secret": http.StatusOK, "newsecret": http.StatusUnauthorized} {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/status", nil)
+		req.SetBasicAuth("admin", pass)
+		h.ServeHTTP(rr, req)
+		if rr.Code != want {
+			t.Errorf("password %q: got %d want %d", pass, rr.Code, want)
+		}
+	}
+}
 
-	// The old password must be revoked on the very next request.
-	rr = httptest.NewRecorder()
-	req = httptest.NewRequest("GET", "/api/status", nil)
-	req.SetBasicAuth("admin", "secret")
+// The user name is the constant "admin", not configurable.
+func TestAdminUserIsConstant(t *testing.T) {
+	h := testServer(t).handler()
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	req.SetBasicAuth("root", "secret")
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("old password after hot reload: got %d want 401 (revocation gap)", rr.Code)
-	}
-
-	// The new password must pass.
-	rr = httptest.NewRecorder()
-	req = httptest.NewRequest("GET", "/api/status", nil)
-	req.SetBasicAuth("admin", "newsecret")
-	h.ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("new password after hot reload: got %d want 200", rr.Code)
-	}
-}
-
-// lockedBuffer is a goroutine-safe bytes.Buffer for capturing logs written
-// from server goroutines while the test polls them.
-type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (l *lockedBuffer) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.Write(p)
-}
-
-func (l *lockedBuffer) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.String()
-}
-
-// TestAdminListenChangeWarns (T-15/F-15): a hot reload that changes
-// admin.listen cannot rebind the running listener, but must log a prominent
-// warning instead of silently keeping the old address.
-func TestAdminListenChangeWarns(t *testing.T) {
-	var buf lockedBuffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
-	if err != nil {
-		t.Fatalf("generate hash: %v", err)
-	}
-	cfg := &config.AdminConfig{Listen: "127.0.0.1:0", Auth: config.AdminAuth{
-		Username: "admin", PasswordHash: string(hash),
-	}}
-	store := config.NewStore(mustCfg(t))
-	s := New(cfg, store, emptyDeps(), logger, "")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errc := make(chan error, 1)
-	go func() { errc <- s.Run(ctx) }()
-
-	// Wait until Run is serving (the watcher is started before the
-	// listening log line, so this also orders the subscription).
-	deadline := time.Now().Add(3 * time.Second)
-	for !strings.Contains(buf.String(), "admin server listening") {
-		if time.Now().After(deadline) {
-			t.Fatal("admin server never started")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	reloaded := mustCfg(t)
-	reloaded.Admin = &config.AdminConfig{Listen: "127.0.0.1:10102", Auth: config.AdminAuth{
-		Username: "admin", PasswordHash: string(hash),
-	}}
-	store.Replace(reloaded)
-
-	deadline = time.Now().Add(3 * time.Second)
-	for !strings.Contains(buf.String(), "admin.listen changed") {
-		if time.Now().After(deadline) {
-			t.Fatalf("listen-change warning never logged; log:\n%s", buf.String())
-		}
-		time.Sleep(10 * time.Millisecond)
+		t.Fatalf("got %d want 401", rr.Code)
 	}
 }
 
@@ -479,7 +386,7 @@ func testCertPEMs(t *testing.T) (certPath, keyPath string, roots *x509.CertPool)
 	return certPath, keyPath, roots
 }
 
-// TestAdminServesTLS (T-26b): with admin.tls_cert/tls_key configured, the
+// TestAdminServesTLS (T-26b): with allow_remote and the top-level tls identity, the
 // listener serves HTTPS with that certificate — a client that verifies
 // against the cert (NO skip-verify) completes the handshake, sees the
 // configured certificate, and gets the API. This is the LAN-deployment path
@@ -490,10 +397,8 @@ func TestAdminServesTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate hash: %v", err)
 	}
-	cfg := &config.AdminConfig{Listen: "127.0.0.1:10100", TLSCert: certPath, TLSKey: keyPath}
-	cfg.Auth.Username = "admin"
-	cfg.Auth.PasswordHash = string(hash)
-	s := New(cfg, config.NewStore(mustCfg(t)), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
+	cfg := &config.AdminConfig{Listen: "127.0.0.1:10100", AllowRemote: true, PasswordHash: string(hash)}
+	s := New(cfg, &config.TLSConfig{Cert: certPath, Key: keyPath}, config.NewStore(mustCfg(t)), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errc := make(chan error, 1)
@@ -528,34 +433,5 @@ func TestAdminServesTLS(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("https /healthz: got %d want 200", resp.StatusCode)
-	}
-}
-
-// TestAdminRemoteWithoutTLSWarns (T-26b): a non-loopback listen with no TLS
-// must log a prominent plaintext warning at startup (the operator opted in
-// via allow_remote, but Basic credentials then travel in the clear). The
-// TEST-NET address normally can't bind, so Run returns a bind error AFTER
-// the warning has been logged — the warning is the assertion, not the bind.
-func TestAdminRemoteWithoutTLSWarns(t *testing.T) {
-	var buf lockedBuffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	hash, err := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
-	if err != nil {
-		t.Fatalf("generate hash: %v", err)
-	}
-	cfg := &config.AdminConfig{Listen: "192.0.2.1:8080"}
-	cfg.Auth.Username = "admin"
-	cfg.Auth.PasswordHash = string(hash)
-	s := New(cfg, config.NewStore(mustCfg(t)), emptyDeps(), logger, "")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = s.Run(ctx) }() // bind error expected (TEST-NET)
-
-	deadline := time.Now().Add(3 * time.Second)
-	for !strings.Contains(buf.String(), "PLAINTEXT on a non-loopback") {
-		if time.Now().After(deadline) {
-			t.Fatalf("plaintext-on-remote warning never logged; log:\n%s", buf.String())
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }

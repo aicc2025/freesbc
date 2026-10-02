@@ -11,67 +11,50 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
-// audit: P2-CFG-007
-// A reload that edits only hot settings reports no restart-only change; one
-// that edits the listener set, the edge topology or the plane set names
-// each changed key.
+// A reload that edits only hot settings (shield) reports no restart-only
+// change; every other section names its changed key.
 func TestRestartOnlyChanges(t *testing.T) {
-	parse := func(src string) *Config {
-		t.Helper()
-		c, err := Parse([]byte(src))
-		if err != nil {
-			t.Fatalf("parse: %v", err)
-		}
-		return c
-	}
-	trunk := parse(minimalYAML)
-	edge := parse(proxyYAML)
-
+	base := minimalYAML + "tls: { cert: a, key: b }\n"
 	cases := []struct {
-		name          string
-		running, next *Config
-		want          []string
+		name string
+		next string
+		want []string
 	}{
-		{"identical", trunk, parse(minimalYAML), nil},
-		{"hot only: peer address", trunk, parse(strings.Replace(minimalYAML, "10.0.0.10:5060", "10.0.0.99:5060", 1)), nil},
-		{"trunk listener", trunk, parse(strings.Replace(minimalYAML, "0.0.0.0:5060", "0.0.0.0:5070", 1)),
-			[]string{"listen.sip / sip.bind_ip / sip.bind_port / sip.transport"}},
-		{"edge rtp range", edge, parse(strings.Replace(proxyYAML, "port_max: 39999", "port_max: 38999", 1)),
-			[]string{"rtp.public / rtp.private"}},
+		{"identical", base, nil},
+		{"hot only: shield", base + "shield: { ban: 2h, rate_limit: 1/s per_ip, carrier_rate_limit: 1/s per_ip }\n", nil},
+		{"public", strings.Replace(base, "203.0.113.7", "203.0.113.8", 1), []string{"public"}},
+		{"private", strings.Replace(base, "10.77.0.2", "10.77.0.3", 1), []string{"private"}},
+		{"rtp", base + "rtp: 30000-30999\n", []string{"rtp"}},
+		{"tls", strings.Replace(base, "cert: a", "cert: c", 1), []string{"tls"}},
+		{"switch", strings.Replace(base, "10.77.0.10:5060", "10.77.0.11:5060", 1), []string{"edge.switch"}},
+		{"switch_carrier_port", strings.Replace(base, "edge:\n", "edge:\n  switch_carrier_port: 5080\n", 1), []string{"edge.switch_carrier_port"}},
+		{"listen", strings.Replace(base, "udp: 5060", "udp: 5070", 1), []string{"edge.listen"}},
+		{"carriers", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carriers: { a: 1.2.3.4 }", 1), []string{"edge.carriers"}},
+		{"carrier_sources", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carrier_sources: [1.2.3.4]", 1), []string{"edge.carrier_sources"}},
+		{"admin", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\" }\n", []string{"admin"}},
 	}
+	running := mustParse(t, base)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := RestartOnlyChanges(tc.running, tc.next); !slices.Equal(got, tc.want) {
+			if got := RestartOnlyChanges(running, mustParse(t, tc.next)); !slices.Equal(got, tc.want) {
 				t.Errorf("RestartOnlyChanges = %q, want %q", got, tc.want)
 			}
 		})
 	}
 }
 
-// audit: P2-APP-003
-// app.Run decides once which planes run. A reload that adds or removes a
-// plane is a restart-only change and must be reported as one.
-func TestRestartOnlyChangesPlaneSet(t *testing.T) {
-	trunk, err := Parse([]byte(minimalYAML))
+// testHash is a bcrypt cost-10 hash of "pw".
+var testHash = func() string {
+	h, err := bcrypt.GenerateFromPassword([]byte("pw"), 10)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-	edge, err := Parse([]byte(proxyYAML))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := RestartOnlyChanges(trunk, edge)
-	for _, key := range []string{
-		"peers (trunk plane on/off)",
-		"sip.upstream / sip.upstreams.nodes (edge plane on/off)",
-	} {
-		if !slices.Contains(got, key) {
-			t.Errorf("trunk-only → edge-only reload: %q missing from %q", key, got)
-		}
-	}
-}
+	return string(h)
+}()
 
 // syncBuffer is a bytes.Buffer safe to write from the watcher goroutine and
 // read from the test.
@@ -97,7 +80,7 @@ func (s *syncBuffer) String() string {
 // settings apply) but warns, naming the setting, instead of accepting it
 // silently.
 func TestWatchWarnsOnRestartOnlyChange(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sbc.yaml")
+	path := filepath.Join(t.TempDir(), "freesbc.yaml")
 	if err := os.WriteFile(path, []byte(minimalYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -112,16 +95,15 @@ func TestWatchWarnsOnRestartOnlyChange(t *testing.T) {
 	go func() { _ = Watch(ctx, path, store, slog.New(slog.NewTextHandler(&logs, nil))) }()
 	time.Sleep(100 * time.Millisecond) // let the watcher attach
 
-	updated := strings.Replace(minimalYAML, "0.0.0.0:5060", "0.0.0.0:5070", 1)
-	updated = strings.Replace(updated, "10.0.0.10:5060", "10.0.0.99:5060", 1)
+	updated := strings.Replace(minimalYAML, "203.0.113.7", "203.0.113.8", 1) + "shield: { ban: 99m }\n"
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, 3*time.Second, func() bool {
-		return store.Current().Peers["pbx"].Address == "10.0.0.99:5060"
+		return store.Current().Shield.Ban.Std() == 99*time.Minute
 	})
 	out := logs.String()
-	if !strings.Contains(out, "restart-only") || !strings.Contains(out, "listen.sip") {
-		t.Errorf("reload changing listen.sip logged no restart-only warning naming it:\n%s", out)
+	if !strings.Contains(out, "restart-only") || !strings.Contains(out, "public") {
+		t.Errorf("reload changing public logged no restart-only warning naming it:\n%s", out)
 	}
 }

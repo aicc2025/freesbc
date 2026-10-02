@@ -14,33 +14,26 @@ import (
 )
 
 // audit: P2-APP-007
-// `freesbc run edge.yaml` (the path without -c) must not silently run
-// ./sbc.yaml: a positional argument is a usage error, exit 2.
+// `freesbc run other.yaml` (the path without -c) must not silently run
+// ./freesbc.yaml: a positional argument is a usage error, exit 2.
 func TestPositionalArgumentIsUsageError(t *testing.T) {
 	dir := t.TempDir()
-	// A valid ./sbc.yaml would make the old behaviour exit 0.
-	good := filepath.Join(dir, "sbc.yaml")
+	// A valid ./freesbc.yaml would make the old behaviour exit 0.
+	good := filepath.Join(dir, "freesbc.yaml")
 	if err := os.WriteFile(good, []byte(`
-network:
-  public:  { bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1 }
-  private: { bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1 }
-sip:
-  public:
-    udp: { enabled: true, bind: "127.0.0.1:5060" }
-  private:
-    bind: "127.0.0.1:5061"
-  upstream:
-    address: 127.0.0.1:5062
-rtp:
-  public:  { port_min: 10010, port_max: 10019 }
-  private: { port_min: 10020, port_max: 10029 }
+public: { ip: 127.0.0.1 }
+private: { ip: 192.0.2.250 }
+rtp: 10010-10029
+edge:
+  switch: [127.0.0.1:5062]
+  listen: { udp: 5060 }
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{
-		{"check", "-c", good, "edge.yaml"},
-		{"check", "edge.yaml"},
-		{"run", "edge.yaml"},
+		{"check", "-c", good, "other.yaml"},
+		{"check", "other.yaml"},
+		{"run", "other.yaml"},
 	} {
 		if got := run(args); got != 2 {
 			t.Errorf("run(%q) = %d, want 2 (usage error)", args, got)

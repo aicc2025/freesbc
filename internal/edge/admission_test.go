@@ -132,10 +132,10 @@ func TestAdmissionRegisteredUDPClientCallProceeds(t *testing.T) {
 	}
 }
 
-// An INVITE from a sip.public.carrier_sources prefix proceeds without any
+// An INVITE from a edge.carrier_sources prefix proceeds without any
 // registration.
 func TestAdmissionCarrierSourceProceeds(t *testing.T) {
-	h := startHarnessFull(t, false, "127.0.0.1", false, "    carrier_sources: [127.0.0.0/8]\n")
+	h := startHarnessFull(t, false, false, "127.0.0.0/8")
 	if got := h.srv.topo.carrierSourcesString(); got != "127.0.0.0/8" {
 		t.Errorf("carrier sources = %q, want 127.0.0.0/8", got)
 	}

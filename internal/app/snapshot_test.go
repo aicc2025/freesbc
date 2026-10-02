@@ -39,11 +39,12 @@ func TestRunStartsFromOneSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	sipPort, privPort, upPort, adminPort := freeUDPPort(t), freeUDPPort(t), freeUDPPort(t), freeTCPPort(t)
-	edgeYAML := edgeRunYAML(sipPort, privPort, upPort)
+	setPrivate(t, privPort)
+	edgeYAML := edgeRunYAML(sipPort, upPort)
 	withAdmin := edgeYAML + fmt.Sprintf(`
 admin:
   listen: 127.0.0.1:%d
-  auth: { username: admin, password_hash: %q }
+  password_hash: %q
 `, adminPort, hash)
 	noAdmin, err := config.Parse([]byte(edgeYAML))
 	if err != nil {

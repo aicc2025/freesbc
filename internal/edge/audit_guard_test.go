@@ -48,7 +48,7 @@ func auditRawRequest(t *testing.T, c *net.UDPConn, dst string, msg string) {
 // banned; a malformed request from it afterwards — one sipgo would answer
 // with a stateless 400 before any handler runs — must get no response.
 func TestAuditBannedSourceGetsNoResponse(t *testing.T) {
-	h := startHarness(t, false)
+	h := startHarnessStrict(t, false, false)
 	c := auditUDP(t)
 	port := auditUDPPort(c)
 	auditRawRequest(t, c, h.publicUDP, fmt.Sprintf("OPTIONS sip:x@127.0.0.1 SIP/2.0\r\n"+

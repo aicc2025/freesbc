@@ -1,7 +1,7 @@
 // Package admin serves the read-only operator HTTP surface: a Prometheus
 // /metrics endpoint and a JSON status API, behind bcrypt HTTP Basic Auth.
 // It imports only config; plane-side data arrives via the Deps closures
-// over admin's own DTOs (internal/app adapts trunk.Server and edge.Server).
+// over admin's own DTOs (internal/app adapts edge.Server).
 package admin
 
 import (
@@ -54,8 +54,7 @@ type Deps struct {
 	// transport://host:port. They are restart-only, so this comes from the
 	// startup snapshot, never the hot-reloaded config. Nil lists none.
 	Listeners func() []string
-	// Proxy reports the edge-proxy plane's counters, or is nil when that
-	// plane is not running (a trunk-only deployment).
+	// Proxy reports the edge plane's counters; nil reports none.
 	Proxy func() ProxyStats
 }
 
@@ -96,7 +95,8 @@ type ProxyStats struct {
 
 // Server is the admin HTTP server.
 type Server struct {
-	cfg     *config.AdminConfig
+	cfg     *config.AdminConfig // the startup snapshot: admin is restart-only
+	tls     *config.TLSConfig   // top-level tls identity; served when cfg.AllowRemote
 	store   *config.Store
 	deps    Deps
 	log     *slog.Logger
@@ -114,8 +114,11 @@ type Server struct {
 	metricsHandler http.Handler
 }
 
-func New(cfg *config.AdminConfig, store *config.Store, deps Deps, log *slog.Logger, cfgPath string) *Server {
-	return &Server{cfg: cfg, store: store, deps: deps, log: log, started: time.Now(), cfgPath: cfgPath}
+// New builds the admin server from the startup admin section and the
+// top-level tls identity (used only when cfg.AllowRemote). Admin is
+// restart-only, so cfg is never re-read from the store.
+func New(cfg *config.AdminConfig, tlsCfg *config.TLSConfig, store *config.Store, deps Deps, log *slog.Logger, cfgPath string) *Server {
+	return &Server{cfg: cfg, tls: tlsCfg, store: store, deps: deps, log: log, started: time.Now(), cfgPath: cfgPath}
 }
 
 // handler composes the mux with the recover and (per-route) auth middleware.
@@ -131,29 +134,23 @@ func (s *Server) handler() http.Handler {
 	return s.recoverMW(mux)
 }
 
+// useTLS reports whether the listener serves HTTPS: with allow_remote the
+// top-level tls identity is mandatory (validation enforces it).
+func (s *Server) useTLS() bool { return s.cfg.AllowRemote && s.tls != nil }
+
 // Run serves until ctx is cancelled, then shuts down gracefully. A bind
-// failure returns an error (fatal to the process). When the construction
-// config carries tls_cert/tls_key, the listener serves HTTPS (TLS >= 1.2);
-// a non-loopback listen WITHOUT TLS logs a prominent startup warning (the
-// operator opted in via allow_remote, but Basic credentials and the full
-// config then travel in the clear).
+// failure returns an error (fatal to the process). With allow_remote the
+// listener serves HTTPS (TLS >= 1.2) using the top-level tls identity;
+// otherwise it serves plain HTTP, which validation only admits on loopback.
 func (s *Server) Run(ctx context.Context) error {
-	stopWatch := s.watchListenChange(ctx)
-	defer stopWatch()
-
-	if s.cfg.TLSCert == "" && !isLoopbackListen(s.cfg.Listen) {
-		s.log.Warn("admin serving PLAINTEXT on a non-loopback address — Basic credentials and the full config are readable on the network; set admin.tls_cert/tls_key or front with a TLS reverse proxy",
-			"listen", s.cfg.Listen)
-	}
-
 	srv := s.newHTTPServer()
 	errc := make(chan error, 1)
 	go func() {
-		if s.cfg.TLSCert == "" {
+		if !s.useTLS() {
 			errc <- srv.ListenAndServe()
 			return
 		}
-		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
+		cert, err := tls.LoadX509KeyPair(s.tls.Cert, s.tls.Key)
 		if err != nil {
 			errc <- fmt.Errorf("admin tls cert/key: %w", err)
 			return
@@ -161,7 +158,7 @@ func (s *Server) Run(ctx context.Context) error {
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
 		errc <- srv.ListenAndServeTLS("", "")
 	}()
-	s.log.Info("admin server listening", "addr", s.cfg.Listen, "tls", s.cfg.TLSCert != "")
+	s.log.Info("admin server listening", "addr", s.cfg.Listen, "tls", s.useTLS())
 	select {
 	case <-ctx.Done():
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -196,9 +193,8 @@ func (s *Server) Run(ctx context.Context) error {
 // Only an exact, previously verified header passes that way, so it gives a
 // guesser nothing.
 //
-// The credentials compared are the store's CURRENT admin
-// snapshot (adminAuth), not the construction-time cfg — a hot reload's new
-// password_hash takes effect on the very next request.
+// The user is always config.AdminUser; the hash is the startup snapshot's
+// (admin is restart-only, so there is no hot password rotation).
 func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user, pass, ok := r.BasicAuth()
@@ -207,8 +203,8 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		auth := s.adminAuth()
-		if s.verified.has(auth, user, pass) {
+		hash := s.cfg.PasswordHash
+		if s.verified.has(hash, user, pass) {
 			h(w, r)
 			return
 		}
@@ -218,8 +214,8 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
-		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(auth.Username)) == 1
-		passOK := bcrypt.CompareHashAndPassword([]byte(auth.PasswordHash), []byte(pass)) == nil
+		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(config.AdminUser)) == 1
+		passOK := bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) == nil
 		if !userOK || !passOK {
 			// The reserved slot stays: it is this failure.
 			w.Header().Set("WWW-Authenticate", `Basic realm="freesbc"`)
@@ -227,7 +223,7 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		s.limiter.refund(slot)
-		s.verified.add(auth, user, pass)
+		s.verified.add(hash, user, pass)
 		h(w, r)
 	}
 }
@@ -247,58 +243,6 @@ func (s *Server) newHTTPServer() *http.Server {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
-}
-
-// isLoopbackListen reports whether addr is a loopback host:port
-// (startup-warning check — config validation has already admitted whatever
-// is here).
-func isLoopbackListen(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	ip, err := netip.ParseAddr(host)
-	return err == nil && ip.IsLoopback()
-}
-
-// adminAuth returns the LIVE admin auth credentials: read from the store on
-// every request, so a hot reload that swaps in a new password_hash revokes
-// the old password immediately — no restart, no grace window. When the
-// reloaded config carries no admin section at all (Admin nil), the
-// construction-time credentials keep applying — the API keeps serving
-// rather than flipping to an empty auth that would deny everyone.
-func (s *Server) adminAuth() config.AdminAuth {
-	if cur := s.store.Current().Admin; cur != nil {
-		return cur.Auth
-	}
-	return s.cfg.Auth
-}
-
-// watchListenChange logs a prominent warning whenever a hot-reloaded config
-// changes admin.listen: the listener is fixed at bind time, so
-// the new address only takes effect after a restart — silently keeping the
-// old one would make operators believe the change applied. Returns a stop
-// func; the subscription itself is deliberately left registered (Store
-// has no unsubscribe).
-func (s *Server) watchListenChange(ctx context.Context) func() {
-	ch := s.store.Subscribe()
-	done := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-done:
-				return
-			case <-ch:
-				if cur := s.store.Current().Admin; cur != nil && cur.Listen != s.cfg.Listen {
-					s.log.Warn("admin.listen changed by hot reload; requires restart to take effect",
-						"bound", s.cfg.Listen, "configured", cur.Listen)
-				}
-			}
-		}
-	}()
-	return func() { close(done) }
 }
 
 // authFailLimit, authFailWindow, and authFailMaxIPs bound the per-source
@@ -446,9 +390,7 @@ const (
 // verifiedCreds remembers Basic credentials that passed bcrypt, so their
 // holder is not locked out by the failure limiter and a repeated scrape
 // skips the KDF. Entries are HMAC-SHA256 digests under a per-process random
-// key — never the password — over (username, password, current hash): a hot
-// reload that changes the username or the hash makes every entry
-// unmatchable at once, so revocation stays immediate. The zero value is
+// key — never the password — over (hash, username, password). The zero value is
 // usable.
 type verifiedCreds struct {
 	mu   sync.Mutex
@@ -456,7 +398,7 @@ type verifiedCreds struct {
 	seen map[[sha256.Size]byte]time.Time // digest -> last use
 }
 
-func (v *verifiedCreds) digestLocked(auth config.AdminAuth, user, pass string) [sha256.Size]byte {
+func (v *verifiedCreds) digestLocked(hash, user, pass string) [sha256.Size]byte {
 	if v.key == nil {
 		v.key = make([]byte, 32)
 		if _, err := rand.Read(v.key); err != nil {
@@ -464,7 +406,7 @@ func (v *verifiedCreds) digestLocked(auth config.AdminAuth, user, pass string) [
 		}
 	}
 	m := hmac.New(sha256.New, v.key)
-	for _, part := range []string{auth.Username, auth.PasswordHash, user, pass} {
+	for _, part := range []string{hash, user, pass} {
 		var n [8]byte
 		binary.BigEndian.PutUint64(n[:], uint64(len(part)))
 		m.Write(n[:])
@@ -475,13 +417,13 @@ func (v *verifiedCreds) digestLocked(auth config.AdminAuth, user, pass string) [
 	return d
 }
 
-// has reports whether (user, pass) was verified against auth before and is
+// has reports whether (user, pass) was verified against hash before and is
 // still fresh, refreshing its last use.
-func (v *verifiedCreds) has(auth config.AdminAuth, user, pass string) bool {
+func (v *verifiedCreds) has(hash, user, pass string) bool {
 	now := time.Now()
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	d := v.digestLocked(auth, user, pass)
+	d := v.digestLocked(hash, user, pass)
 	last, ok := v.seen[d]
 	if !ok || now.Sub(last) >= verifiedCredsTTL {
 		return false
@@ -490,15 +432,15 @@ func (v *verifiedCreds) has(auth config.AdminAuth, user, pass string) bool {
 	return true
 }
 
-// add remembers (user, pass) as verified against auth.
-func (v *verifiedCreds) add(auth config.AdminAuth, user, pass string) {
+// add remembers (user, pass) as verified against hash.
+func (v *verifiedCreds) add(hash, user, pass string) {
 	now := time.Now()
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.seen == nil {
 		v.seen = make(map[[sha256.Size]byte]time.Time)
 	}
-	d := v.digestLocked(auth, user, pass)
+	d := v.digestLocked(hash, user, pass)
 	if _, ok := v.seen[d]; !ok && len(v.seen) >= verifiedCredsMax {
 		var oldest [sha256.Size]byte
 		first := true
@@ -526,7 +468,7 @@ func remoteIP(r *http.Request) string {
 // to the client; the stack is logged.
 // It also injects Cache-Control: no-store on every response:
 // the API serves live state and, on /api/config/raw, the FULL config —
-// every peer credential in plaintext — none of which belongs in a
+// the admin password hash — none of which belongs in a
 // browser's on-disk cache. /healthz is exempt: it is static and is what
 // load balancers poll, where no-store would be noise. ETag/If-Match
 // semantics are untouched.
