@@ -159,6 +159,11 @@ type dialog struct {
 	inFlight *inviteAttempt
 	route    dialogRoute
 
+	// carrier names the carrier a carrier-originated call came from
+	// (edge.carriers name, or "unknown"); empty for every other call. Set
+	// once right after the record is created (setCarrier).
+	carrier string
+
 	// cancelled is set, synchronously, the moment the caller's CANCEL (or
 	// the INVITE backstop) gives up on the call. From then on no 2xx may
 	// confirm the record: sipgo answers the caller 487 as soon as the
@@ -387,6 +392,10 @@ func (t *dialogTable) calls() []CallRecord {
 			if d.callerPlane != planePublic {
 				from, to = to, from
 			}
+			if d.carrier != "" {
+				// A carrier-originated call: name both ends.
+				from, to = "carrier:"+d.carrier, "switch:"+d.route.privateRemote
+			}
 			out = append(out, CallRecord{
 				ID: "edge:" + d.callID + ";" + d.callerTag, CallID: d.callID,
 				From: from, To: to, StartUnixNano: d.confirmedAt.UnixNano(),
@@ -485,6 +494,20 @@ func (d *dialog) routeSnapshot() dialogRoute {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
 	return d.route
+}
+
+// setCarrier records the carrier a call came from.
+func (d *dialog) setCarrier(name string) {
+	d.tab.mu.Lock()
+	d.carrier = name
+	d.tab.mu.Unlock()
+}
+
+// carrierName is the carrier the call came from, "" if none.
+func (d *dialog) carrierName() string {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return d.carrier
 }
 
 // tags returns the dialog's caller and callee tags. The callee tag is

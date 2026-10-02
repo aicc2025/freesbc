@@ -214,20 +214,6 @@ func TestTopologyCarrierPort(t *testing.T) {
 	}
 }
 
-// The carrier-source set is edge.carrier_sources plus the literal-IP
-// carriers; a DNS-name carrier contributes nothing without resolution.
-func TestTopologyCarrierSources(t *testing.T) {
-	topo := buildTestTopology(t, strings.Replace(topoYAML, "  listen: {udp: 16060, ws: 18080}\n",
-		"  listen: {udp: 16060, ws: 18080}\n  carrier_sources: [198.51.100.0/28]\n  carriers: {a: 223.76.90.4:16060, b: sip.carrier-b.example}\n", 1))
-	for ip, want := range map[string]bool{
-		"198.51.100.9": true, "223.76.90.4": true, "223.76.90.5": false, "10.77.0.10": false,
-	} {
-		if got := topo.isCarrierSource(netip.MustParseAddr(ip)); got != want {
-			t.Errorf("isCarrierSource(%s) = %v, want %v", ip, got, want)
-		}
-	}
-}
-
 // hashUpstreamUser is the selection contract: FNV-1a 64 over the LOWER-CASED
 // user. The fixed vectors pin the algorithm (changing it silently would
 // remap every user), the case check pins the lower-casing (a phone that

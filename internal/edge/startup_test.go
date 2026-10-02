@@ -42,7 +42,10 @@ func TestCallsListsWhatActiveCallsCounts(t *testing.T) {
 	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
 	settle()
 
+	// Registered, so the phone is a client even though the shared harness
+	// also lists 127.0.0.1 as a carrier source (a registration wins).
 	phone := newUDPClient(t)
+	auditRegisterPhone(t, h, phone, "1001")
 	invite, res, _ := auditPhoneCall(t, h, phone)
 	waitForDialog(t, h, fsip.CallID(invite))
 

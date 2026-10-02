@@ -225,6 +225,9 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 		return
 	}
 	s.retargetInDialog(req, out, to, d)
+	if !in.private() {
+		s.stampCarrier(out, req, d)
+	}
 	if err := s.client.WriteRequest(out, noBuild); err != nil {
 		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
 	}
@@ -279,6 +282,21 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 		s.reject(req, tx, 481, "Subscription Does Not Exist")
 		return
 	}
+	if in.private() && fsip.ToTag(req) == "" {
+		// An out-of-dialog request from the switch is classified by its
+		// Request-URI alone (classifySwitchRequest). Only a client token
+		// goes on to directionFor; a carrier accepts REGISTER, INVITE and
+		// OPTIONS only; anything else is nobody's.
+		switch kind, _ := s.classifySwitchRequest(req); kind {
+		case targetClient:
+		case targetCarrier:
+			s.respond(req, tx, methodNotAllowed(req))
+			return
+		default:
+			s.reject(req, tx, 404, "Not Found")
+			return
+		}
+	}
 	from, to, dest, d, ok := s.directionFor(req, in.private())
 	if !ok && req.Method == sip.NOTIFY && fsip.ToTag(req) != "" && in.private() {
 		from, to, dest, d, ok = s.relaxedNotifyDirection(req)
@@ -297,6 +315,9 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 	}
 	s.retargetInDialog(req, out, to, d)
 	fsip.SetContact(out, to.uri())
+	if !in.private() {
+		s.stampCarrier(out, req, d)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
@@ -461,6 +482,17 @@ func (s *Server) directionFor(req *sip.Request, onPrivate bool) (from, to side, 
 	// is found above; the record of which switch carries it is the whole
 	// stickiness guarantee — a dialog must never migrate between switches
 	// mid-call.)
+	//
+	// A carrier's request is hashed by the DID (as its INVITE was) and goes
+	// to the node's carrier port; stampCarrier names the carrier.
+	if _, isCarrier := s.carrierFallback(req); isCarrier {
+		if name, entry, found := s.selectUpstream(carrierHashUser(req)); found {
+			s.log.Debug("carrier in-dialog request without a dialog record; hashing upstream",
+				"sip_call_id", fsip.CallID(req), "upstream", name)
+			return from, s.topo.private, entry.carrierAddr().String(), nil, true
+		}
+		return side{}, side{}, "", nil, false
+	}
 	if name, entry, found := s.selectUpstream(hashUserFor(req)); found {
 		s.log.Debug("in-dialog request without a dialog record; hashing upstream",
 			"sip_call_id", fsip.CallID(req), "upstream", name)

@@ -42,6 +42,13 @@ type Server struct {
 
 	topo *topology
 
+	// carriers is the carrier directory: what edge.carriers resolves to and
+	// the carrier source set (carrierdns.go). carrierURIs maps the
+	// "host:port" a carrier is addressed by in a Request-URI to its name.
+	// Both are written once in New.
+	carriers    *carrierDirectory
+	carrierURIs map[string]string
+
 	pubPool  *media.PlanePool
 	privPool *media.PlanePool
 	identity *media.DTLSIdentity
@@ -178,6 +185,8 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		privAddr:         priv,
 		log:              log.With("component", "proxy"),
 		topo:             topo,
+		carriers:         newCarrierDirectory(cfg, log.With("component", "carriers")),
+		carrierURIs:      carrierURIsOf(cfg),
 		loc:              NewLocation(),
 		metrics:          NewMetrics(),
 		upstreamCooldown: newCooldownTable(),
@@ -339,7 +348,7 @@ func (s *Server) Run(ctx context.Context) error {
 	defer client.Close()
 	s.client = client
 
-	sh := shield.New(s.store, s.log, s.topo.isCarrierSource)
+	sh := shield.New(s.store, s.log, func(ip netip.Addr) bool { return s.carriers.snapshot().isSource(ip) })
 	defer sh.Close()
 	s.shieldMu.Lock()
 	s.shield = sh
@@ -410,7 +419,7 @@ func (s *Server) Run(ctx context.Context) error {
 		// The INVITE admission posture (admission.go): edge.carrier_sources
 		// and literal-IP edge.carriers. Empty means only registered clients
 		// may place calls on a public listener.
-		"carrier_sources", s.topo.carrierSourcesString(),
+		"carrier_sources", s.carriers.snapshot().sourcesString(),
 		"webrtc", s.webrtcEnabled)
 
 	close(s.ready)
@@ -432,6 +441,14 @@ func (s *Server) Run(ctx context.Context) error {
 				}
 			}
 		}
+	}()
+
+	// The carrier directory resolves DNS-name carriers in the background; a
+	// resolver that is down at startup delays those carriers, nothing else.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.carriers.Run(listenCtx)
 	}()
 
 	var runErr error
@@ -804,7 +821,23 @@ type handler func(*sip.Request, sip.ServerTransaction, inbound)
 // onOptions answers a keepalive locally. An OPTIONS ping is a liveness
 // check on FreeSBC itself; forwarding every phone's keepalive upstream
 // would multiply load on FreeSWITCH for no information gain.
-func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, _ inbound) {
+//
+// From the switch an OPTIONS is classified by its Request-URI like every
+// other out-of-dialog request (classifySwitchRequest): addressed to
+// FreeSBC itself or to a registered client's token it is answered here; to
+// a carrier it is a carrier probe (not proxied yet); to anything else, 404.
+// A public OPTIONS, a carrier's keepalive included, is answered here.
+func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inbound) {
+	if in.private() && fsip.ToTag(req) == "" {
+		switch kind, name := s.classifySwitchRequest(req); kind {
+		case targetCarrier:
+			s.carrierNotImplemented(req, tx, name)
+			return
+		case targetNotFound:
+			s.reject(req, tx, 404, "Not Found")
+			return
+		}
+	}
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	res.AppendHeader(sip.NewHeader("Allow", strings.Join(allowedMethods, ", ")))
 	s.respond(req, tx, res)

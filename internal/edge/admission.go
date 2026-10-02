@@ -3,8 +3,6 @@ package edge
 import (
 	"container/list"
 	"net/netip"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,8 +17,8 @@ import (
 // responses:
 //
 //   - an out-of-dialog INVITE on a public listener is admitted only from an
-//     upstream, from a carrier source, or from a transport address that holds
-//     a live registration binding (admitPublicInvite);
+//     a carrier source or from a transport address that holds a live
+//     registration binding (admitPublicInvite);
 //   - a REGISTER is always admitted, except from a source that has had
 //     enumMaxAORs distinct AoRs rejected 403/404 by the registrar within
 //     enumWindow (enumLimiter).
@@ -46,71 +44,48 @@ var dropReasonLabels = [numDropReasons]string{
 
 func (r dropReason) String() string { return dropReasonLabels[r] }
 
-// carrierSourcesFrom builds the carrier-source prefix set:
-// sip.public.carrier_sources (already canonical from validation). The
-// result is deduplicated and sorted, so the startup log line is stable.
-func carrierSourcesFrom(configured []netip.Prefix) []netip.Prefix {
-	seen := map[netip.Prefix]bool{}
-	var out []netip.Prefix
-	add := func(p netip.Prefix) {
-		if !seen[p] {
-			seen[p] = true
-			out = append(out, p)
-		}
-	}
-	for _, p := range configured {
-		add(p)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if c := out[i].Addr().Compare(out[j].Addr()); c != 0 {
-			return c < 0
-		}
-		return out[i].Bits() < out[j].Bits()
-	})
-	return out
-}
+// inviteSource is who a public out-of-dialog INVITE is from, which decides
+// where admission sends it.
+type inviteSource int
 
-// isCarrierSource reports whether ip is inside a carrier-source prefix.
-func (t *topology) isCarrierSource(ip netip.Addr) bool {
-	ip = ip.Unmap()
-	for _, p := range t.carrierSources {
-		if p.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// carrierSourcesString renders the carrier-source set for the startup log.
-func (t *topology) carrierSourcesString() string {
-	parts := make([]string, len(t.carrierSources))
-	for i, p := range t.carrierSources {
-		parts[i] = p.String()
-	}
-	return strings.Join(parts, ",")
-}
+const (
+	// srcDrop: neither a live registration nor a carrier source.
+	srcDrop inviteSource = iota
+	// srcClient: the transport address of a live registration.
+	srcClient
+	// srcCarrier: a carrier source (resolved edge.carriers addresses plus
+	// edge.carrier_sources).
+	srcCarrier
+)
 
 // admitPublicInvite decides whether an out-of-dialog INVITE that arrived
-// on a public listener may be relayed upstream. FreeSWITCH is not among the
-// admitted sources: it speaks only on the private bind, a trusted
-// socket that never reaches this check, so a public
-// read from FreeSWITCH's own address is an ordinary public INVITE. It is
-// admitted when its transport source is:
+// on a public listener may be relayed to the switch, and by which path.
+// FreeSWITCH is not among the admitted sources: it speaks only on the
+// private bind, a trusted socket that never reaches this check, so a public
+// read from FreeSWITCH's own address is an ordinary public INVITE. The
+// source is, in order:
 //
-//   - inside a carrier-source prefix (sip.public.carrier_sources);
 //   - exactly the transport address (transport + IP:port) of a live
 //     registration binding: a registered phone or browser calling out over
-//     the socket it registered from. A WebSocket client's INVITE arrives on
+//     the socket it registered from (a WebSocket client's INVITE arrives on
 //     the connection that registered, which is the address its binding
-//     records.
+//     records). It wins over a carrier source, so a client behind a
+//     carrier's address is never sent down the unauthenticated carrier
+//     path: srcClient, delivered to the switch's client port;
+//   - inside a carrier source (carrierDirectory): srcCarrier, with the
+//     carrier's name, delivered to the switch's carrier port;
+//   - anything else: srcDrop.
 //
 // The check keys on the transport source only, never on From or any
 // identity header, so it cannot be talked past by a spoofed header.
-func (s *Server) admitPublicInvite(req *sip.Request, src netip.AddrPort) bool {
-	if s.topo.isCarrierSource(src.Addr()) {
-		return true
+func (s *Server) admitPublicInvite(req *sip.Request, src netip.AddrPort) (inviteSource, string) {
+	if s.loc.HasSource(sip.NetworkToLower(req.Transport()), src) {
+		return srcClient, ""
 	}
-	return s.loc.HasSource(sip.NetworkToLower(req.Transport()), src)
+	if name, ok := s.carriers.snapshot().carrierFor(src); ok {
+		return srcCarrier, name
+	}
+	return srcDrop, ""
 }
 
 // dropSilently records an admission drop: it counts it by reason and logs

@@ -393,8 +393,10 @@ func TestUpstreamInviteFailsOverToLiveNode(t *testing.T) {
 	}
 	user := userForNode(t, topo, 0)
 
+	// The harness lists 127.0.0.1 as a carrier source, so this call takes
+	// the carrier path, which hashes the Request-URI user (the DID).
 	phone := newUDPClient(t)
-	invite := phone.buildInvite(user, "2002", "example.com", phoneOfferSDP(freePort(t)))
+	invite := phone.buildInvite("2002", user, "example.com", phoneOfferSDP(freePort(t)))
 	res := phone.do(t, invite, h.publicUDP)
 	if res.StatusCode != 200 {
 		t.Fatalf("INVITE via failover: got %d, want 200 from fs-b", res.StatusCode)

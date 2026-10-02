@@ -136,12 +136,6 @@ type topology struct {
 	upstreams     map[string]endpoint
 	upstreamNames []string
 
-	// carrierSources are the public source prefixes an out-of-dialog
-	// INVITE is admitted from without a registration (admission.go):
-	// edge.carrier_sources plus the literal-IP edge.carriers. A startup
-	// snapshot like the rest of the topology (restart-only).
-	carrierSources []netip.Prefix
-
 	// media advertised addresses.
 	publicMediaIP  netip.Addr
 	privateMediaIP netip.Addr
@@ -170,10 +164,9 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 	sort.Strings(upstreamNames)
 
 	t := &topology{
-		public:         map[string]side{},
-		upstreams:      upstreams,
-		upstreamNames:  upstreamNames,
-		carrierSources: carrierSourcesFrom(cfg.CarrierNets()),
+		public:        map[string]side{},
+		upstreams:     upstreams,
+		upstreamNames: upstreamNames,
 		private: side{
 			plane:     planePrivate,
 			transport: "udp",

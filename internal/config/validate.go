@@ -194,6 +194,17 @@ func ParseCarrierHost(s string) (host string, port int, addr netip.Addr, err err
 	return finishCarrierHost(h, port)
 }
 
+// carrierHasPort reports whether a (valid) edge.carriers value wrote a
+// port: a bare IP never does, anything bracketed or with exactly one colon
+// does.
+func carrierHasPort(s string) bool {
+	s = strings.TrimSpace(s)
+	if _, err := netip.ParseAddr(s); err == nil {
+		return false
+	}
+	return strings.HasPrefix(s, "[") || strings.Count(s, ":") == 1
+}
+
 func finishCarrierHost(h string, port int) (string, int, netip.Addr, error) {
 	if a, err := netip.ParseAddr(h); err == nil {
 		a = a.Unmap()
@@ -263,7 +274,8 @@ func (c *Config) validateCarriers(fail failFunc) {
 				}
 			}
 		}
-		e.carriers = append(e.carriers, Carrier{Name: name, Host: host, Port: port, Addr: addr})
+		e.carriers = append(e.carriers, Carrier{Name: name, Host: host, Port: port, Addr: addr,
+			ExplicitPort: carrierHasPort(e.Carriers[name])})
 	}
 }
 

@@ -29,8 +29,15 @@ const registerTimeout = 32 * time.Second
 func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived inbound) {
 	src := arrived.src
 	if arrived.private() {
-		// FreeSWITCH does not register through its own edge proxy.
-		s.reject(req, tx, 403, "Forbidden")
+		// FreeSWITCH does not register through its own edge proxy. A
+		// REGISTER from the switch is only ever a carrier registration, and
+		// it is classified by its Request-URI like everything else the
+		// switch originates.
+		if kind, name := s.classifySwitchRequest(req); kind == targetCarrier {
+			s.carrierNotImplemented(req, tx, name)
+			return
+		}
+		s.reject(req, tx, 404, "Not Found")
 		return
 	}
 	if s.enumLimit.blocked(src.Addr()) {

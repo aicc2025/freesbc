@@ -43,21 +43,26 @@ const maxEarlyPerSource = 64
 func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	src := in.src
 	inDialog := isInDialog(req)
-	if !inDialog && !in.private() && !s.admitPublicInvite(req, src) {
-		// Admission (issue #86; admission.go): a public out-of-dialog
-		// INVITE from a source that is neither a carrier source nor a
-		// registered transport address is dropped before
-		// anything answers it — ahead of the 100rel check below, whose 420
-		// would otherwise tell a scanner something. Returning without a
-		// response is the whole mechanism: sipgo's Server.handleRequest
-		// calls TerminateGracefully when the handler returns, which, for a
-		// transaction with no final response, is Terminate — it stops the
-		// Timer_1xx that would otherwise send "100 Trying" at 200 ms,
-		// removes the transaction and sends nothing. A retransmission of
-		// the INVITE opens a fresh transaction and is dropped the same way.
-		s.dropSilently(dropInviteNotAdmitted, req, src,
-			"to", req.Recipient.User)
-		return
+	carrier := "" // the carrier a public out-of-dialog INVITE came from, if any
+	if !inDialog && !in.private() {
+		var kind inviteSource
+		if kind, carrier = s.admitPublicInvite(req, src); kind == srcDrop {
+			// Admission (issue #86; admission.go): a public out-of-dialog
+			// INVITE from a source that is neither a carrier source nor a
+			// registered transport address is dropped before anything
+			// answers it — ahead of the 100rel check below, whose 420
+			// would otherwise tell a scanner something. Returning without a
+			// response is the whole mechanism: sipgo's Server.handleRequest
+			// calls TerminateGracefully when the handler returns, which, for
+			// a transaction with no final response, is Terminate — it stops
+			// the Timer_1xx that would otherwise send "100 Trying" at 200
+			// ms, removes the transaction and sends nothing. A
+			// retransmission of the INVITE opens a fresh transaction and is
+			// dropped the same way.
+			s.dropSilently(dropInviteNotAdmitted, req, src,
+				"to", req.Recipient.User)
+			return
+		}
 	}
 	if s.rejectRequired100rel(req, tx) {
 		return // PRACK cannot pass the proxy (extensions.go)
@@ -67,10 +72,10 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound
 		return
 	}
 	if in.private() {
-		s.inviteToClient(req, tx)
+		s.invitePrivate(req, tx)
 		return
 	}
-	s.inviteToUpstream(req, tx, src)
+	s.inviteToUpstream(req, tx, src, carrier)
 }
 
 // beginDialog opens the call's record, or answers 482 when the INVITE
@@ -89,8 +94,20 @@ func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerP
 	return d, true
 }
 
-// inviteToUpstream handles a call placed BY a public client.
-func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort) {
+// inviteToUpstream handles a call from the public side to the switch. It
+// serves two kinds of caller, told apart by carrier:
+//
+//   - carrier == "": a registered client placing a call. Everything it
+//     does starts on the switch its From user hashes to, at the switch's
+//     CLIENT port (edge.switch), where the switch authenticates it.
+//   - carrier != "": a carrier delivering a call (the name is its
+//     edge.carriers entry, or "unknown"). The node is the hash of the
+//     Request-URI user (the DID), the destination is that node's CARRIER
+//     port (edge.switch_carrier_port) and never the client port, the
+//     Request-URI is left alone, and the request is stamped
+//     X-FreeSBC-Carrier. Carriers are exempt from the per-source early-call
+//     cap; shield.carrier_rate_limit bounds them.
+func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort, carrier string) {
 	from, ok := s.publicSideFor(req)
 	if !ok {
 		s.reject(req, tx, 488, "Not Acceptable Here")
@@ -105,14 +122,18 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		return
 	}
 
-	release, ok := s.admitEarly(src.Addr())
-	if !ok {
-		s.log.Warn("rejecting call: too many unanswered calls from one source",
-			"public_remote", src.String(), "limit", maxEarlyPerSource, "sip_call_id", fsip.CallID(req))
-		s.reject(req, tx, 503, "Service Unavailable")
-		return
+	if carrier == "" {
+		release, ok := s.admitEarly(src.Addr())
+		if !ok {
+			s.log.Warn("rejecting call: too many unanswered calls from one source",
+				"public_remote", src.String(), "limit", maxEarlyPerSource, "sip_call_id", fsip.CallID(req))
+			s.reject(req, tx, 503, "Service Unavailable")
+			return
+		}
+		defer release()
+	} else {
+		s.metrics.CarrierRequest(carrier, dirInbound, req.Method.String())
 	}
-	defer release()
 
 	// ctx is the whole-series backstop: the 5-minute inviteTimeout,
 	// cancellable — a client CANCEL cancels the series, never just the
@@ -128,6 +149,9 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		return
 	}
 	defer d.endUnlessUp()
+	if carrier != "" {
+		d.setCarrier(carrier)
+	}
 
 	offer, err := s.buildUpstreamOffer(ctx, d, body, src.Addr())
 	if err != nil {
@@ -170,7 +194,11 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// The caller's hash order, cooled nodes at the tail: everything this
 	// user does starts on the same switch, and a switch that just failed is
 	// only dialed once its alternatives have been tried.
-	for attempt, name := range s.upstreamOrder(hashUserFor(req)) {
+	hashUser := hashUserFor(req)
+	if carrier != "" {
+		hashUser = carrierHashUser(req)
+	}
+	for attempt, name := range s.upstreamOrder(hashUser) {
 		if ctx.Err() != nil {
 			break // the caller is gone (or the backstop fired) mid-series
 		}
@@ -181,10 +209,17 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		// and Record-Route pair per attempt, same Call-ID/CSeq/From/To — it
 		// is one dialog the client is still waiting on, whatever we had to
 		// try to connect it.
-		out, err := s.prepareForward(req, from, s.topo.private, entry.host, true)
+		dest := entry.host
+		if carrier != "" {
+			dest = entry.carrierAddr().String()
+		}
+		out, err := s.prepareForward(req, from, s.topo.private, dest, true)
 		if err != nil {
 			s.reject(req, tx, 483, "Too Many Hops")
 			return
+		}
+		if carrier != "" {
+			out.AppendHeader(sip.NewHeader(carrierHeader, carrier))
 		}
 		// The client's Contact must not reach FreeSWITCH: it names the
 		// client's own address (or, for a browser, an unreachable .invalid
@@ -196,7 +231,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		s.log.Info("proxying INVITE upstream",
 			"sip_call_id", fsip.CallID(req), "direction", "public->private",
 			"transport", from.transport, "public_remote", src.String(),
-			"upstream", name, "attempt", attempt+1,
+			"carrier", carrier, "upstream", name, "dest", dest, "attempt", attempt+1,
 			"rtp_public_port", sess.publicPort,
 			"rtp_private_port", sess.privatePort,
 			"codec", codecNames(sess.negotiated()))
@@ -235,7 +270,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		// what their Request-URI names.
 		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
 			near: from, far: s.topo.private, callee: calleeUpstream,
-			calleeRemote: entry.host, transport: from.transport}
+			calleeRemote: dest, transport: from.transport}
 		r := s.pumpInvite(ctx, l)
 
 		if r.final != nil {
@@ -469,7 +504,7 @@ func (s *Server) bindingForRequest(req *sip.Request) (Binding, bool) {
 			return b, true
 		}
 	}
-	if r := req.Route(); r != nil {
+	if r := s.firstForeignRoute(req); r != nil {
 		if tok, ok := tokenOf(r.Address); ok {
 			if b, found := s.loc.ByToken(tok); found {
 				return b, true

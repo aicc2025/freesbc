@@ -144,6 +144,7 @@ func adminDeps(edgeSrv *edge.Server, version string) admin.Deps {
 				DTLSFailures:           s.WebRTCDTLSFailures,
 				HandlerPanics:          s.HandlerPanics,
 				AdmissionDrops:         s.AdmissionDrops,
+				CarrierRequests:        s.CarrierRequests,
 			}
 		},
 	}

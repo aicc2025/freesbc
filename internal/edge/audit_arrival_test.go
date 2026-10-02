@@ -49,10 +49,10 @@ func TestAuditPrivateSourceOnPublicListenerIsPublic(t *testing.T) {
 
 	// Warm: this socket talks to the private bind (its source IP is the
 	// upstream's, which is all the trusted socket checks).
-	auditRawRequest(t, conn, h.privateSIP, fmt.Sprintf("OPTIONS sip:proxy@127.0.0.1 SIP/2.0\r\n"+
+	auditRawRequest(t, conn, h.privateSIP, fmt.Sprintf("OPTIONS sip:proxy@%s SIP/2.0\r\n"+
 		"Via: SIP/2.0/UDP 127.0.0.1:%d;branch=z9hG4bK-arr-warm;rport\r\n"+
-		"Max-Forwards: 70\r\nFrom: <sip:fs@127.0.0.1>;tag=warm\r\nTo: <sip:proxy@127.0.0.1>\r\n"+
-		"Call-ID: arr-warm\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n", port))
+		"Max-Forwards: 70\r\nFrom: <sip:fs@127.0.0.1>;tag=warm\r\nTo: <sip:proxy@%s>\r\n"+
+		"Call-ID: arr-warm\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n", h.privateSIP, port, h.privateSIP))
 	if !auditRecvUntil(conn, 2*time.Second, func(b []byte) bool { return bytes.HasPrefix(b, []byte("SIP/2.0 200")) }) {
 		t.Fatal("the private bind never answered the warming OPTIONS")
 	}

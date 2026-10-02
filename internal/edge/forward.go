@@ -44,6 +44,11 @@ func (s *Server) prepareForward(req *sip.Request, from, to side, dest string, re
 	annotateVia(out, req.Source())
 	s.stripOwnRoutes(out)
 	sanitizeExtensions(out)
+	// Hardening: no X-FreeSBC-* header is ever forwarded as received. They
+	// are stripped on arrival; a switch that echoes one must not pass it
+	// toward a public client. Whatever FreeSBC itself adds for the switch
+	// is added after this returns.
+	stripInternalHeaders(out)
 
 	// RFC 3261 §16.3 step 3 rejects only a request that ARRIVES with zero;
 	// §16.6 step 3 then decrements, so one that arrives with 1 leaves with
@@ -210,6 +215,7 @@ func (s *Server) relayResponse(orig *sip.Request, tx sip.ServerTransaction, res 
 		return errResponseDropped
 	}
 	sanitizeExtensions(out)
+	stripInternalHeaders(out) // only FreeSBC adds X-FreeSBC-*, and never to a response
 	if adapt != nil {
 		if err := adapt(out); err != nil {
 			return err

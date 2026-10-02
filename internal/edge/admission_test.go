@@ -136,7 +136,7 @@ func TestAdmissionRegisteredUDPClientCallProceeds(t *testing.T) {
 // registration.
 func TestAdmissionCarrierSourceProceeds(t *testing.T) {
 	h := startHarnessFull(t, false, false, "127.0.0.0/8")
-	if got := h.srv.topo.carrierSourcesString(); got != "127.0.0.0/8" {
+	if got := h.srv.carriers.snapshot().sourcesString(); got != "127.0.0.0/8" {
 		t.Errorf("carrier sources = %q, want 127.0.0.0/8", got)
 	}
 	carrier := newUDPClient(t)
@@ -333,23 +333,5 @@ func TestWarnOnceIsBounded(t *testing.T) {
 	}
 	if len(w.seen) != 2 {
 		t.Fatalf("seen = %d, want the cap 2", len(w.seen))
-	}
-}
-
-// carrierSourcesFrom deduplicates and sorts the configured prefixes.
-func TestCarrierSourcesFrom(t *testing.T) {
-	got := carrierSourcesFrom([]netip.Prefix{
-		netip.MustParsePrefix("203.0.113.9/32"), netip.MustParsePrefix("203.0.113.0/24"),
-		netip.MustParsePrefix("198.51.100.1/32"), netip.MustParsePrefix("203.0.113.9/32"),
-	})
-	topo := &topology{carrierSources: got}
-	if s := topo.carrierSourcesString(); s != "198.51.100.1/32,203.0.113.0/24,203.0.113.9/32" {
-		t.Fatalf("carrier sources = %q", s)
-	}
-	if !topo.isCarrierSource(netip.MustParseAddr("::ffff:203.0.113.77")) {
-		t.Error("a mapped address inside a prefix is not a carrier source")
-	}
-	if topo.isCarrierSource(netip.MustParseAddr("192.0.2.1")) {
-		t.Error("an unrelated address is a carrier source")
 	}
 }

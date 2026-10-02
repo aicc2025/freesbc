@@ -297,3 +297,30 @@ func TestArrivalMarkerNeverLeavesTheProxy(t *testing.T) {
 		t.Errorf("the response the phone received carries the marker:\n%s", res.String())
 	}
 }
+
+// take removes every X-FreeSBC-* header, whatever its case, from a public
+// request, and still reports it public; the original is left intact.
+func TestTakeStripsEveryInternalHeaderCaseInsensitively(t *testing.T) {
+	m, err := newArrivalMarker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := sip.NewRequest(sip.INVITE, sip.Uri{User: "1", Host: "example.com"})
+	req.AppendHeader(sip.NewHeader("X-FreeSBC-Carrier", "spoofed"))
+	req.AppendHeader(sip.NewHeader("x-freesbc-extra", "1"))
+	req.AppendHeader(sip.NewHeader("X-FREESBC-Arrival", "forged;private"))
+	req.AppendHeader(sip.NewHeader("X-Other", "kept"))
+	got, arr := m.take(req)
+	if arr != arrPublic {
+		t.Errorf("a forged marker made the request %v", arr)
+	}
+	if names := internalHeaderNames(got); len(names) != 0 {
+		t.Errorf("internal headers left after take: %v", names)
+	}
+	if len(got.GetHeaders("X-Other")) != 1 {
+		t.Error("take removed an unrelated header")
+	}
+	if len(internalHeaderNames(req)) != 3 {
+		t.Error("take edited the shared original in place")
+	}
+}

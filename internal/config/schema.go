@@ -91,6 +91,10 @@ type Carrier struct {
 	// dot) or the canonical literal IP.
 	Host string
 	Port int
+	// ExplicitPort is true when the entry wrote a port. A DNS-name entry
+	// without one is resolved through SRV; with one, through A/AAAA only
+	// (RFC 3263 §4.2).
+	ExplicitPort bool
 	// Addr is the literal IP when Host is one, else the zero Addr.
 	Addr netip.Addr
 }

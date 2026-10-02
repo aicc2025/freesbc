@@ -44,6 +44,12 @@ type Metrics struct {
 	// admission policy, one counter per (fixed) reason (admission.go).
 	admissionDrops [numDropReasons]atomic.Uint64
 
+	// carrierReqs counts requests of the carrier path by (carrier,
+	// direction, method) — key "carrier/direction/method". The carrier is a
+	// configured name or "unknown", the direction one of two, the method
+	// folded like requestsIn, so the set is bounded.
+	carrierReqs sync.Map // string → *atomic.Uint64
+
 	// Media byte/packet totals, accumulated at call teardown from each
 	// session's own counters. Sampling live sessions instead would need a
 	// registry walk on every scrape.
@@ -120,6 +126,15 @@ func (m *Metrics) PortAllocationFailed()  { m.portFailures.Add(1) }
 // AdmissionDropped counts one public request dropped by admission.
 func (m *Metrics) AdmissionDropped(r dropReason) { m.admissionDrops[r].Add(1) }
 
+// CarrierRequest counts one request of the carrier path.
+func (m *Metrics) CarrierRequest(carrier, direction, method string) {
+	label := metricOther
+	if i := methodIndex(method); i < len(metricMethods) {
+		label = string(metricMethods[i])
+	}
+	bump(&m.carrierReqs, carrier+"/"+direction+"/"+label)
+}
+
 // HandlerPanicked counts a SIP handler panic the guard recovered.
 func (m *Metrics) HandlerPanicked() { m.handlerPanics.Add(1) }
 
@@ -192,6 +207,9 @@ type Snapshot struct {
 	// AdmissionDrops is keyed by drop reason (dropReasonLabels); every
 	// reason is present, zero or not.
 	AdmissionDrops map[string]uint64
+
+	// CarrierRequests is keyed "carrier/direction/method".
+	CarrierRequests map[string]uint64
 }
 
 func (m *Metrics) Snapshot() Snapshot {
@@ -214,7 +232,12 @@ func (m *Metrics) Snapshot() Snapshot {
 		WebRTCICEFailures:           m.iceFailures.Load(),
 		WebRTCDTLSFailures:          m.dtlsFailures.Load(),
 		AdmissionDrops:              map[string]uint64{},
+		CarrierRequests:             map[string]uint64{},
 	}
+	m.carrierReqs.Range(func(k, v any) bool {
+		s.CarrierRequests[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
 	for r := range m.admissionDrops {
 		s.AdmissionDrops[dropReasonLabels[r]] = m.admissionDrops[r].Load()
 	}

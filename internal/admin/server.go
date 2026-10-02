@@ -91,6 +91,10 @@ type ProxyStats struct {
 	// dropped silently, by reason (a fixed set: invite_not_admitted,
 	// register_enumeration).
 	AdmissionDrops map[string]uint64 `json:"admission_drops_total"`
+
+	// CarrierRequests counts carrier-path requests, keyed
+	// "carrier/direction/method" (direction: inbound or outbound).
+	CarrierRequests map[string]uint64 `json:"carrier_requests_total"`
 }
 
 // Server is the admin HTTP server.
