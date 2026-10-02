@@ -180,6 +180,48 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 			s.reject(req, tx, 408, "Request Timeout")
 			return
 		case <-ctx.Done():
+			// The backstop expired with only provisionals seen. sipgo uses
+			// ctx only to send, so the client transaction is still live:
+			// CANCEL it (RFC 3261 §16.8, as giveUp does for an initial
+			// INVITE) and answer the requester 408, or it waits out its own
+			// timer and the far end keeps an open INVITE transaction that
+			// 491s every later re-INVITE (§14.1).
+			s.abandonReInvite(req, tx, out, clTx, to)
+			return
+		}
+	}
+}
+
+// abandonReInvite ends a re-INVITE whose backstop expired: the requester is
+// answered 408 and the forwarded re-INVITE is CANCELled. CANCEL is built
+// from out, the request as it went on the wire, so a carrier leg's CANCEL
+// carries the same hidden identity as the re-INVITE (hide.go). The
+// transaction is then drained for the final the CANCEL provokes, so a 487
+// is ACKed by the transaction layer and a 2xx that crossed the CANCEL is
+// ACKed here rather than retransmitted.
+func (s *Server) abandonReInvite(req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
+	clTx sip.ClientTransaction, to side) {
+	s.reject(req, tx, 408, "Request Timeout")
+	s.sendCancel(&inviteAttempt{req: out, cancel: func() {}})
+	drain := time.NewTimer(cancelDrain)
+	defer drain.Stop()
+	responses := clTx.Responses()
+	for {
+		select {
+		case res, ok := <-responses:
+			if !ok {
+				responses = nil
+				continue
+			}
+			if res.StatusCode/100 == 2 {
+				s.ack2xx(res, to)
+			}
+			if res.StatusCode >= 200 {
+				return
+			}
+		case <-clTx.Done():
+			return
+		case <-drain.C:
 			return
 		}
 	}

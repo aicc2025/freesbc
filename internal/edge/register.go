@@ -216,6 +216,11 @@ func (s *Server) pumpRegister(ctx context.Context, req *sip.Request, tx sip.Serv
 			}
 			responded = true
 			final := res.StatusCode >= 200
+			// Record a rejection before the client can see it: a scanner
+			// that sends its next REGISTER the moment it reads this 403
+			// must find the limit already applied.
+			limitHit := final && countsAsEnumeration(res.StatusCode) &&
+				s.enumLimit.rejected(in.source.Addr(), in.aor)
 			err := s.relayResponse(req, tx, res, func(relayed *sip.Response) error {
 				if final && res.StatusCode/100 == 2 {
 					granted := s.recordBinding(res, in)
@@ -244,7 +249,7 @@ func (s *Server) pumpRegister(ctx context.Context, req *sip.Request, tx sip.Serv
 			}
 			if final {
 				s.logRegister(res, in.aor, in.transport, in.source, in.unregister)
-				if countsAsEnumeration(res.StatusCode) && s.enumLimit.rejected(in.source.Addr(), in.aor) {
+				if limitHit {
 					s.log.Warn("REGISTER enumeration limit reached; dropping this source's REGISTERs",
 						"public_remote", in.source.String(), "transport", in.transport,
 						"distinct_aors", enumMaxAORs, "window", enumWindow.String())

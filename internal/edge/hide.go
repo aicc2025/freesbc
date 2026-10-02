@@ -31,9 +31,10 @@ import (
 //     them) and are kept: the only private entry in the switch's route set
 //     is FreeSBC's, already stripped. The send-to address is unchanged.
 //   - Identity: the host of From, To, P-Asserted-Identity,
-//     P-Preferred-Identity, Remote-Party-ID and Diversion is rewritten to
-//     public.ip (port dropped) when it is private.ip or the IP of an
-//     edge.switch node (Asterisk and FreeSWITCH default to their own IP).
+//     P-Preferred-Identity, Remote-Party-ID, Diversion, Call-Info and
+//     Alert-Info is rewritten to public.ip (port dropped) when it is
+//     private.ip or the IP of an edge.switch node (Asterisk and FreeSWITCH
+//     default to their own IP).
 //     User, parameters and tags are kept. Any other host (a carrier
 //     domain) is left alone. Call-ID is the switch's and passes through
 //     unchanged.
@@ -88,7 +89,9 @@ func (s *Server) prepareForwardHidden(req *sip.Request, from, to side, dest stri
 }
 
 // identityHeaders are the generic headers whose URI hosts are masked.
-var identityHeaders = []string{"P-Asserted-Identity", "P-Preferred-Identity", "Remote-Party-ID", "Diversion"}
+// Call-Info and Alert-Info carry switch-generated SIP URIs such as
+// FreeSWITCH's intercom hint `Call-Info: <sip:10.77.0.10>;answer-after=0`.
+var identityHeaders = []string{"P-Asserted-Identity", "P-Preferred-Identity", "Remote-Party-ID", "Diversion", "Call-Info", "Alert-Info"}
 
 var uriHostRe = regexp.MustCompile(`(sips?:(?:[^@\s>;,]*@)?)([^\s:>;,]+)(:\d+)?`)
 

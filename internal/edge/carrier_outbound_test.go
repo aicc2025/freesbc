@@ -506,7 +506,9 @@ func TestOutboundIdentityMasked(t *testing.T) {
 	swPort := portOf(o.fs.addr)
 
 	req := o.fs.callRequest(o.ruri("+442071234567"), o.privateSIP, phoneOfferSDP(o.fs.rtpPort),
-		sip.NewHeader("P-Asserted-Identity", fmt.Sprintf("<sip:1000@127.0.0.1:%d>", swPort)))
+		sip.NewHeader("P-Asserted-Identity", fmt.Sprintf("<sip:1000@127.0.0.1:%d>", swPort)),
+		sip.NewHeader("Call-Info", fmt.Sprintf("<sip:127.0.0.1:%d>;answer-after=0", swPort)),
+		sip.NewHeader("Alert-Info", fmt.Sprintf("<sip:127.0.0.1:%d>;info=alert-autoanswer", swPort)))
 	origFrom := sip.Uri{User: "1000", Host: "127.0.0.1", Port: swPort}
 	req.From().Address = origFrom
 	tag, _ := req.From().Params.Get("tag")
@@ -527,6 +529,11 @@ func TestOutboundIdentityMasked(t *testing.T) {
 	}
 	if pai := got[0].GetHeader("P-Asserted-Identity"); pai == nil || strings.Contains(pai.Value(), fmt.Sprint(swPort)) {
 		t.Errorf("P-Asserted-Identity = %v, want the switch's port gone", pai)
+	}
+	for name, params := range map[string]string{"Call-Info": ";answer-after=0", "Alert-Info": ";info=alert-autoanswer"} {
+		if h := got[0].GetHeader(name); h == nil || h.Value() != "<sip:127.0.0.1>"+params {
+			t.Errorf("%s = %v, want <sip:127.0.0.1>%s", name, h, params)
+		}
 	}
 	if res.From().Address.String() != origFrom.String() {
 		t.Errorf("200 From = %s, want the switch's original %s", res.From().Address.String(), origFrom.String())
