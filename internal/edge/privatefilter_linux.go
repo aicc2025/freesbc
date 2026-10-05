@@ -3,6 +3,7 @@
 package edge
 
 import (
+	"fmt"
 	"net"
 	"syscall"
 
@@ -59,6 +60,11 @@ func attachFilter(prog []unix.SockFilter) func(network, address string, c syscal
 		if err := c.Control(func(fd uintptr) {
 			fprog := unix.SockFprog{Len: uint16(len(prog)), Filter: &prog[0]}
 			serr = unix.SetsockoptSockFprog(int(fd), unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &fprog)
+			if serr != nil {
+				// net wraps this in a listen error that names only the
+				// socket; say that the filter was what failed.
+				serr = fmt.Errorf("attach private ingress filter: %w", serr)
+			}
 		}); err != nil {
 			return err
 		}
