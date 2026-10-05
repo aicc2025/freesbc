@@ -600,7 +600,8 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 			// otherwise delivers a datagram addressed to private.ip and
 			// sent into the public NIC to this socket, where a spoofed
 			// switch source is believed (issue #90). The filter drops it
-			// before FreeSBC ever sees it and leaves the send path alone.
+			// before FreeSBC ever sees it and leaves the send path alone;
+			// docs/edge.md states the topology requirement.
 			ifname, ok, err := localInterface(s.privAddr.Addr())
 			if err != nil {
 				return l, fmt.Errorf("private.ip: list local addresses: %w", err)
@@ -620,9 +621,6 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		}
 		pc, err := lc.ListenPacket(context.Background(), "udp", ua.String())
 		if err != nil {
-			if transport == "udp-private" {
-				return l, fmt.Errorf("private socket receive filter: %w", err)
-			}
 			return l, err
 		}
 		l.packet = pc

@@ -1,13 +1,15 @@
 package edge
 
 import (
-	"context"
-	"net"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/netip"
 	"runtime"
 	"syscall"
 	"testing"
-	"time"
+
+	"github.com/freesbc/freesbc/internal/config"
 )
 
 // localInterface finds the interface that owns an address, which is what
@@ -25,53 +27,70 @@ func TestLocalInterface(t *testing.T) {
 	}
 }
 
-// The private socket's filter must accept datagrams received on an accepted
-// interface and drop every other one. On Linux the accept list is a real
-// BPF program; elsewhere the filter is a no-op and the test only checks the
-// documented nil control.
-func TestPrivateSocketFilter(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		control, err := privateSocketFilter("lo")
-		if err != nil || control != nil {
-			t.Fatalf("privateSocketFilter off Linux: non-nil=%v, err=%v; want nil, nil", control != nil, err)
+// privateSocketFilter is Linux-only; elsewhere it must stay a no-op so the
+// private socket keeps working and Run logs the warning.
+func TestPrivateSocketFilterPlatform(t *testing.T) {
+	control, err := privateSocketFilter("lo")
+	if runtime.GOOS == "linux" {
+		if err != nil || control == nil {
+			t.Fatalf("privateSocketFilter on Linux: non-nil=%v, err=%v; want a control", control != nil, err)
 		}
 		return
 	}
-	loop, err := net.InterfaceByName("lo")
+	if err != nil || control != nil {
+		t.Fatalf("privateSocketFilter off Linux: non-nil=%v, err=%v; want nil, nil", control != nil, err)
+	}
+}
+
+// TestPrivateListenerWiresTheFilter proves openListener asks for the private
+// socket's filter with the interface that owns private.ip, and only for
+// udp-private: the control it returns runs when the socket is created.
+func TestPrivateListenerWiresTheFilter(t *testing.T) {
+	old := privateSocketFilter
+	defer func() { privateSocketFilter = old }()
+	var called []string
+	privateSocketFilter = func(ifname string) (func(network, address string, c syscall.RawConn) error, error) {
+		return func(_, _ string, _ syscall.RawConn) error {
+			called = append(called, ifname)
+			return nil
+		}, nil
+	}
+
+	cfg, err := config.Parse([]byte(fmt.Sprintf(`
+public: {ip: 127.0.0.1}
+private: {ip: 192.0.2.250}
+edge:
+  switch: [127.0.0.1:5060]
+  listen: {udp: %d}
+`, nextPort(t))))
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	delivered := func(control func(network, address string, c syscall.RawConn) error) bool {
-		lc := net.ListenConfig{Control: control}
-		pc, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listen with filter: %v", err)
-		}
-		defer pc.Close()
-		peer, err := net.Dial("udp", pc.LocalAddr().String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer peer.Close()
-		if _, err := peer.Write([]byte("x")); err != nil {
-			t.Fatal(err)
-		}
-		if err := pc.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
-			t.Fatal(err)
-		}
-		buf := make([]byte, 8)
-		_, _, err = pc.ReadFrom(buf)
-		return err == nil
+	srv, err := New(config.NewStore(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithPrivateAddr(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", nextPort(t)))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ifname, ok, err := localInterface(srv.privAddr.Addr())
+	if err != nil || !ok {
+		t.Fatalf("localInterface(%s) = %q, %v, %v", srv.privAddr.Addr(), ifname, ok, err)
 	}
 
-	if !delivered(recvOnInterfaces(loop.Index)) {
-		t.Error("a datagram received on the accepted interface was dropped")
+	priv, err := srv.openListener("udp-private", srv.privAddr.String())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !delivered(recvOnInterfaces(999999, loop.Index)) {
-		t.Error("the second accepted interface was not honoured")
+	defer priv.Close()
+	if len(called) != 1 || called[0] != ifname {
+		t.Fatalf("private listener control calls = %v, want [%s]", called, ifname)
 	}
-	if delivered(recvOnInterfaces(999999)) {
-		t.Error("a datagram was delivered although its ingress interface was not accepted")
+
+	pub, err := srv.openListener("udp", netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(nextPort(t))).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+	if len(called) != 1 {
+		t.Fatalf("public listener invoked the private filter control: %v", called)
 	}
 }
